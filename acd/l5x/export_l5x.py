@@ -139,13 +139,33 @@ class ExportL5x:
         )
 
         comps_by_id = {}
+        # Side map object_id -> FULL stream payload (record.record.record_buffer,
+        # = len_record-6, untruncated). The deduped comps `record` column stores
+        # the TRUNCATED FafaComps.record_buffer (long-header) which cuts off the
+        # tail where a tag value backing's ext attr 0x66 lives; the value reader
+        # (Step 6b) needs the full payload. Keep the LARGEST full payload per id.
+        full_by_id: Dict[int, bytes] = {}
         for record in comps_db.records.record:
             t = CompsRecord.parse(record, self._comps_short_header)
             if t is not None:
                 oid = t[0]
                 if oid not in comps_by_id or len(t[5]) > len(comps_by_id[oid][5]):
                     comps_by_id[oid] = t
+                try:
+                    full = bytes(record.record.record_buffer)
+                    if oid not in full_by_id or len(full) > len(full_by_id[oid]):
+                        full_by_id[oid] = full
+                except Exception:  # noqa: BLE001
+                    pass
         self._cur.executemany("INSERT INTO comps VALUES (?,?,?,?,?,?)", comps_by_id.values())
+        # Full-payload table for the tag-value reader (Step 6b); separate so the
+        # deduped comps table and every existing query stay byte-for-byte the same.
+        self._cur.execute(
+            "CREATE TABLE comps_full(object_id int PRIMARY KEY, record BLOB NOT NULL)"
+        )
+        self._cur.executemany(
+            "INSERT INTO comps_full VALUES (?,?)", full_by_id.items()
+        )
         self._db.commit()
 
         # Build name lookup for SbRegion tag reference resolution (object_id → comp_name).

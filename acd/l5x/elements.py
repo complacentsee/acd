@@ -14,6 +14,8 @@ from typing import List, Tuple, Dict, Union
 from acd.generated.comps.rx_generic import RxGeneric
 from acd.l5x.catalog_numbers import CATALOG_NUMBERS
 from acd.l5x.port_structures import PORT_STRUCTURES
+from acd.l5x import tag_value as _tag_value
+from acd.record.comps import CompsRecord
 
 
 @dataclass
@@ -440,6 +442,16 @@ class Tag(L5xElement):
     # emitted. This is populated only by the V10..V21 short-header TagBuilder
     # path; defaults None so the long-header (V24+) path is unaffected.
     alias_for: Union[str, None] = None
+    # Step 6c — raw design-value image (ext attr 0x66 of the cip-0x6a backing)
+    # and its CIP type code (ext attr 0x65). Populated only when the value reader
+    # succeeds; None leaves today's zero-placeholder <Data> behaviour untouched
+    # (so both header families fall back identically on any failure).
+    _value_bytes: Union[bytes, None] = None
+    _value_type_code: int = 0
+    # True for V10..V21 short-header projects. Selects the raw-hex <Data> first
+    # block (the older Studio style: <Data>1D 00 00 00</Data>) instead of the
+    # V24+ L5K CDATA block. Defaults False so the long (V24+) path is unchanged.
+    _short_header: bool = False
 
     @property
     def _l5x_exclude(self) -> bool:
@@ -518,18 +530,50 @@ class Tag(L5xElement):
         # target). Suppress all data emission when this is an alias.
         is_alias = self.tag_type == "Alias" or self.alias_for is not None
         dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
-        l5k_zero = (
-            _PRIMITIVE_L5K_ZERO.get(dt_base)
-            if (not is_alias and not self.dimensions)
-            else None
-        )
-        data_xml = f'<Data Format="L5K">\n{l5k_zero}\n</Data>' if l5k_zero is not None else ""
 
-        if not is_alias and not data_xml and dt_base not in _SKIP_DECORATED and dt_base != "STRING":
-            # Generate Decorated data for non-primitive / array types
-            decorated = _generate_decorated(dt_base, self.dimensions, self._data_types_map)
-            if decorated:
-                data_xml = decorated
+        # --- Step 6c: real value <Data> from the design-value image (0x66) ---
+        # When the value reader returned an image, emit BOTH the OEM blocks Logix
+        # writes for a Base non-IO tag, then <Data Format="Decorated"> (structured
+        # Value=...). The FIRST block is version-styled:
+        #   LONG (V24+):  <Data Format="L5K"><![CDATA[50]]></Data>
+        #   SHORT(V10-21): <Data>1D 00 00 00</Data>  (raw image, space-sep hex)
+        # Both styles carry the same value; the Decorated block is identical.
+        # Wrapped so any failure degrades to today's zero-placeholder behaviour
+        # below — no regression.
+        data_xml = ""
+        if not is_alias and self._value_bytes is not None and dt_base not in _SKIP_DECORATED and dt_base != "STRING":
+            try:
+                decorated_inner = _tag_value.render_decorated(
+                    dt_base, self.dimensions, self._value_bytes, self._data_types_map
+                )
+                if self._short_header:
+                    first = "<Data>" + _tag_value.render_hex(self._value_bytes) + "</Data>"
+                    ok_first = bool(self._value_bytes)
+                else:
+                    l5k_text = _tag_value.render_l5k(
+                        dt_base, self.dimensions, self._value_bytes, self._data_types_map
+                    )
+                    first = f'<Data Format="L5K">\n<![CDATA[{l5k_text}]]>\n</Data>'
+                    ok_first = l5k_text is not None
+                if ok_first and decorated_inner is not None:
+                    data_xml = first + f'<Data Format="Decorated">\n{decorated_inner}\n</Data>'
+            except Exception:
+                data_xml = ""
+
+        if not data_xml:
+            # Fallback: today's exact zero-placeholder behaviour.
+            l5k_zero = (
+                _PRIMITIVE_L5K_ZERO.get(dt_base)
+                if (not is_alias and not self.dimensions)
+                else None
+            )
+            data_xml = f'<Data Format="L5K">\n{l5k_zero}\n</Data>' if l5k_zero is not None else ""
+
+            if not is_alias and not data_xml and dt_base not in _SKIP_DECORATED and dt_base != "STRING":
+                # Generate Decorated data for non-primitive / array types
+                decorated = _generate_decorated(dt_base, self.dimensions, self._data_types_map)
+                if decorated:
+                    data_xml = decorated
 
         if not comments_xml and not desc_xml and not data_xml:
             return base
@@ -1820,6 +1864,32 @@ class TagBuilder(L5xElementBuilder):
         except Exception:
             return None
 
+    def _read_tag_value(self, data_table_instance: int):
+        """Return (value_bytes, type_code) for a tag's design value, or (None, 0).
+
+        Resolves the cip-0x6a backing via data_table_instance, reads its FULL
+        stream payload from the comps_full side table (the deduped comps `record`
+        column is the TRUNCATED FafaComps buffer and cuts off ext attr 0x66), and
+        decodes attr 0x66. Best-effort: any failure yields (None, 0) so the Tag
+        keeps today's zero-placeholder <Data>.
+        """
+        try:
+            if not data_table_instance:
+                return None, 0
+            self._cur.execute(
+                "SELECT record FROM comps_full WHERE object_id=?",
+                (data_table_instance,),
+            )
+            row = self._cur.fetchone()
+            if not row or row[0] is None:
+                return None, 0
+            res = CompsRecord.read_tag_value(bytes(row[0]), self._short_header)
+            if res is None:
+                return None, 0
+            return res
+        except Exception:
+            return None, 0
+
     def build(self) -> Tag:
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
@@ -1948,6 +2018,10 @@ class TagBuilder(L5xElementBuilder):
             if r.main_record.dimension_3 != 0:
                 dim_parts.append(str(r.main_record.dimension_3))
             dimensions = ",".join(dim_parts) if dim_parts else None
+            value_bytes, value_type_code = (
+                (None, 0) if alias_for
+                else self._read_tag_value(r.main_record.data_table_instance)
+            )
             return Tag(
                 results[0][0], results[0][0], tag_type,
                 None if alias_for else data_type, radix,
@@ -1955,6 +2029,9 @@ class TagBuilder(L5xElementBuilder):
                 comment_results,
                 _operand_comments=operand_comments,
                 alias_for=alias_for,
+                _value_bytes=value_bytes,
+                _value_type_code=value_type_code,
+                _short_header=self._short_header,
             )
 
         name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
@@ -1971,6 +2048,10 @@ class TagBuilder(L5xElementBuilder):
         if r.main_record.dimension_3 != 0:
             dim_parts.append(str(r.main_record.dimension_3))
         dimensions = ",".join(dim_parts) if dim_parts else None
+        value_bytes, value_type_code = (
+            (None, 0) if alias_for
+            else self._read_tag_value(r.main_record.data_table_instance)
+        )
         return Tag(
             name,
             name,
@@ -1984,6 +2065,9 @@ class TagBuilder(L5xElementBuilder):
             comment_results,
             _operand_comments=operand_comments,
             alias_for=alias_for,
+            _value_bytes=value_bytes,
+            _value_type_code=value_type_code,
+            _short_header=self._short_header,
         )
 
 

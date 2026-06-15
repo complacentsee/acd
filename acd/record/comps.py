@@ -129,6 +129,83 @@ class CompsRecord:
         record_buffer = buf[_SH_BODY_OFF:]
         return (object_id, parent_id, record_name, seq_number, record_type, record_buffer)
 
+    # ------------------------------------------------------------------ #
+    # Tag VALUE reader (Step 6b) — design value from ext attr 0x66        #
+    # ------------------------------------------------------------------ #
+    # A tag's design/initial value is NOT in the tag's own comps record. The
+    # tag main_record @0x24 holds ``data_table_instance`` (u32); the comps row
+    # whose object_id == that value is a cip-0x6a "$hash$" backing carrying
+    # ext attrs [0x01, 0x64, 0x65, 0x66]:
+    #   0x64 = 16-byte runtime cache (ALL-ZERO on disk — the WRONG source)
+    #   0x65 = 2-byte CIP type code (0xc4=DINT, 0x8f__=system struct, ...)
+    #   0x66 = the design value, byte-exact (THE source)
+    # Two truncations stop the stock parsers from ever reaching 0x66:
+    #   1) FafaComps.record_buffer trims to record_length(@0)-148, but the
+    #      @0 length undercounts backings with sub-blobs -> 0x66 is in the tail.
+    #   2) RxGeneric loops range(count_record-1) and stops before 0x66.
+    # So this reader takes the FULL stream payload (DatRecord.record.record_buffer
+    # = len_record-6, untruncated) and walks attribute records to end-of-body,
+    # ignoring count_record. See read_tag_value.
+
+    # Body offset within the FULL stream payload (== record_buffer start):
+    #   LONG (V24+)   = 148 (record_length u32 [4] + 144-byte header)
+    #   SHORT(V10-V21)= 94  (== _SH_BODY_OFF)
+    _LONG_BODY_OFF = 148
+
+    @staticmethod
+    def body_offset(short_header: bool) -> int:
+        """Full-payload offset of the RxGeneric body (prelude) for the family."""
+        return _SH_BODY_OFF if short_header else CompsRecord._LONG_BODY_OFF
+
+    @staticmethod
+    def read_value_attrs(full_payload: bytes, short_header: bool) -> dict:
+        """Walk a cip-0x6a backing's body and return {attribute_id: bytes}.
+
+        ``full_payload`` MUST be the untruncated stream payload
+        (DatRecord.record.record_buffer), NOT FafaComps.record_buffer. Returns
+        an empty dict on any structural problem so callers fall back to today's
+        zero-placeholder behaviour.
+
+        Body layout (from body_offset): 14B RxGeneric prelude + 60B main_record,
+        then at body+74: u32 len_record, u32 count_record, then a sequence of
+        (u32 attribute_id, u32 len_value, len_value bytes) attribute records.
+        We walk to buffer exhaustion (NOT count_record) so 0x66 is captured.
+        """
+        out: dict = {}
+        try:
+            off = CompsRecord.body_offset(short_header)
+            body = full_payload[off:]
+            # prelude(14) + main_record(60) = 74, then len_record/count_record.
+            pos = 74 + 8  # skip len_record(4)+count_record(4)
+            n = len(body)
+            while pos + 8 <= n:
+                attr_id = int.from_bytes(body[pos:pos + 4], "little")
+                ln = int.from_bytes(body[pos + 4:pos + 8], "little")
+                pos += 8
+                if ln < 0 or pos + ln > n:
+                    break
+                out[attr_id] = body[pos:pos + ln]
+                pos += ln
+        except Exception:
+            return {}
+        return out
+
+    @staticmethod
+    def read_tag_value(full_payload: bytes, short_header: bool):
+        """Return (value_bytes, cip_type_code) from a cip-0x6a backing, or None.
+
+        value_bytes = ext attr 0x66 (the design value); cip_type_code = ext attr
+        0x65 (u16, 0 if absent). Returns None when 0x66 is missing so callers
+        keep today's zero-placeholder behaviour.
+        """
+        attrs = CompsRecord.read_value_attrs(full_payload, short_header)
+        if 0x66 not in attrs:
+            return None
+        type_code = 0
+        if 0x65 in attrs and len(attrs[0x65]) >= 2:
+            type_code = int.from_bytes(attrs[0x65][0:2], "little")
+        return attrs[0x66], type_code
+
     @staticmethod
     def _decode_utf16z(buf: bytes) -> str:
         """Decode a NUL-terminated UTF-16LE name (walk u16 units to 0x0000)."""
