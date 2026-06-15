@@ -522,6 +522,18 @@ class Tag(L5xElement):
         return "".join(parts)
 
     def to_xml(self) -> str:
+        if self._io and (self.tag_type == "Alias" or self.alias_for):
+            # Per-point module I/O ALIAS tag — OEM emits a self-closing tag:
+            #   Name TagType="Alias" Radix="Binary" AliasFor=... ExternalAccess IO="true"
+            # No DataType, no <Data> (the value lives on the alias target). The
+            # whole element is returned here; the Data/Description machinery below
+            # is skipped (an alias carries none of it).
+            return (
+                f'<Tag Name="{html.escape(self.name, quote=True)}"'
+                f' TagType="Alias" Radix="Binary"'
+                f' AliasFor="{html.escape(self.alias_for, quote=True)}"'
+                f' ExternalAccess="{self.external_access}" IO="true"/>'
+            )
         if self._io:
             # Module I/O tag — emit the exact OEM attribute set and order:
             #   Name TagType DataType ExternalAccess IO="true"
@@ -592,9 +604,25 @@ class Tag(L5xElement):
                     first = "<Data>" + _tag_value.render_hex(self._value_bytes) + "</Data>"
                     ok_first = bool(self._value_bytes)
                 else:
-                    l5k_text = _tag_value.render_l5k(
-                        dt_base, self.dimensions, self._value_bytes, self._data_types_map
-                    )
+                    # Module I/O struct types need the layout-driven L5K bracket
+                    # tree (mixed-width members); the flat int32-word render_l5k is
+                    # wrong for them. Try the layout form first for IO tags, and
+                    # fall back to the flat form. Wrapped: any failure -> no L5K
+                    # (ok_first stays False -> the <Data> blocks are suppressed,
+                    # which is today's behaviour for the long path).
+                    l5k_text = None
+                    if self._io and self._taginfo_layout:
+                        try:
+                            l5k_text = _tag_value.render_l5k_layout(
+                                dt_decorated, self.dimensions, self._value_bytes,
+                                self._taginfo_layout, self._data_types_map
+                            )
+                        except Exception:
+                            l5k_text = None
+                    if l5k_text is None:
+                        l5k_text = _tag_value.render_l5k(
+                            dt_base, self.dimensions, self._value_bytes, self._data_types_map
+                        )
                     first = f'<Data Format="L5K">\n<![CDATA[{l5k_text}]]>\n</Data>'
                     ok_first = l5k_text is not None
                 if ok_first and decorated_inner is not None:
@@ -2048,6 +2076,30 @@ class TagBuilder(L5xElementBuilder):
         except Exception:
             return None
 
+    def _io_alias_for(self, io_name: str) -> Union[str, None]:
+        """AliasFor target of a per-point module I/O alias tag, or None.
+
+        A networked module exposes its connection image as a single Base tag
+        (``<module>:I`` / ``<module>:O``) whose ``Data`` member is a primitive
+        array, plus one ALIAS tag per point named ``<module>:<slot>:<I|O>`` that
+        references a primitive (SINT/INT/...).  The OEM emits each such alias as
+        ``TagType="Alias" AliasFor="<module>:<I|O>.Data[<slot>]"`` (with no
+        ``<Data>``).  The whole target is derivable from the resolved I/O name
+        (``<module>:<slot>:<type>``); no @hex@ blob is involved.
+
+        Returns the AliasFor string, or None when ``io_name`` is not a
+        ``<module>:<slot>:<I|O>`` per-point form (Config ``:C`` points and the
+        slotless ``<module>:<I|O>`` base tag are NOT aliases).  Best-effort.
+        """
+        try:
+            m = re.match(r"^(.+):(\d+):([IO])$", io_name)
+            if not m:
+                return None
+            module, slot, io_type = m.group(1), m.group(2), m.group(3)
+            return "%s:%s.Data[%s]" % (module, io_type, slot)
+        except Exception:
+            return None
+
     def build(self) -> Tag:
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
@@ -2071,13 +2123,15 @@ class TagBuilder(L5xElementBuilder):
         # emitted with the module's friendly name (Local:slot:type) and IO="true".
         # io_name is None for ordinary tags, which keeps every existing path
         # unchanged. IO tags carry no Constant attribute (OEM never emits it).
-        # Gated to the V10..V21 short-header path: that is where the OEM emits the
-        # full module I/O tag set and where the value image is complete enough to
-        # render byte-for-byte (validated on PROJ_O/PROJ_D). The V24+/V36 long path
-        # is left byte-identical — its IO value images decode incompletely (a
-        # missing trailing member would regress PROJ_A), so it stays unchanged
-        # until that decode is solid.
-        io_name = self._resolve_io_name(results[0][0]) if self._short_header else None
+        # Enabled on BOTH header families: the OEM emits genuine module-typed
+        # Base IO tags (Local:n:C/I/O, <module>:n:C/<module>:I/...) in both V10..V21
+        # short and V24+ long projects. The refinement at the bottom of build()
+        # (drop is_io unless the resolved DataType name carries a ':', i.e. a real
+        # module-defined type) keeps the slotless alias-into-module form out of the
+        # Base-IO path. The Decorated/L5K <Data> image decode is wrapped in
+        # try/except in the renderer so an incomplete value image degrades to
+        # no-<Data> (today's behaviour) rather than a wrong Structure.
+        io_name = self._resolve_io_name(results[0][0])
         is_io = io_name is not None
         if is_io:
             constant = None
@@ -2163,12 +2217,28 @@ class TagBuilder(L5xElementBuilder):
         # (Local:N:C/I/O) references a MODULE-DEFINED data type whose own name
         # carries a ':' (e.g. AB:1756_DI:C:0). The other ':'-named module records
         # (e.g. PROJ_X:1:I) are ALIASES into a parent module tag and
-        # reference a primitive (SINT/INT/...) — OEM emits those as TagType="Alias"
-        # with no <Data>, which we don't yet synthesize. Emitting them as Base IO
-        # would regress, so for those we drop is_io and let the ordinary ':' filter
-        # exclude them (== baseline behaviour). Only module-typed IO tags are kept.
+        # reference a primitive (SINT/INT/...). The OEM emits those as
+        # TagType="Alias" AliasFor="<module>:<I|O>.Data[<slot>]" with no <Data>.
+        # That target is fully derivable from the resolved I/O name, so we emit
+        # them as aliases; only when the alias target cannot be built do we drop
+        # is_io and let the ordinary ':' filter exclude them (baseline behaviour).
         if is_io and ":" not in (data_type or ""):
-            is_io = False
+            _io_alias = None
+            if not alias_for:
+                try:
+                    _io_alias = self._io_alias_for(io_name)
+                except Exception:
+                    _io_alias = None
+            if _io_alias:
+                # Per-point module I/O alias (e.g. PROJ_X:1:I). Keep the
+                # IO flag (emits IO="true", Radix="Binary"-styled alias) but make
+                # it an Alias with no DataType / no <Data>.
+                alias_for = _io_alias
+                tag_type = "Alias"
+                data_type = ""
+                constant = None
+            else:
+                is_io = False
 
         # Tag-level Description: a tag must only carry its OWN description, which
         # the comments table identifies by member_ref==0 (sub-element/member
@@ -3161,8 +3231,18 @@ class ControllerBuilder(L5xElementBuilder):
             tag._data_types_map = data_types_map
             tag._taginfo_layout = self._taginfo_layout
             # Module I/O tags carry a ':' (Local:1:C) and are kept; the ':' filter
-            # only drops other internal ':'-named records.
-            if tag.data_type and not tag.name.startswith("$") and (tag._io or ":" not in tag.name) and not tag.name.startswith("__"):
+            # only drops other internal ':'-named records. Per-point I/O ALIAS
+            # tags (PROJ_X:1:I) carry no DataType (the value lives on the
+            # target) but a non-empty alias_for, so keep them via the IO/alias
+            # path even though tag.data_type is empty.
+            keep_typed = bool(tag.data_type)
+            # Alias tags carry no DataType (the value lives on the target) but a
+            # non-empty alias_for; keep them via the alias path. This covers both
+            # per-point I/O aliases (tag._io, e.g. PROJ_X:1:I) and ordinary
+            # user aliases into an I/O point (e.g. Part_Draft_Present ->
+            # Local:1:I.Data.0), which the long-path alias resolver builds.
+            keep_alias = bool(tag.alias_for)
+            if (keep_typed or keep_alias) and not tag.name.startswith("$") and (tag._io or ":" not in tag.name) and not tag.name.startswith("__"):
                 tags.append(tag)
 
         # Get the Program Collection and get the programs

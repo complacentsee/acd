@@ -206,6 +206,166 @@ def render_l5k(dt_base: str, dimensions: Optional[str], image: bytes,
     return "[" + ",".join(str(w) for w in words) + "]"
 
 
+def render_l5k_layout(dt_base: str, dimensions: Optional[str], image: bytes,
+                      layout_map: Dict, data_types_map: Dict) -> Optional[str]:
+    """Layout-driven <Data Format="L5K"> rendering for module / struct types.
+
+    The flat int32-word form in ``render_l5k`` is wrong for module config/input
+    types whose members have mixed widths (an INT[18] config array packs two
+    16-bit words into each int32, etc.).  OEM instead emits the L5K bracket tree
+    that mirrors the datatype's MEMBER tree using the TagInfo byte-offset layout:
+
+        struct           -> ``[m0, m1, ...]``  (members in declared order)
+        atomic scalar    -> signed decimal of the member's image bytes
+        atomic array     -> ``[v0, v1, ...]``  (nested bracket, one per element)
+        nested struct    -> ``[...]``          (recursively)
+
+    Values are always plain (signed) decimals here, regardless of the member's
+    display radix (the radix only affects the Decorated block).  Returns the
+    CDATA payload, or None on any failure / unsupported shape so the caller
+    keeps today's behaviour (no regression).
+    """
+    if not layout_map:
+        return None
+    total, dim_parts = _dims_total(dimensions)
+
+    if dt_base in _ATOMIC:
+        # Atomic scalar/array: the flat form is already correct & byte-faithful.
+        return render_l5k(dt_base, dimensions, image, data_types_map)
+
+    if dt_base.upper() not in layout_map:
+        return None
+
+    if total == 0:
+        return _l5k_struct(dt_base, image, layout_map, data_types_map, 0)
+
+    stride = _struct_stride(dt_base, layout_map, data_types_map)
+    if stride is None:
+        return None
+    elems = []
+    for i in range(total):
+        sub = image[i * stride:(i + 1) * stride]
+        frag = _l5k_struct(dt_base, sub, layout_map, data_types_map, 1)
+        if frag is None:
+            return None
+        elems.append(frag)
+    return "[" + ",".join(elems) + "]"
+
+
+def _l5k_atomic(mdt: str, image: bytes, offset: int) -> Optional[str]:
+    """Signed decimal of one atomic member at ``offset`` for the L5K bracket form."""
+    if mdt not in _ATOMIC:
+        return None
+    width, fmt = _ATOMIC[mdt]
+    if offset + width > len(image):
+        return None
+    val = struct.unpack_from(fmt, image, offset)[0]
+    if mdt in ("REAL", "LREAL"):
+        return _fmt_real(val)
+    return str(val)
+
+
+def _l5k_struct(dt_name: str, image: bytes, layout_map: Dict,
+                data_types_map: Dict, depth: int) -> Optional[str]:
+    """Render one struct as the L5K bracket tree ``[m0,m1,...]``."""
+    if depth > 24:
+        return None
+    layout = _resolve_layout(dt_name, layout_map, data_types_map)
+    if layout is None:
+        return None
+    # The L5K bracket form serialises the physical STORAGE image: one entry per
+    # distinct storage location.  Unlike the Decorated block it DOES include
+    # HIDDEN members (e.g. AB:1734_4SLOT:O:0's SlotStatusBits DINTs, or the
+    # connection-header CfgSize/CfgIDNum/Reserved words that Logix hides from the
+    # Decorated view but still serialises).  BUT a BOOL member that is merely a
+    # BIT-ALIAS of a wider integer member at the same byte (e.g. Pt0FaultMode
+    # overlaying the FaultMode SINT) is NOT a separate storage location and must
+    # be skipped -- only the containing integer member is emitted.  Build the set
+    # of byte offsets owned by non-BOOL atomic / struct members, then drop any
+    # BOOL/BIT scalar member whose byte falls inside one of those.
+    covered = set()
+    for (name, mdt, off, bit, hidden, dims, def_radix) in layout:
+        if mdt in ("BOOL", "BIT") and not dims:
+            continue
+        if mdt in _ATOMIC:
+            w = _ATOMIC[mdt][0]
+        else:
+            w = _struct_stride(mdt, layout_map, data_types_map) or 1
+        n = 1
+        if dims:
+            for d in dims:
+                n *= d
+        for b in range(off, off + w * n):
+            covered.add(b)
+    parts: List[str] = []
+    for (name, mdt, off, bit, hidden, dims, def_radix) in layout:
+        if mdt in ("BOOL", "BIT") and not dims and off in covered:
+            # bit-alias of a wider integer member -> not a distinct storage slot
+            continue
+        frag = _l5k_member(mdt, off, bit, dims, image, layout_map,
+                           data_types_map, depth)
+        if frag is None:
+            return None
+        parts.append(frag)
+    return "[" + ",".join(parts) + "]"
+
+
+def _l5k_member(mdt: str, off: int, bit, dims, image: bytes, layout_map: Dict,
+                data_types_map: Dict, depth: int) -> Optional[str]:
+    """Render one member's L5K fragment (scalar text, or nested bracket)."""
+    if dims:
+        total = 1
+        for d in dims:
+            total *= d
+        if mdt in _ATOMIC:
+            width, _ = _ATOMIC[mdt]
+            if mdt in ("BOOL", "BIT"):
+                # packed BOOL array -> one int per element (0/1) from the bits
+                vals = []
+                for i in range(total):
+                    byte = off + (i // 8)
+                    if byte >= len(image):
+                        return None
+                    vals.append(str((image[byte] >> (i % 8)) & 1))
+                return "[" + ",".join(vals) + "]"
+            vals = []
+            for i in range(total):
+                vt = _l5k_atomic(mdt, image, off + i * width)
+                if vt is None:
+                    return None
+                vals.append(vt)
+            return "[" + ",".join(vals) + "]"
+        # array of nested struct
+        stride = _struct_stride(mdt, layout_map, data_types_map)
+        if stride is None:
+            return None
+        elems = []
+        for i in range(total):
+            sub = image[off + i * stride: off + (i + 1) * stride]
+            frag = _l5k_struct(mdt, sub, layout_map, data_types_map, depth + 1)
+            if frag is None:
+                return None
+            elems.append(frag)
+        return "[" + ",".join(elems) + "]"
+
+    if mdt in ("BOOL", "BIT"):
+        b = bit if bit is not None else 0
+        byte = off + (b // 8)
+        if byte >= len(image):
+            return None
+        return str((image[byte] >> (b % 8)) & 1)
+
+    if mdt in _ATOMIC:
+        return _l5k_atomic(mdt, image, off)
+
+    # nested struct member
+    stride = _struct_stride(mdt, layout_map, data_types_map)
+    if stride is None:
+        return None
+    return _l5k_struct(mdt, image[off: off + stride], layout_map,
+                       data_types_map, depth + 1)
+
+
 # --------------------------------------------------------------------------- #
 # Decorated rendering                                                          #
 # --------------------------------------------------------------------------- #
