@@ -217,6 +217,12 @@ class ExportL5x:
         )
         comments_db = DbExtract(os.path.join(self._temp_dir, "Comments.Dat")).read()
         comment_tuples = [t for record in comments_db.records.record if (t := CommentsRecord.parse(record, self._comps_short_header)) is not None]
+        # NB: the ACD stores multi-line descriptions / rung+operand comments with
+        # CRLF, and genuine Logix Designer L5X export keeps CRLF inside the CDATA
+        # (its whole file is CRLF). We deliberately PRESERVE CRLF here so our
+        # output is byte-faithful to Rockwell. (The Copia OEM reference normalizes
+        # to bare LF; that is Copia's quirk, not Rockwell's, so the gauntlet
+        # comparator normalizes newlines instead of us changing the output.)
         self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?)", comment_tuples)
         self._db.commit()
 
@@ -514,13 +520,18 @@ class ExportL5x:
         except OSError:
             return
         is_short = 1 if getattr(self, "_comps_short_header", False) else 0
-        # Marker bytes [2:4] discriminate the family (byte1 varies for LONG).
-        marker_tail = b"\x00\x09" if is_short else b"\x00\x01"
+        # Record marker = 02 ?? 00 TT (byte1 varies). The tail byte TT is the
+        # record kind and is version-dependent, NOT a clean short/long split:
+        #   01  rung region link (LONG V24+, and SHORT V11)
+        #   09  rung region link (SHORT V13..V20)
+        # so we accept either tail rather than gating on header family. (The
+        # 16-bit vs 32-bit comment-key difference is the real short/long axis and
+        # is handled in RoutineBuilder via is_short.)
         entries: List[tuple] = []
         i = 0
         n = len(data)
         while i + 16 <= n:
-            if data[i] == 0x02 and data[i + 2:i + 4] == marker_tail:
+            if data[i] == 0x02 and data[i + 2] == 0x00 and data[i + 3] in (0x01, 0x09):
                 rc_hi = struct.unpack_from("<H", data, i + 4)[0]
                 rc_lo7 = data[i + 6]
                 group_id = struct.unpack_from("<I", data, i + 8)[0]
