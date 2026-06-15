@@ -1964,6 +1964,62 @@ class TagBuilder(L5xElementBuilder):
         except Exception:
             return False
 
+    def _long_header_alias_for(self, raw_rec: bytes) -> Union[str, None]:
+        """Build a V24+ long-header alias tag's @AliasFor target, byte-exact.
+
+        An alias tag's ``main_record.data_table_instance`` points at the
+        module-element comps record it aliases into, named ``&<8hex
+        moduleCompUId>:<slot>:<C|I|O>``.  Resolving the ``&hex`` ref to the
+        module's friendly name yields the module element (e.g. ``Local:1:I``).
+        The aliased bit is in the tag record at byte ``0x26 & 0x1F``.
+
+        Only the EMBEDDED-IO sub-case (module friendly name ``Local``) has a
+        cracked, byte-exact suffix: ``<module>:<slot>:<type>.Data.<bit>`` (the
+        ``.Data.`` member is implicit for embedded I/O).  Validated 13/13 on
+        PROJ_A and 24/24 on PROJ_C.  The alias-into-alias sub-case (a
+        non-``Local`` parent module, e.g. ``PROJ_X``) uses a DIFFERENT
+        byte-0x26 encoding and a ``.<bit>`` (no ``.Data``) suffix that is not yet
+        cracked; for those we return None so the caller keeps the tag as Base
+        rather than emit a wrong (and invalid) ``TagType="Alias"`` without a
+        correct AliasFor.
+
+        Returns the full AliasFor string when it can be built byte-exactly, or
+        None on any failure / uncracked sub-case (no regression).
+        """
+        try:
+            r = RxGeneric.from_bytes(raw_rec)
+            if r.cip_type not in (0x6B, 0x68):
+                return None
+            dti = r.main_record.data_table_instance
+            if not dti:
+                return None
+            self._cur.execute(
+                "SELECT comp_name FROM comps WHERE object_id=" + str(dti)
+            )
+            row = self._cur.fetchone()
+            if not row or not row[0]:
+                return None
+            m = re.match(r"^&([0-9a-fA-F]+)(:.*)$", row[0])
+            if not m:
+                return None
+            self._cur.execute(
+                "SELECT comp_name FROM comps WHERE object_id="
+                + str(int(m.group(1), 16))
+            )
+            prow = self._cur.fetchone()
+            if not prow or not prow[0]:
+                return None
+            module_name = prow[0]
+            # Only the embedded-IO (module "Local") suffix is cracked byte-exact.
+            if module_name != "Local":
+                return None
+            if len(raw_rec) <= 0x26:
+                return None
+            bit = raw_rec[0x26] & 0x1F
+            return module_name + m.group(2) + ".Data.%d" % bit
+        except Exception:
+            return None
+
     def _resolve_io_name(self, comp_name: str) -> Union[str, None]:
         """Resolve a module I/O tag's display name, or None if it is not one.
 
@@ -2051,6 +2107,24 @@ class TagBuilder(L5xElementBuilder):
         if not self._short_header and not is_io and constant is None:
             if not self._long_header_is_alias(raw_rec):
                 constant = "false"
+
+        # --- V24+ long-header @AliasFor / TagType="Alias" ---
+        # When the alias detector fires AND we can build the AliasFor target
+        # byte-exactly (the cracked embedded-IO "Local:" sub-case), emit the tag
+        # as an Alias: TagType="Alias", AliasFor=<module>:<slot>:<type>.Data.<bit>,
+        # no DataType, no Constant, no <Data>. We deliberately gate on
+        # _long_header_alias_for succeeding (not merely on _long_header_is_alias)
+        # so the uncracked alias-into-alias sub-case stays a Base tag rather than
+        # emit an invalid Alias without a correct AliasFor. Wrapped/best-effort:
+        # any failure leaves the tag exactly as today (no regression).
+        if not self._short_header and not is_io and not alias_for:
+            try:
+                _laf = self._long_header_alias_for(raw_rec)
+            except Exception:
+                _laf = None
+            if _laf:
+                alias_for = _laf
+                constant = None
 
         # Alias tags export TagType="Alias", carry no Constant (it lives on the
         # target), and omit DataType (None -> attribute omitted).
