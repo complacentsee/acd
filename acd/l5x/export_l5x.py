@@ -228,9 +228,12 @@ class ExportL5x:
     def populate_region_map(self):
         # The Region Map body is parsed at V24+/V36-specific absolute offsets
         # (70/78). For V10..V21 short-header projects the body layout differs, so
-        # these offsets read garbage -> skip (rung<->region linkage for
-        # short-header is a separate follow-on, like the V21 rung path).
+        # the short path uses its own empirically-derived offset.
         if getattr(self, "_comps_short_header", False):
+            try:
+                self._populate_region_map_short()
+            except Exception as exc:  # noqa: BLE001 - never regress short-header export
+                log.warning("Short-header region map parse failed, skipping: {}", exc)
             return
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id=0 AND comp_name='Region Map'"
@@ -285,6 +288,84 @@ class ExportL5x:
             identifier_offset += 16
 
         self._db.commit()
+
+    # ---- SHORT (V10..V21) region map ---------------------------------------
+    # The short-header Region Map comps record (parent_id=0, comp_name='Region
+    # Map') carries a flat array of 16-byte entries that link each rung object_id
+    # to its owning routine. The entries begin at FULL-PAYLOAD offset 124, which
+    # is body offset 30 here because the short-header comps body is already sliced
+    # at payload offset 94 (see acd.record.comps._SH_BODY_OFF). Each entry is, in
+    # the SAME field order as the long-header path and as RoutineBuilder's JOIN:
+    #   [parent_id u32 @0][unknown u32 @4][seq u32 @8][object_id u32 @12]
+    # where parent_id is the routine's comps object_id and object_id is the rung's
+    # SbRegion object_id. Derived empirically on V17/V20 short-header pool files
+    # (parent_id in comps set 211/229; object_id in rungs set 223/223).
+    #
+    # VALIDATION (cross-reference recipe): an entry is only inserted when its
+    # parent_id resolves to a known comps object_id and region_length (the 16-byte
+    # entry) fits inside the body. If the parsed array fails to cross-reference
+    # broadly (no entries link to a real routine), we skip and preserve today's
+    # behaviour (empty region map) so nothing regresses.
+    _SH_REGION_ENTRY_OFF = 30  # body offset == full-payload offset 124
+
+    def _populate_region_map_short(self):
+        self._cur.execute(
+            "SELECT record FROM comps WHERE parent_id=0 AND comp_name='Region Map'"
+        )
+        results = self._cur.fetchall()
+        if not results:
+            return
+        record = results[0][0]
+
+        off = self._SH_REGION_ENTRY_OFF
+        if len(record) < off + 16:
+            return
+
+        # Known comps object_id set for cross-reference validation.
+        self._cur.execute("SELECT object_id FROM comps")
+        valid_ids = {row[0] for row in self._cur.fetchall()}
+
+        entries: List[tuple] = []
+        linked = 0
+        while off + 16 <= len(record):
+            parent_id_identifier = struct.unpack_from("<I", record, off)[0]
+            unknown_identifier = struct.unpack_from("<I", record, off + 4)[0]
+            seq_identifier = struct.unpack_from("<I", record, off + 8)[0]
+            object_id_identifier = struct.unpack_from("<I", record, off + 12)[0]
+
+            # Only keep entries whose parent (routine) is a real comps record and
+            # whose rung object_id is plausible (nonzero, not the 0xFFFFFFFF
+            # sentinel that prefixes the array).
+            if (
+                parent_id_identifier in valid_ids
+                and object_id_identifier not in (0, 0xFFFFFFFF)
+            ):
+                entries.append(
+                    (
+                        object_id_identifier,
+                        parent_id_identifier,
+                        unknown_identifier,
+                        seq_identifier,
+                        record[off : off + 16],
+                    )
+                )
+                linked += 1
+            off += 16
+
+        # Cross-reference gate: require at least one entry to link to a known
+        # routine; otherwise the offset is wrong for this file -> preserve today's
+        # behaviour (no region map) rather than emit garbage rung linkage.
+        if linked == 0:
+            log.warning(
+                "Short-header region map: no entries cross-referenced; skipping"
+            )
+            return
+
+        self._cur.executemany(
+            "INSERT INTO region_map VALUES (?, ?, ?, ?, ?)", entries
+        )
+        self._db.commit()
+        log.info("Short-header region map: linked {} rung entries", linked)
 
 
 if __name__ == "__main__":
