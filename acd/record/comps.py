@@ -35,7 +35,14 @@ _SH_OBJID_OFF = 12  # u32 object_id (self_lcg / CompUId)
 _SH_PARENT_OFF = 16  # u32 parent_id
 _SH_NAME_OFF = 20    # UTF-16LE NUL-terminated record_name
 _SH_NAME_END = 102   # name field window end (82-byte window)
-_SH_BODY_OFF = 110   # record_buffer (body) start; read to END of payload
+# record_buffer (body) start = 94, NOT 110: the body the builders/RxGeneric parse
+# must START at the 14-byte RxGeneric prelude (parent/unique_tag/rfv/cip_type/
+# comment_id), which begins at payload offset 94 (its cip_type lands at payload
+# 104 == the header cip). (acdgen's "body@110" is the content AFTER that prelude.)
+# Proven on short-header pool files: @94 -> 661/661 component bodies parse with the
+# correct cip distribution (0x6b/0x6a/0x6c/0x68); @110 -> all cip_type=0 garbage.
+# read to END of payload (the @0 record_length undercounts records w/ sub-blobs).
+_SH_BODY_OFF = 94
 #   (do NOT compute body length from the @0 record_length: it is the primary-
 #    record length and is < total payload for records carrying appended sub-blobs,
 #    which would truncate large datatype/tag bodies.)
