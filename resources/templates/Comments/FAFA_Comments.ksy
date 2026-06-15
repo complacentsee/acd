@@ -80,8 +80,12 @@ types:
           type: u4
         - id: unknown_2
           size: 0x04
-        - id: len_record
-          type: u2
+        # NB: there is NO u2 length field here. An earlier revision read a
+        # `len_record: u2` before tag_reference, which shifted tag_reference 2
+        # bytes too far (dropping the leading operand char, e.g. "[0]" -> "0]")
+        # and left record_string empty. The layout is identical to
+        # controller_record: tag_reference (the operand) begins immediately after
+        # unknown_2. Verified byte-for-byte on V34 rt=4 operand-comment records.
         - id: tag_reference
           type: strz_utf_16
         - id: unknown_3

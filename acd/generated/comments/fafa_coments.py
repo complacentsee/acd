@@ -292,7 +292,11 @@ class FafaComents(KaitaiStruct):
             self.unknown_1 = self._io.read_bytes(8)
             self.object_id = self._io.read_u4le()
             self.unknown_2 = self._io.read_bytes(4)
-            self.len_record = self._io.read_u2le()
+            # No u2 length field here (see FAFA_Comments.ksy): tag_reference (the
+            # operand string) begins immediately after unknown_2, identical to
+            # controller_record. A prior spurious `len_record: u2` read shifted
+            # tag_reference 2 bytes (dropping the leading operand char and
+            # emptying record_string).
             self.tag_reference = FafaComents.StrzUtf16(self._io, self, self._root)
             self.unknown_3 = self._io.read_bytes(self.len_unknown_3)
             self.record_string = (self._io.read_bytes_term(0, False, True, True)).decode(u"UTF-8")
