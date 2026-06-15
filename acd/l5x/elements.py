@@ -2288,13 +2288,12 @@ class TagBuilder(L5xElementBuilder):
             except Exception:
                 comment_results = []
 
-        # Operand-keyed member/bit/array comments (V10..V21 short-header only).
-        # These are stored in the comments table keyed by parent == comment_id,
-        # with the operand in the tag_reference column and the text in
-        # record_string. The long-header path leaves operand_comments empty.
+        # Operand-keyed member/bit/array comments. Stored in the comments table
+        # with the operand in tag_reference and the text in record_string.
         # Wrapped so any failure degrades to today's no-operand-comment behaviour.
         operand_comments: List[Tuple[str, str]] = []
         if self._short_header:
+            # SHORT (V10..V21): keyed by parent == comment_id; record types 3..11.
             try:
                 self._cur.execute(
                     "SELECT tag_reference, record_string FROM comments "
@@ -2305,6 +2304,32 @@ class TagBuilder(L5xElementBuilder):
                 for op_ref, op_text in self._cur.fetchall():
                     if op_ref:
                         operand_comments.append((op_ref, op_text or ""))
+            except Exception:
+                operand_comments = []
+        else:
+            # LONG (V24+): keyed by parent == comment_id*0x10000 + cip_type, as
+            # FafaComents utf_16_record (record_type 3/4/13/14): tag_reference is
+            # the operand string ("[0]", ".5", ".Member"), record_string the text.
+            # Require BOTH non-empty (empty record_string marks an internal
+            # multi-entry/member record Studio does NOT surface as a tag
+            # <Comment Operand=>, e.g. PLStgDecode). COLLISION-SAFE: only emit when
+            # the tag's comment key is owned by exactly one comp (unique_comment_key
+            # table). cip-0x68 tags share a constant comment_id, some versions
+            # collide on 0x6b, and $hash$ value backings reuse keys; those records
+            # belong to / are shared with other tags and would over-emit, so they
+            # are omitted (missing, never mis-attributed).
+            try:
+                parent_key = (r.comment_id * 0x10000) + r.cip_type
+                self._cur.execute(
+                    "SELECT c.tag_reference, c.record_string FROM comments c "
+                    "WHERE c.parent=? AND c.record_type IN (3,4,13,14) "
+                    "AND c.tag_reference!='' AND c.record_string!='' "
+                    "AND EXISTS (SELECT 1 FROM unique_comment_key u WHERE u.k=c.parent)",
+                    (parent_key,),
+                )
+                for op_ref, op_text in self._cur.fetchall():
+                    if op_ref and op_text:
+                        operand_comments.append((op_ref, op_text))
             except Exception:
                 operand_comments = []
 

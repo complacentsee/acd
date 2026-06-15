@@ -166,6 +166,30 @@ class ExportL5x:
                 except Exception:  # noqa: BLE001
                     pass
         self._cur.executemany("INSERT INTO comps VALUES (?,?,?,?,?,?)", comps_by_id.values())
+
+        # Collision-safe operand-comment keying (long-header). An operand comment
+        # is keyed by parent == comment_id*0x10000 + cip_type, but that key is NOT
+        # unique for every comp: cip-0x68 tags all carry a constant comment_id, and
+        # some versions collide on cip-0x6b too, which would smear one tag's
+        # operand comments across many. Precompute the set of comment keys owned by
+        # exactly ONE comp; TagBuilder only emits long-header operand comments for
+        # tags whose key is in this set (others are omitted -> missing, never
+        # mis-attributed). cip_type is u2 @ record offset 10, comment_id u2 @ 12
+        # (RxGeneric prelude); read directly to avoid a full parse per comp.
+        self._cur.execute("CREATE TABLE unique_comment_key(k INTEGER PRIMARY KEY)")
+        _key_counts: Dict[int, int] = {}
+        for _t in comps_by_id.values():
+            _rec = _t[5]
+            if len(_rec) >= 14:
+                _cip = int.from_bytes(_rec[10:12], "little")
+                _cid = int.from_bytes(_rec[12:14], "little")
+                _k = (_cid << 16) | _cip
+                _key_counts[_k] = _key_counts.get(_k, 0) + 1
+        self._cur.executemany(
+            "INSERT OR IGNORE INTO unique_comment_key VALUES (?)",
+            [(k,) for k, n in _key_counts.items() if n == 1],
+        )
+
         # Full-payload table for the tag-value reader (Step 6b); separate so the
         # deduped comps table and every existing query stay byte-for-byte the same.
         self._cur.execute(
