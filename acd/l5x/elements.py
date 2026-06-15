@@ -464,12 +464,9 @@ class Tag(L5xElement):
         base = super().to_xml()
 
         # --- Description child element ---
-        # Find tag-level description: empty tag_reference means the tag itself.
-        # Tags with multiple empty-ref entries (e.g. array-element bit descriptions
-        # alongside the tag description) store the real tag description as the
-        # longest entry — short entries like "Spare" or "End CIP" are element labels.
-        candidates = [text for ref, text in self._comments if ref in ("", ".") and text]
-        desc_raw = max(candidates, key=len) if candidates else None
+        # _comments now carries at most the tag's OWN description (member_ref==0),
+        # already filtered in TagBuilder.build. Take the first non-empty entry.
+        desc_raw = next((text for _ref, text in self._comments if text), None)
         desc = self._sanitize_xml_text(desc_raw) if desc_raw else None
         desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>' if desc else ""
 
@@ -1734,6 +1731,8 @@ class ModuleBuilder(L5xElementBuilder):
 
 @dataclass
 class TagBuilder(L5xElementBuilder):
+    _short_header: bool = field(default=False)
+
     def build(self) -> Tag:
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
@@ -1773,11 +1772,35 @@ class TagBuilder(L5xElementBuilder):
             data_type_results = self._cur.fetchall()
             data_type = data_type_results[0][0]
 
-        self._cur.execute(
-            "SELECT tag_reference, record_string FROM comments WHERE parent="
-            + str((r.comment_id * 0x10000) + r.cip_type)
-        )
-        comment_results = self._cur.fetchall()
+        # Tag-level Description: a tag must only carry its OWN description, which
+        # the comments table identifies by member_ref==0 (sub-element/member
+        # descriptions have a nonzero member_ref). The previous behaviour fetched
+        # EVERY comment for the parent and stamped the longest as a Description on
+        # the tag, over-emitting member descriptions as tag Descriptions.
+        #
+        # The exact comment is identified by the member_ref stored in bytes
+        # [14:18] of the tag's OWN comps record (the same discriminator used by
+        # MemberBuilder/Parameter/LocalTag): nonzero for tags whose description
+        # lives under a member_ref (e.g. alias tags into a shared I/O module),
+        # zero for a tag's plain own description. The member_ref@14 read is a
+        # LONG-header (V24+) construct; for V10..V21 short-header records we emit
+        # no tag-level Description rather than risk a wrong lookup. Wrapped so any
+        # failure degrades to today's no-description behaviour.
+        comment_results: List[Tuple[str, str]] = []
+        if not self._short_header:
+            try:
+                member_ref = 0
+                if len(raw_rec) >= 18:
+                    member_ref = struct.unpack_from("<I", raw_rec, 14)[0]
+                self._cur.execute(
+                    "SELECT record_string FROM comments WHERE parent=? AND member_ref=? LIMIT 1",
+                    ((r.comment_id * 0x10000) + r.cip_type, member_ref),
+                )
+                desc_row = self._cur.fetchone()
+                if desc_row and desc_row[0]:
+                    comment_results = [("", desc_row[0])]
+            except Exception:
+                comment_results = []
 
         extended_records: Dict[int, bytes] = {}
         for extended_record in r.extended_records:
@@ -2325,6 +2348,7 @@ class AoiBuilder(L5xElementBuilder):
 class ProgramBuilder(L5xElementBuilder):
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
     _redundancy_enabled: bool = field(default=False)
+    _short_header: bool = field(default=False)
 
     def build(self) -> Program:
         self._cur.execute(
@@ -2410,7 +2434,7 @@ class ProgramBuilder(L5xElementBuilder):
                 + str(results[0][1])
             )
             for result in self._cur.fetchall():
-                tag = TagBuilder(self._cur, result[1]).build()
+                tag = TagBuilder(self._cur, result[1], _short_header=self._short_header).build()
                 tag._data_types_map = self._data_types_map
                 tags.append(tag)
 
@@ -2668,7 +2692,7 @@ class ControllerBuilder(L5xElementBuilder):
         tags: List[Tag] = []
         for result in results:
             _tag_object_id = result[1]
-            tag = TagBuilder(self._cur, _tag_object_id).build()
+            tag = TagBuilder(self._cur, _tag_object_id, _short_header=self._short_header).build()
             tag._data_types_map = data_types_map
             if tag.data_type and not tag.name.startswith("$") and ":" not in tag.name and not tag.name.startswith("__"):
                 tags.append(tag)
@@ -2693,7 +2717,7 @@ class ControllerBuilder(L5xElementBuilder):
         for result in results:
             _program_object_id = result[1]
             programs.append(
-                ProgramBuilder(self._cur, _program_object_id, data_types_map, redundancy_enabled).build()
+                ProgramBuilder(self._cur, _program_object_id, data_types_map, redundancy_enabled, _short_header=self._short_header).build()
             )
 
         # Build comment_id → program name map for task scheduled-program resolution.
