@@ -183,7 +183,7 @@ class ExportL5x:
             "Getting records from ACD Comments file and storing in sqllite database"
         )
         comments_db = DbExtract(os.path.join(self._temp_dir, "Comments.Dat")).read()
-        comment_tuples = [t for record in comments_db.records.record if (t := CommentsRecord.parse(record)) is not None]
+        comment_tuples = [t for record in comments_db.records.record if (t := CommentsRecord.parse(record, self._comps_short_header)) is not None]
         self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?)", comment_tuples)
         self._db.commit()
 

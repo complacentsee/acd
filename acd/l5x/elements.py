@@ -431,6 +431,10 @@ class Tag(L5xElement):
     _data_table_instance: int
     _comments: List[Tuple[str, str]]
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
+    # Operand-keyed member/bit/array comments: list of (operand, text) pairs,
+    # e.g. ("[3]", "Hydraulic Pump\r\nStart"). Empty by default (long-header
+    # path leaves these untouched).
+    _operand_comments: List[Tuple[str, str]] = field(default_factory=list)
 
     @property
     def _l5x_exclude(self) -> bool:
@@ -460,8 +464,38 @@ class Tag(L5xElement):
                 parts.append(f"&#x{cp:04X};")
         return "".join(parts)
 
+    def _build_comments_xml(self) -> str:
+        """Build the <Comments> block of operand-keyed member/bit/array comments.
+
+        Each entry becomes <Comment Operand="...">text</Comment>; the block is
+        emitted only when there is at least one operand comment. Operand strings
+        are de-duplicated (first occurrence wins) and sorted to give stable,
+        Logix-like ordering.
+        """
+        if not self._operand_comments:
+            return ""
+        seen = set()
+        items: List[Tuple[str, str]] = []
+        for operand, text in self._operand_comments:
+            if not operand or operand in seen:
+                continue
+            seen.add(operand)
+            items.append((operand, text))
+        if not items:
+            return ""
+        parts = ["<Comments>"]
+        for operand, text in items:
+            op_attr = html.escape(operand, quote=True)
+            body = self._sanitize_xml_text(text) if text else ""
+            parts.append(f'<Comment Operand="{op_attr}">\n<![CDATA[{body}]]>\n</Comment>')
+        parts.append("</Comments>")
+        return "".join(parts)
+
     def to_xml(self) -> str:
         base = super().to_xml()
+
+        # --- Comments child element (operand-keyed member/bit/array comments) ---
+        comments_xml = self._build_comments_xml()
 
         # --- Description child element ---
         # _comments now carries at most the tag's OWN description (member_ref==0),
@@ -485,12 +519,13 @@ class Tag(L5xElement):
             if decorated:
                 data_xml = decorated
 
-        if not desc_xml and not data_xml:
+        if not comments_xml and not desc_xml and not data_xml:
             return base
 
-        # Insert Description (if any) then Data (if any) immediately after the opening tag.
+        # Insert Comments (if any), then Description, then Data, immediately after
+        # the opening tag. Logix emits <Comments> before <Description>/<Data>.
         idx = base.index(">")
-        return base[:idx + 1] + desc_xml + data_xml + base[idx + 1:]
+        return base[:idx + 1] + comments_xml + desc_xml + data_xml + base[idx + 1:]
 
 
 @dataclass
@@ -1802,6 +1837,26 @@ class TagBuilder(L5xElementBuilder):
             except Exception:
                 comment_results = []
 
+        # Operand-keyed member/bit/array comments (V10..V21 short-header only).
+        # These are stored in the comments table keyed by parent == comment_id,
+        # with the operand in the tag_reference column and the text in
+        # record_string. The long-header path leaves operand_comments empty.
+        # Wrapped so any failure degrades to today's no-operand-comment behaviour.
+        operand_comments: List[Tuple[str, str]] = []
+        if self._short_header:
+            try:
+                self._cur.execute(
+                    "SELECT tag_reference, record_string FROM comments "
+                    "WHERE parent=? AND record_type IN (3,4,5,6,7,9,10,11) "
+                    "AND tag_reference!=''",
+                    (r.comment_id,),
+                )
+                for op_ref, op_text in self._cur.fetchall():
+                    if op_ref:
+                        operand_comments.append((op_ref, op_text or ""))
+            except Exception:
+                operand_comments = []
+
         extended_records: Dict[int, bytes] = {}
         for extended_record in r.extended_records:
             extended_records[extended_record.attribute_id] = bytes(
@@ -1824,6 +1879,7 @@ class TagBuilder(L5xElementBuilder):
                 results[0][0], results[0][0], "Base", data_type, radix,
                 external_access, constant, dimensions, r.main_record.data_table_instance,
                 comment_results,
+                _operand_comments=operand_comments,
             )
 
         name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
@@ -1851,6 +1907,7 @@ class TagBuilder(L5xElementBuilder):
             dimensions,
             r.main_record.data_table_instance,
             comment_results,
+            _operand_comments=operand_comments,
         )
 
 

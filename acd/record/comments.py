@@ -59,9 +59,92 @@ class CommentsRecord:
             return None
 
     @staticmethod
-    def parse(dat_record: DatRecord) -> Optional[tuple]:
+    def _parse_short_operand_body(raw: bytes) -> Optional[tuple]:
+        """Parse a V10..V21 short-header operand comment record (types 3/4/5).
+
+        These RSLogix-style operand comments store, per member/bit/array element:
+          [0:4]   u32 record_length
+          [4:6]   u16 seq_number
+          [6:8]   u16 record_type
+          [8:10]  u16 sub_record_length
+          [10:14] u32 parent  (== the owning component's comment_id)
+        then the body (raw[14:]):
+          [0:6]   six zero bytes
+          [6:8]   u16 member key (a per-element discriminator)
+          [8:12]  u32 object_id (controller/scope object, constant per project)
+          [12]    one pad byte (0x00)
+          [13:]   UTF-16LE NUL-terminated OPERAND string ("[3]", ".5", ".DINT[1]")
+          [..]    UTF-16LE NUL-terminated comment text (newlines kept as CR/LF)
+
+        Returns the 9-tuple matching the comments table schema, or None.  The
+        operand goes into the tag_reference column and the comment text into
+        record_string so the existing comments-table join can read both.
+        """
+        if len(raw) < 14:
+            return None
+        record_length = struct.unpack_from("<I", raw, 0)[0]
+        seq_number = struct.unpack_from("<H", raw, 4)[0]
+        sub_record_length = struct.unpack_from("<H", raw, 8)[0]
+        parent = struct.unpack_from("<I", raw, 10)[0]
+        body = raw[14:]
+        if len(body) < 14:
+            return None
+        member_key = struct.unpack_from("<H", body, 6)[0]
+        object_id = struct.unpack_from("<I", body, 8)[0]
+
+        def _utf16z(buf: bytes, pos: int):
+            cus = []
+            while pos + 1 < len(buf):
+                cu = struct.unpack_from("<H", buf, pos)[0]
+                pos += 2
+                if cu == 0:
+                    break
+                cus.append(cu)
+            return "".join(chr(c) for c in cus), pos
+
+        operand, pos = _utf16z(body, 13)
+        text, _ = _utf16z(body, pos)
+        if not operand:
+            return None
+        return (
+            seq_number,
+            sub_record_length,
+            object_id,
+            text,
+            struct.unpack_from("<H", raw, 6)[0],  # record_type
+            parent,
+            operand,        # tag_reference column carries the L5X Operand
+            0,              # rung_content
+            member_key,     # member_ref column carries the per-element key
+        )
+
+    @staticmethod
+    def parse(dat_record: DatRecord, short_header: bool = False) -> Optional[tuple]:
         if dat_record.identifier != 64250:
             return None
+        raw_full = bytes(dat_record.record.record_buffer)
+        # V10..V21 short-header operand comments (member/bit/array element
+        # comments) use a different body layout than V24+ long-header records.
+        # Decode them here so TagBuilder can emit <Comment Operand="..."> children.
+        # Long-header export is untouched: this branch is gated on short_header
+        # and falls through to the original parser on any failure.
+        if short_header and len(raw_full) >= 8:
+            try:
+                rt = struct.unpack_from("<H", raw_full, 6)[0]
+                # Operand comment record types observed across V10..V21 projects:
+                #   3/4/5  array/bit/element comments on atomic tags
+                #   6      IO-module .DATA comments
+                #   7      array-of-struct element.bit comments ("[0].10")
+                #   9/10/11 UDT-member comments (".DINT[1]", ".BOOL[19]")
+                # All share the same body layout (operand UTF-16 at body+13).
+                # Types 1/2 (plain own-description) and the long-header UTF-16
+                # record types are deliberately excluded.
+                if rt in (0x03, 0x04, 0x05, 0x06, 0x07, 0x09, 0x0A, 0x0B):
+                    parsed = CommentsRecord._parse_short_operand_body(raw_full)
+                    if parsed is not None:
+                        return parsed
+            except Exception:
+                pass
         try:
             r = FafaComents.from_bytes(dat_record.record.record_buffer)
             # Type-12 (0x0C) records carry UDI metadata such as the AOI RevisionNote.
