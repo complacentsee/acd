@@ -456,10 +456,19 @@ class Tag(L5xElement):
     # decode the value image into a full Decorated tree. Empty -> the existing
     # render_decorated/zero path is used (no behaviour change).
     _taginfo_layout: Dict[str, object] = field(default_factory=dict)
+    # True for module I/O tags (Local:1:C, Local:8:O, ...). When set, the tag is
+    # NOT excluded for its ':' name, the OEM IO="true" attribute is emitted, and
+    # Radix/Constant/Dimensions are suppressed (OEM never emits them on IO tags).
+    # Defaults False so every non-IO tag (both header families) is unchanged.
+    _io: bool = False
 
     @property
     def _l5x_exclude(self) -> bool:
         """Exclude tags with empty or non-identifier names (hex-address placeholders, etc.)."""
+        # Module I/O tags carry a ':' in their name (Local:1:C) but are valid and
+        # MUST be emitted; only their ':' would otherwise trip the filter below.
+        if self._io:
+            return not self.name
         return (
             not self.name
             or not (self.name[0].isalpha() or self.name[0] == "_")
@@ -513,7 +522,18 @@ class Tag(L5xElement):
         return "".join(parts)
 
     def to_xml(self) -> str:
-        base = super().to_xml()
+        if self._io:
+            # Module I/O tag — emit the exact OEM attribute set and order:
+            #   Name TagType DataType ExternalAccess IO="true"
+            # (no Radix/Constant/Dimensions, which OEM never writes on IO tags).
+            dt_attr = f' DataType="{html.escape(self.data_type, quote=True)}"' if self.data_type else ""
+            base = (
+                f'<Tag Name="{html.escape(self.name, quote=True)}"'
+                f' TagType="{self.tag_type}"{dt_attr}'
+                f' ExternalAccess="{self.external_access}" IO="true"></Tag>'
+            )
+        else:
+            base = super().to_xml()
 
         # --- Comments child element (operand-keyed member/bit/array comments) ---
         comments_xml = self._build_comments_xml()
@@ -534,6 +554,12 @@ class Tag(L5xElement):
         # target). Suppress all data emission when this is an alias.
         is_alias = self.tag_type == "Alias" or self.alias_for is not None
         dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
+        # Module I/O types keep their ORIGINAL case in the <Structure DataType=...>
+        # attribute (OEM writes AB:Embedded_IQ16F:C:0, not the uppercased form the
+        # generic-tag path uses). render_decorated_layout uppercases internally for
+        # the layout lookup, so passing the original-case name is safe and keeps
+        # the Structure attribute byte-faithful. Non-IO tags are unchanged.
+        dt_decorated = (self.data_type.split("[")[0] if (self._io and self.data_type) else dt_base)
 
         # --- Step 6c: real value <Data> from the design-value image (0x66) ---
         # When the value reader returned an image, emit BOTH the OEM blocks Logix
@@ -553,7 +579,7 @@ class Tag(L5xElement):
                 if self._taginfo_layout:
                     try:
                         decorated_inner = _tag_value.render_decorated_layout(
-                            dt_base, self.dimensions, self._value_bytes,
+                            dt_decorated, self.dimensions, self._value_bytes,
                             self._taginfo_layout, self._data_types_map
                         )
                     except Exception:
@@ -1906,6 +1932,34 @@ class TagBuilder(L5xElementBuilder):
         except Exception:
             return None, 0
 
+    def _resolve_io_name(self, comp_name: str) -> Union[str, None]:
+        """Resolve a module I/O tag's display name, or None if it is not one.
+
+        I/O config/input/output tags are stored in Comps.Dat under a synthetic
+        name of the form ``&<8hex moduleCompUId>:<slot>:<C|I|O>`` (e.g.
+        ``&9928c4af:2:C``).  The OEM L5X emits these with the module's *friendly*
+        name substituted for the ``&hex`` ref, e.g. ``Local:2:C``.  This is the
+        same ``&hex`` resolution used by the alias decoder.
+
+        Returns the resolved ``<module>:<slot>:<type>`` name, or None when the
+        comp_name is not an ``&hex:`` module-tag reference (so the caller keeps
+        the ordinary tag path).  Best-effort: any failure returns None.
+        """
+        try:
+            m = re.match(r"^&([0-9a-fA-F]+)(:.*)$", comp_name)
+            if not m:
+                return None
+            self._cur.execute(
+                "SELECT comp_name FROM comps WHERE object_id="
+                + str(int(m.group(1), 16))
+            )
+            row = self._cur.fetchone()
+            if not row or not row[0]:
+                return None
+            return row[0] + m.group(2)
+        except Exception:
+            return None
+
     def build(self) -> Tag:
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
@@ -1924,15 +1978,31 @@ class TagBuilder(L5xElementBuilder):
             external_access = "Read/Write"
             constant = None
 
+        # --- Module I/O tag detection (both header families) ---
+        # I/O tags are stored as ``&<hex moduleCompUId>:slot:type`` and must be
+        # emitted with the module's friendly name (Local:slot:type) and IO="true".
+        # io_name is None for ordinary tags, which keeps every existing path
+        # unchanged. IO tags carry no Constant attribute (OEM never emits it).
+        # Gated to the V10..V21 short-header path: that is where the OEM emits the
+        # full module I/O tag set and where the value image is complete enough to
+        # render byte-for-byte (validated on PROJ_O/PROJ_D). The V24+/V36 long path
+        # is left byte-identical — its IO value images decode incompletely (a
+        # missing trailing member would regress PROJ_A), so it stays unchanged
+        # until that decode is solid.
+        io_name = self._resolve_io_name(results[0][0]) if self._short_header else None
+        is_io = io_name is not None
+        if is_io:
+            constant = None
+
         # --- V10..V21 short-header (Step 6a) ---
         # Alias detection + the Base-tag Constant="false" OEM invariant. Both are
         # gated to the short-header path so the long-header (V24+) export is
         # byte-for-byte unchanged. The long path's 0x278/0x279 offsets do not hold
         # the Constant flag for short-header records (observed 0), so we apply the
         # OEM invariant instead: Logix always emits Constant="false" on Base
-        # non-IO tags. IO tags (':' in name) are excluded from export upstream.
+        # non-IO tags. IO tags are emitted with their own attribute set below.
         alias_for: Union[str, None] = None
-        if self._short_header:
+        if self._short_header and not is_io:
             alias_for = self._short_header_alias_for(raw_rec)
             if alias_for is None and constant is None:
                 constant = "false"
@@ -1946,15 +2016,19 @@ class TagBuilder(L5xElementBuilder):
         try:
             r = RxGeneric.from_bytes(raw_rec)
         except Exception as e:
+            _nm = io_name or results[0][0]
             return Tag(
-                results[0][0], results[0][0], tag_type, None if alias_for else "",
-                None, external_access, constant, None, 0, [], alias_for=alias_for
+                _nm, _nm, tag_type, None if alias_for else "",
+                None, external_access, constant, None, 0, [],
+                alias_for=alias_for, _io=is_io,
             )
 
         if r.cip_type != 0x6B and r.cip_type != 0x68:
+            _nm = io_name or results[0][0]
             return Tag(
-                results[0][0], results[0][0], tag_type, None if alias_for else "",
-                None, external_access, constant, None, 0, [], alias_for=alias_for
+                _nm, _nm, tag_type, None if alias_for else "",
+                None, external_access, constant, None, 0, [],
+                alias_for=alias_for, _io=is_io,
             )
         if r.main_record.data_type == 0xFFFFFFFF:
             data_type = ""
@@ -1965,6 +2039,17 @@ class TagBuilder(L5xElementBuilder):
             )
             data_type_results = self._cur.fetchall()
             data_type = data_type_results[0][0]
+
+        # Refine IO classification: a genuine module config/input/output tag
+        # (Local:N:C/I/O) references a MODULE-DEFINED data type whose own name
+        # carries a ':' (e.g. AB:1756_DI:C:0). The other ':'-named module records
+        # (e.g. PROJ_X:1:I) are ALIASES into a parent module tag and
+        # reference a primitive (SINT/INT/...) — OEM emits those as TagType="Alias"
+        # with no <Data>, which we don't yet synthesize. Emitting them as Base IO
+        # would regress, so for those we drop is_io and let the ordinary ':' filter
+        # exclude them (== baseline behaviour). Only module-typed IO tags are kept.
+        if is_io and ":" not in (data_type or ""):
+            is_io = False
 
         # Tag-level Description: a tag must only carry its OWN description, which
         # the comments table identifies by member_ref==0 (sub-element/member
@@ -2038,8 +2123,9 @@ class TagBuilder(L5xElementBuilder):
                 (None, 0) if alias_for
                 else self._read_tag_value(r.main_record.data_table_instance)
             )
+            _nm = io_name or results[0][0]
             return Tag(
-                results[0][0], results[0][0], tag_type,
+                _nm, _nm, tag_type,
                 None if alias_for else data_type, radix,
                 external_access, constant, dimensions, r.main_record.data_table_instance,
                 comment_results,
@@ -2048,6 +2134,7 @@ class TagBuilder(L5xElementBuilder):
                 _value_bytes=value_bytes,
                 _value_type_code=value_type_code,
                 _short_header=self._short_header,
+                _io=is_io,
             )
 
         name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
@@ -2068,9 +2155,10 @@ class TagBuilder(L5xElementBuilder):
             (None, 0) if alias_for
             else self._read_tag_value(r.main_record.data_table_instance)
         )
+        _nm = io_name or name
         return Tag(
-            name,
-            name,
+            _nm,
+            _nm,
             tag_type,
             None if alias_for else data_type,
             radix,
@@ -2084,6 +2172,7 @@ class TagBuilder(L5xElementBuilder):
             _value_bytes=value_bytes,
             _value_type_code=value_type_code,
             _short_header=self._short_header,
+            _io=is_io,
         )
 
 
@@ -2934,7 +3023,9 @@ class ControllerBuilder(L5xElementBuilder):
             tag = TagBuilder(self._cur, _tag_object_id, _short_header=self._short_header).build()
             tag._data_types_map = data_types_map
             tag._taginfo_layout = self._taginfo_layout
-            if tag.data_type and not tag.name.startswith("$") and ":" not in tag.name and not tag.name.startswith("__"):
+            # Module I/O tags carry a ':' (Local:1:C) and are kept; the ':' filter
+            # only drops other internal ':'-named records.
+            if tag.data_type and not tag.name.startswith("$") and (tag._io or ":" not in tag.name) and not tag.name.startswith("__"):
                 tags.append(tag)
 
         # Get the Program Collection and get the programs
