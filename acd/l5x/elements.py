@@ -2633,24 +2633,48 @@ class RoutineBuilder(L5xElementBuilder):
                     )
                 rungs = [_resolve(r) if r else r for r in rungs]
 
-        # Fetch rung-level comments from the comments table.
-        # Rung comments are stored under the routine's own comment parent key
-        # (comment_id * 0x10000 + cip_type), as AsciiRecord (record_type=1) entries
-        # where rung_content != 0 (distinguishes user rung comments from internal
-        # metadata strings like FBDRoutineDescription which have rung_content=0).
-        # The object_id field is the 1-based rung index (rung 0 -> object_id=1).
+        # Fetch rung-level comments and map each to its rung Number.
+        #
+        # A rung comment lives in Comments.Dat keyed only by its own rung_content
+        # (an id that appears NOWHERE in the rung/SbRegion data). The link from a
+        # rung to its comment is RegnLink.Dat (the regn_link table): each rung_oid
+        # is paired with its comment's rung_content, encoded as
+        #   rc_hi  = rung_content >> 16
+        #   rc_lo7 = rung_content & 0x7f
+        # which is globally unique. rung_ids[i] is the SbRegion object_id of the
+        # rung at Number i (from region_map, ordered above), so joining this
+        # routine's rung_oids -> regn_link -> comments by the encoded rung_content
+        # yields rung_oid -> comment text, and the rung Number is the position of
+        # rung_oid in rung_ids. (The legacy "object_id - 1" scheme was wrong:
+        # the comment object_id is always 1.) Best-effort: if regn_link is empty
+        # (parse failed / stream absent) no rung comments are attached.
         rung_comments: Dict[int, str] = {}
         try:
-            comment_parent = (r.comment_id * 0x10000) + r.cip_type
-            self._cur.execute(
-                "SELECT object_id, record_string FROM comments "
-                "WHERE parent=? AND record_type=1 AND rung_content!=0",
-                (comment_parent,),
-            )
-            for obj_id, rec_str in self._cur.fetchall():
-                rung_index = obj_id - 1  # convert 1-based to 0-based
-                if rung_index >= 0 and rec_str and rung_index not in rung_comments:
-                    rung_comments[rung_index] = rec_str
+            if rung_ids:
+                oid_to_number = {oid: idx for idx, oid in enumerate(rung_ids)}
+                placeholders = ",".join("?" for _ in rung_ids)
+                # The encoded comment key differs by header family (see
+                # ExportL5x.populate_regn_link): LONG-header comments carry the
+                # full 32-bit rung_content, matched by (rc>>16, rc&0x7f); the
+                # SHORT-header (V10-V21) comment parser yields a 16-bit
+                # rung_content (== the hi16), matched directly against rc_hi. The
+                # rl.is_short flag (constant per file) selects the right branch.
+                self._cur.execute(
+                    "SELECT rl.rung_oid, c.record_string "
+                    "FROM regn_link rl "
+                    "JOIN comments c "
+                    "  ON (rl.is_short=1 AND c.rung_content = rl.rc_hi) "
+                    "  OR (rl.is_short=0 "
+                    "      AND (c.rung_content >> 16) = rl.rc_hi "
+                    "      AND (c.rung_content & 127) = rl.rc_lo7) "
+                    "WHERE c.record_type=1 AND c.rung_content!=0 "
+                    "  AND rl.rung_oid IN (" + placeholders + ")",
+                    rung_ids,
+                )
+                for rung_oid, rec_str in self._cur.fetchall():
+                    number = oid_to_number.get(rung_oid)
+                    if number is not None and rec_str and number not in rung_comments:
+                        rung_comments[number] = rec_str
         except Exception:
             pass
 

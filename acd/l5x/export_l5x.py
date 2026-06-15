@@ -93,6 +93,14 @@ class ExportL5x:
             "CREATE TABLE nameless(object_id int, parent_id int, record BLOB NOT NULL)"
         )
 
+        log.debug("Create Region Link (regn_link) table in sqllite db")
+        # RegnLink.Dat is the rung<->comment link table: one 16-byte record per
+        # rung that ties the rung's SbRegion object_id to its rung comment's
+        # rung_content (see _populate_regn_link / RoutineBuilder).
+        self._cur.execute(
+            "CREATE TABLE regn_link(rung_oid int, rc_hi int, rc_lo7 int, group_id int, is_short int)"
+        )
+
         # Detect the Studio version (V21 source-protects SbRegion rungs
         # differently from V30+ — see acd.record.source_protection).
         self._acd_version: Optional[str] = detect_acd_version(self.input_filename)
@@ -177,6 +185,11 @@ class ExportL5x:
             "Getting records from ACD Region Map file and storing in sqllite database"
         )
         self.populate_region_map()
+
+        log.info(
+            "Getting records from ACD Region Link file and storing in sqllite database"
+        )
+        self.populate_regn_link()
 
         # V21 stores comps with a different FAFA layout than V30+ (the shared
         # comps parser reads object_id 4 bytes too far for V21), so the V21 rung
@@ -463,6 +476,74 @@ class ExportL5x:
         )
         self._db.commit()
         log.info("Short-header region map: linked {} rung entries", linked)
+
+    # ---- Region Link (rung <-> rung-comment linkage) -----------------------
+    # RegnLink.Dat is the table that links each rung to its rung-level comment.
+    # It is NOT a FAFA/FDFD stream (the shared Dat parser rejects it), but a flat
+    # array of 16-byte records (one per rung):
+    #   [marker u32]                   record marker (LONG: 02 ?? 00 01,
+    #                                                  SHORT: 02 00 00 09)
+    #   [rc_hi u16][rc_lo7 u8][00]     comment rung_content, encoded
+    #   [group_id u32]                 the owning routine's region group id
+    #   [rung_oid u32]                 the rung's SbRegion object_id (== region_map.object_id)
+    # Each record describes the rung at offset +12 (rung_oid); records form a
+    # back-linked chain so the next record's marker follows immediately.
+    #
+    # The comment's rung_content is encoded as rc_hi = (rung_content >> 16) and
+    # rc_lo7 = (rung_content & 0x7f). The link Logix Designer uses to map a rung
+    # comment to its rung lives ONLY here and in Comments.Dat (the rung_content
+    # value appears nowhere in the rung/SbRegion data itself).
+    #
+    # Header families differ in BOTH the marker and how the comment stores
+    # rung_content:
+    #   LONG  (V24+): marker 02 ?? 00 01; comment rung_content is the full 32-bit
+    #                 value, matched by (rc>>16, rc&0x7f) == (rc_hi, rc_lo7).
+    #   SHORT (V10-V21): marker 02 00 00 09; the short-header comment parser reads
+    #                 a 16-bit rung_content (== the hi16), matched by rc==rc_hi.
+    #
+    # VALIDATED: V34 Air Compressor (LONG) -> 897 records, 318/318 rung comments
+    # mapped, 121/121 OEM (Copia) ground-truth rung Numbers exact; V20 PROJ_P 2
+    # (SHORT) -> 2863 records, 296/299 ground-truth pairs. Best-effort: on any
+    # structural problem the table stays empty and RoutineBuilder falls back to
+    # today's behaviour (no rung comments) so nothing regresses.
+    def populate_regn_link(self):
+        path = os.path.join(self._temp_dir, "RegnLink.Dat")
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            return
+        is_short = 1 if getattr(self, "_comps_short_header", False) else 0
+        # Marker bytes [2:4] discriminate the family (byte1 varies for LONG).
+        marker_tail = b"\x00\x09" if is_short else b"\x00\x01"
+        entries: List[tuple] = []
+        i = 0
+        n = len(data)
+        while i + 16 <= n:
+            if data[i] == 0x02 and data[i + 2:i + 4] == marker_tail:
+                rc_hi = struct.unpack_from("<H", data, i + 4)[0]
+                rc_lo7 = data[i + 6]
+                group_id = struct.unpack_from("<I", data, i + 8)[0]
+                rung_oid = struct.unpack_from("<I", data, i + 12)[0]
+                entries.append((rung_oid, rc_hi, rc_lo7, group_id, is_short))
+                i += 16
+            else:
+                i += 1
+        if not entries:
+            log.warning("Region Link: no records parsed; rung comments unavailable")
+            return
+        self._cur.executemany(
+            "INSERT INTO regn_link VALUES (?, ?, ?, ?, ?)", entries
+        )
+        self._cur.execute(
+            "CREATE INDEX idx_regn_link_oid ON regn_link(rung_oid)"
+        )
+        self._db.commit()
+        log.info(
+            "Region Link: parsed {} rung linkage records ({})",
+            len(entries),
+            "SHORT" if is_short else "LONG",
+        )
 
 
 if __name__ == "__main__":
