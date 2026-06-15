@@ -215,6 +215,21 @@ class ExportL5x:
         self._cur.executemany("INSERT INTO nameless VALUES (?,?,?)", nameless_tuples)
         self._db.commit()
 
+        # Step 6d: parse TagInfo.XML ONCE into a datatype -> member byte-layout
+        # map used to decode tag value images into the Decorated <Data> tree.
+        # Best-effort; on any failure the map is empty and the zero-generator
+        # fallback in Tag.to_xml keeps today's behaviour (no regression).
+        self._taginfo_layout: Dict[str, object] = {}
+        try:
+            self._taginfo_layout = self._parse_taginfo_layout(
+                os.path.join(self._temp_dir, "TagInfo.XML")
+            )
+            log.info("TagInfo layout: {} datatypes", sum(
+                1 for k in self._taginfo_layout if not k.startswith("@size@")))
+        except Exception as exc:  # noqa: BLE001 - never block export
+            log.warning("TagInfo layout parse failed, skipping value decode: {}", exc)
+            self._taginfo_layout = {}
+
         log.info("Creating indexes for fast object graph queries")
         self._cur.execute("CREATE INDEX idx_comps_object_id ON comps(object_id)")
         self._cur.execute("CREATE INDEX idx_comps_parent_id ON comps(parent_id)")
@@ -224,11 +239,73 @@ class ExportL5x:
         self._cur.execute("CREATE INDEX idx_comments_parent ON comments(parent)")
         self._db.commit()
 
+    @staticmethod
+    def _parse_taginfo_layout(taginfo_path: str) -> Dict[str, object]:
+        """Build {DATATYPE_UPPER: [(name, dt, offset, bit, hidden, dims), ...]}.
+
+        Also stores "@size@<NAME>" -> int Size for each datatype so the value
+        decoder can compute per-element strides for arrays of structs. Reads the
+        UTF-16 TagInfo.XML (the authoritative per-project member byte layout).
+        Returns an empty dict if the file is absent / unparsable.
+        """
+        import xml.etree.ElementTree as ET
+
+        if not os.path.exists(taginfo_path):
+            return {}
+        with open(taginfo_path, "rb") as fh:
+            raw = fh.read()
+        text = raw.decode("utf-16", errors="replace")
+        root = ET.fromstring(text)
+        dts = root.find("DataTypes")
+        layout: Dict[str, object] = {}
+        if dts is None:
+            return layout
+        for dt in dts.findall("DataType"):
+            name = dt.get("Name")
+            if not name:
+                continue
+            size = dt.get("Size")
+            try:
+                if size is not None:
+                    layout["@size@" + name.upper()] = int(size)
+            except ValueError:
+                pass
+            members_node = dt.find("Members")
+            members: List[tuple] = []
+            if members_node is not None:
+                for m in members_node.findall("Member"):
+                    mname = m.get("Name")
+                    mdt = m.get("DataType")
+                    if mname is None or mdt is None:
+                        continue
+                    try:
+                        off = int(m.get("Offset", "0"))
+                    except ValueError:
+                        off = 0
+                    bit_attr = m.get("Bit")
+                    bit = int(bit_attr) if bit_attr is not None else None
+                    hidden = m.get("Hidden") == "true"
+                    dims = None
+                    dim_node = m.find("Dimensions")
+                    if dim_node is not None:
+                        ds = []
+                        for d in dim_node.findall("Dim"):
+                            try:
+                                ds.append(int(d.get("Size", "0")))
+                            except ValueError:
+                                pass
+                        dims = ds or None
+                    members.append((mname, mdt, off, bit, hidden, dims))
+            layout[name.upper()] = members
+        return layout
+
     @property
     def controller(self):
         if self._controller is None:
             self._controller = ControllerBuilder(
-                self._cur, _short_header=self._comps_short_header
+                self._cur,
+                _short_header=self._comps_short_header,
+                _taginfo_layout=getattr(self, "_taginfo_layout", {}),
             ).build()
         return self._controller
 

@@ -452,6 +452,10 @@ class Tag(L5xElement):
     # block (the older Studio style: <Data>1D 00 00 00</Data>) instead of the
     # V24+ L5K CDATA block. Defaults False so the long (V24+) path is unchanged.
     _short_header: bool = False
+    # Step 6d: TagInfo.XML byte-layout map {DATATYPE_UPPER: [members...]} used to
+    # decode the value image into a full Decorated tree. Empty -> the existing
+    # render_decorated/zero path is used (no behaviour change).
+    _taginfo_layout: Dict[str, object] = field(default_factory=dict)
 
     @property
     def _l5x_exclude(self) -> bool:
@@ -543,9 +547,21 @@ class Tag(L5xElement):
         data_xml = ""
         if not is_alias and self._value_bytes is not None and dt_base not in _SKIP_DECORATED and dt_base != "STRING":
             try:
-                decorated_inner = _tag_value.render_decorated(
-                    dt_base, self.dimensions, self._value_bytes, self._data_types_map
-                )
+                # Step 6d: layout-driven decode (full member fidelity) first;
+                # fall back to the simpler render_decorated on None/any failure.
+                decorated_inner = None
+                if self._taginfo_layout:
+                    try:
+                        decorated_inner = _tag_value.render_decorated_layout(
+                            dt_base, self.dimensions, self._value_bytes,
+                            self._taginfo_layout, self._data_types_map
+                        )
+                    except Exception:
+                        decorated_inner = None
+                if decorated_inner is None:
+                    decorated_inner = _tag_value.render_decorated(
+                        dt_base, self.dimensions, self._value_bytes, self._data_types_map
+                    )
                 if self._short_header:
                     first = "<Data>" + _tag_value.render_hex(self._value_bytes) + "</Data>"
                     ok_first = bool(self._value_bytes)
@@ -2566,6 +2582,7 @@ class ProgramBuilder(L5xElementBuilder):
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
     _redundancy_enabled: bool = field(default=False)
     _short_header: bool = field(default=False)
+    _taginfo_layout: Dict[str, object] = field(default_factory=dict)
 
     def build(self) -> Program:
         self._cur.execute(
@@ -2653,6 +2670,7 @@ class ProgramBuilder(L5xElementBuilder):
             for result in self._cur.fetchall():
                 tag = TagBuilder(self._cur, result[1], _short_header=self._short_header).build()
                 tag._data_types_map = self._data_types_map
+                tag._taginfo_layout = self._taginfo_layout
                 tags.append(tag)
 
         if _prog_comment_parent is not None:
@@ -2738,6 +2756,10 @@ class ControllerBuilder(L5xElementBuilder):
     # datatype build through the inline-member / full-lean-set path; defaults
     # False so V24+/V36 export is byte-for-byte unchanged.
     _short_header: bool = field(default=False)
+    # Step 6d: {DATATYPE_UPPER: [member layout...]} from TagInfo.XML, used to
+    # decode tag value images into the Decorated <Data> tree. Empty -> the
+    # zero-generator fallback is used (no behaviour change).
+    _taginfo_layout: Dict[str, object] = field(default_factory=dict)
 
     def build(self) -> Controller:
         self._cur.execute(
@@ -2911,6 +2933,7 @@ class ControllerBuilder(L5xElementBuilder):
             _tag_object_id = result[1]
             tag = TagBuilder(self._cur, _tag_object_id, _short_header=self._short_header).build()
             tag._data_types_map = data_types_map
+            tag._taginfo_layout = self._taginfo_layout
             if tag.data_type and not tag.name.startswith("$") and ":" not in tag.name and not tag.name.startswith("__"):
                 tags.append(tag)
 
@@ -2934,7 +2957,7 @@ class ControllerBuilder(L5xElementBuilder):
         for result in results:
             _program_object_id = result[1]
             programs.append(
-                ProgramBuilder(self._cur, _program_object_id, data_types_map, redundancy_enabled, _short_header=self._short_header).build()
+                ProgramBuilder(self._cur, _program_object_id, data_types_map, redundancy_enabled, _short_header=self._short_header, _taginfo_layout=self._taginfo_layout).build()
             )
 
         # Build comment_id → program name map for task scheduled-program resolution.

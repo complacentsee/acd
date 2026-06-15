@@ -76,6 +76,67 @@ def _atomic_text(dt: str, b: bytes) -> str:
     return str(val)
 
 
+def _fmt_real_decorated(v: float) -> str:
+    """Format a REAL value the way Logix writes it in a Decorated Value attribute.
+
+    Unlike the L5K CDATA form (8-digit scientific), Decorated REALs use the
+    shortest decimal that round-trips through IEEE-754 single precision, with a
+    trailing '.0' for integral values (e.g. 380.0, 0.1, 34.805748). Very large /
+    small magnitudes fall back to 3-digit-exponent scientific. The two single
+    +/-FLT_MAX sentinels (common PID limit defaults) are matched to OEM exactly.
+    """
+    import math
+    f = struct.unpack("<f", struct.pack("<f", v))[0]
+    if f != f:                      # NaN
+        return "0.0"
+    if f == 0.0:
+        return "0.0"
+    if f == struct.unpack("<f", struct.pack("<f", 3.40282347e38))[0]:
+        return "3.40282347e+038"
+    if f == struct.unpack("<f", struct.pack("<f", -3.40282347e38))[0]:
+        return "-3.40282347e+038"
+    best = None
+    for p in range(1, 10):
+        s = "%.*g" % (p, f)
+        try:
+            rt = struct.unpack("<f", struct.pack("<f", float(s)))[0]
+        except OverflowError:
+            continue
+        if rt == f:
+            best = s
+            break
+    if best is None:
+        best = "%.9g" % f
+    if "e" in best or "E" in best:
+        a = abs(f)
+        exp = math.floor(math.log10(a))
+        if -4 <= exp < 16:
+            sig = len(best.split("e")[0].replace("-", "").replace(".", ""))
+            decimals = max(0, sig - 1 - exp)
+            best = "%.*f" % (decimals, f)
+    if "." not in best and "e" not in best and "E" not in best:
+        best += ".0"
+    if "e" in best:
+        m, _, e = best.partition("e")
+        sign = e[0]
+        ev = int(e[1:])
+        best = "%se%s%03d" % (m, sign, ev)
+    return best
+
+
+def _atomic_value_decorated(dt: str, image: bytes, offset: int) -> Optional[str]:
+    """Decode one atomic value at `offset` for a Decorated Value attribute."""
+    width, fmt = _ATOMIC[dt]
+    if offset + width > len(image):
+        return None
+    val = struct.unpack_from(fmt, image, offset)[0]
+    if dt in ("REAL", "LREAL"):
+        return _fmt_real_decorated(val)
+    if dt == "BOOL":
+        return "1" if val else "0"
+    return str(val)
+
+
 def _dims_total(dimensions: Optional[str]) -> Tuple[int, List[int]]:
     if not dimensions:
         return 0, []
@@ -248,3 +309,386 @@ def render_decorated(dt_base: str, dimensions: Optional[str], image: bytes,
     if total == 0:
         return _decorated_struct(dt_base, image, data_types_map)
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Step 6d — TagInfo.XML-layout-driven Decorated rendering                      #
+# --------------------------------------------------------------------------- #
+# This path uses the per-datatype member byte-offset / bit map extracted from
+# the project's TagInfo.XML (passed in as `layout_map`) so that EVERY visible
+# member — including nested UDTs, BOOL bits packed into a backing word, and
+# member arrays — is sliced from the raw value image at its real offset, rather
+# than the sequential/zero approximation of `_decorated_struct`. Everything is
+# best-effort; the caller wraps the entry point in try/except and falls back to
+# the existing zero generator, so the V24+ path can never regress.
+#
+# layout_map: {DATATYPE_UPPER: [LayoutMember, ...]} where LayoutMember is a tuple
+#   (name, member_dt_str, byte_offset, bit_or_None, hidden_bool, dims_list_or_None)
+# byte_offset is the member's offset within its parent struct image; bit is the
+# bit index (0..) within that offset for BOOL/BIT members; dims is a list of
+# array sizes (e.g. [4]) or None for scalars.
+
+# Radix string per atomic type for the value formatter, when the member def did
+# not supply one (BOOL/BIT carry no Radix attribute and are not in this map).
+_DEFAULT_RADIX: Dict[str, str] = dict(_RADIX)
+
+
+def _format_int_radix(dt: str, val: int, width: int, radix: Optional[str]) -> str:
+    """Format an integer value honoring its Logix Radix string."""
+    if radix == "Binary":
+        bits = width * 8
+        u = val & ((1 << bits) - 1)
+        s = format(u, "0%db" % bits)
+        grouped = "_".join(s[i:i + 4] for i in range(0, len(s), 4))
+        return "2#" + grouped
+    if radix == "Hex":
+        nyb = width * 2
+        u = val & ((1 << (width * 8)) - 1)
+        s = format(u, "0%dx" % nyb)
+        grouped = "_".join(s[i:i + 4] for i in range(0, len(s), 4))
+        return "16#" + grouped
+    if radix == "Octal":
+        u = val & ((1 << (width * 8)) - 1)
+        return "8#" + format(u, "o")
+    # Decimal / ASCII / anything else -> signed decimal
+    return str(val)
+
+
+def _member_value_text(dt: str, image: bytes, offset: int, radix: Optional[str]
+                       ) -> Optional[str]:
+    """Decode one atomic member's value text from the image at `offset`."""
+    width, fmt = _ATOMIC[dt]
+    if offset + width > len(image):
+        return None
+    val = struct.unpack_from(fmt, image, offset)[0]
+    if dt in ("REAL", "LREAL"):
+        return _fmt_real_decorated(val)
+    return _format_int_radix(dt, val, width, radix)
+
+
+def _radix_for(member_dt: str, def_radix: Optional[str]) -> Optional[str]:
+    """Pick the Radix attribute for a DataValue(Member) of a given atomic type.
+
+    Prefer the radix declared on the DataType member definition (e.g. Binary,
+    Hex). Fall back to the conventional default (Float for REAL, Decimal for
+    ints). BOOL/BIT carry no Radix.
+    """
+    if member_dt in ("BOOL", "BIT"):
+        return None
+    if def_radix and def_radix not in ("NullType",):
+        return def_radix
+    return _DEFAULT_RADIX.get(member_dt, "Decimal")
+
+
+def _resolve_layout(dt_name: str, layout_map: Dict, data_types_map: Dict):
+    """Return the ordered member layout for a struct datatype, or None.
+
+    Each entry: (name, member_dt_upper, byte_offset, bit_or_None, hidden_bool,
+    dims_list_or_None, def_radix_or_None). def_radix comes from data_types_map
+    when available (TagInfo.XML carries no Radix attribute).
+    """
+    members = layout_map.get(dt_name.upper())
+    if not members:
+        return None
+    # radix lookup from the parsed DataType definition (by member name).
+    dt_def = data_types_map.get(dt_name.upper())
+    radix_by_name = {}
+    if dt_def is not None:
+        for m in getattr(dt_def, "members", []):
+            radix_by_name[m.name] = getattr(m, "radix", None)
+    out = []
+    for (name, mdt, off, bit, hidden, dims) in members:
+        out.append((name, mdt.upper(), off, bit, hidden, dims,
+                    radix_by_name.get(name)))
+    return out
+
+
+def _is_string_layout(layout) -> bool:
+    """True if a struct layout is the Logix STRING shape: LEN (int) + DATA SINT[].
+
+    Logix renders STRING (and STRING-family) values as a single CDATA DATA
+    member rather than an array of SINT bytes, so these need special handling.
+    """
+    if not layout:
+        return False
+    vis = [m for m in layout if not m[4]]      # m[4] = hidden
+    names = {m[0].upper() for m in vis}
+    if names != {"LEN", "DATA"}:
+        return False
+    data = next((m for m in vis if m[0].upper() == "DATA"), None)
+    if data is None:
+        return False
+    # DATA must be a SINT array.
+    return data[1] == "SINT" and bool(data[5])
+
+
+def _render_string_inner(layout, image: bytes) -> Optional[str]:
+    """Render the inner members of a STRING-shaped struct (LEN + CDATA DATA)."""
+    parts: List[str] = []
+    for (name, mdt, off, bit, hidden, dims, def_radix) in layout:
+        if hidden:
+            continue
+        if name.upper() == "LEN":
+            if off + 4 > len(image):
+                return None
+            length = struct.unpack_from("<i", image, off)[0]
+            parts.append(
+                f'<DataValueMember Name="{name}" DataType="DINT" '
+                f'Radix="Decimal" Value="{length}"/>'
+            )
+        elif name.upper() == "DATA":
+            total = 1
+            for d in (dims or []):
+                total *= d
+            raw = image[off:off + total]
+            length = 0
+            # Use LEN if present/valid; else stop at first NUL.
+            length = next((struct.unpack_from("<i", image, m[2])[0]
+                           for m in layout if m[0].upper() == "LEN"
+                           and m[2] + 4 <= len(image)), 0)
+            if length <= 0 or length > len(raw):
+                length = len(raw.split(b"\x00", 1)[0])
+            text = _ascii_string_cdata(raw[:length])
+            parts.append(
+                f'<DataValueMember Name="{name}" DataType="STRING" '
+                f'Radix="ASCII">\n<![CDATA[{text}]]>\n</DataValueMember>'
+            )
+        else:
+            return None
+    return "".join(parts)
+
+
+def _ascii_string_cdata(b: bytes) -> str:
+    """Encode raw SINT-array bytes as a Logix STRING CDATA literal.
+
+    Printable ASCII passes through; the few Logix escape sequences ($ control
+    chars) are emitted as $-codes the way Studio writes them.
+    """
+    out = []
+    for ch in b:
+        if ch == 0x24:           # '$'
+            out.append("$$")
+        elif ch == 0x27:         # "'"
+            out.append("$'")
+        elif ch == 0x09:
+            out.append("$t")
+        elif ch == 0x0A:
+            out.append("$l")
+        elif ch == 0x0D:
+            out.append("$r")
+        elif 0x20 <= ch < 0x7F:
+            out.append(chr(ch))
+        else:
+            out.append("$%02X" % ch)
+    return "".join(out)
+
+
+def _decorated_struct_layout(dt_name: str, image: bytes, layout_map: Dict,
+                             data_types_map: Dict, depth: int = 0
+                             ) -> Optional[str]:
+    """Render <Structure DataType=..>..</Structure> using the TagInfo layout."""
+    if depth > 24:
+        return None
+    layout = _resolve_layout(dt_name, layout_map, data_types_map)
+    if layout is None:
+        return None
+    if _is_string_layout(layout):
+        inner = _render_string_inner(layout, image)
+        if inner is None:
+            return None
+        return f'<Structure DataType="{dt_name}">{inner}</Structure>'
+    parts: List[str] = []
+    for (name, mdt, off, bit, hidden, dims, def_radix) in layout:
+        if hidden:
+            continue
+        frag = _decorated_member(name, mdt, off, bit, dims, def_radix,
+                                 image, layout_map, data_types_map, depth)
+        if frag is None:
+            return None
+        parts.append(frag)
+    return f'<Structure DataType="{dt_name}">{"".join(parts)}</Structure>'
+
+
+def _decorated_member(name: str, mdt: str, off: int, bit, dims,
+                      def_radix: Optional[str], image: bytes, layout_map: Dict,
+                      data_types_map: Dict, depth: int) -> Optional[str]:
+    """Render one DataValueMember / ArrayMember / StructureMember."""
+    # ---- array member ----------------------------------------------------- #
+    if dims:
+        total = 1
+        for d in dims:
+            total *= d
+        dim_str = ",".join(str(d) for d in dims)
+        if mdt in _ATOMIC:
+            width, _ = _ATOMIC[mdt]
+            # BOOL/BIT scalar members carry no Radix, but a BOOL *array* member
+            # is emitted with Radix="Decimal" by Logix.
+            radix = "Decimal" if mdt in ("BOOL", "BIT") else _radix_for(mdt, def_radix)
+            elems = []
+            for i in range(total):
+                eoff = off + i * width
+                if mdt in ("BOOL", "BIT"):
+                    # packed BOOL array: 1 bit per element from the base offset
+                    byte = off + (i // 8)
+                    if byte >= len(image):
+                        return None
+                    v = (image[byte] >> (i % 8)) & 1
+                    elems.append(f'<Element Index="[{i}]" Value="{v}"/>')
+                    continue
+                vt = _member_value_text(mdt, image, eoff, radix)
+                if vt is None:
+                    return None
+                elems.append(f'<Element Index="[{i}]" Value="{vt}"/>')
+            ra = f' Radix="{radix}"' if radix else ""
+            return (f'<ArrayMember Name="{name}" DataType="{mdt}" '
+                    f'Dimensions="{dim_str}"{ra}>{"".join(elems)}</ArrayMember>')
+        # array of struct/UDT
+        sub_layout = _resolve_layout(mdt, layout_map, data_types_map)
+        if sub_layout is None:
+            return None
+        # element size = struct size from layout map (max offset+width). We need a
+        # per-element stride; derive from the datatype Size if present, else span.
+        stride = _struct_stride(mdt, layout_map, data_types_map)
+        if stride is None:
+            return None
+        elems = []
+        for i in range(total):
+            sub = image[off + i * stride: off + (i + 1) * stride]
+            inner = _decorated_struct_inner(mdt, sub, layout_map, data_types_map,
+                                            depth + 1)
+            if inner is None:
+                return None
+            # OEM wraps each array-of-struct element's members in <Structure>.
+            elems.append(
+                f'<Element Index="[{i}]"><Structure DataType="{mdt}">'
+                f'{inner}</Structure></Element>'
+            )
+        return (f'<ArrayMember Name="{name}" DataType="{mdt}" '
+                f'Dimensions="{dim_str}">{"".join(elems)}</ArrayMember>')
+
+    # ---- BOOL / BIT scalar member ---------------------------------------- #
+    if mdt in ("BOOL", "BIT"):
+        b = bit if bit is not None else 0
+        byte = off + (b // 8)
+        if byte >= len(image):
+            return None
+        v = (image[byte] >> (b % 8)) & 1
+        return f'<DataValueMember Name="{name}" DataType="BOOL" Value="{v}"/>'
+
+    # ---- atomic scalar member -------------------------------------------- #
+    if mdt in _ATOMIC:
+        radix = _radix_for(mdt, def_radix)
+        vt = _member_value_text(mdt, image, off, radix)
+        if vt is None:
+            return None
+        ra = f' Radix="{radix}"' if radix else ""
+        return f'<DataValueMember Name="{name}" DataType="{mdt}"{ra} Value="{vt}"/>'
+
+    # ---- nested struct/UDT member ---------------------------------------- #
+    stride = _struct_stride(mdt, layout_map, data_types_map)
+    if stride is None:
+        return None
+    sub = image[off: off + stride]
+    inner = _decorated_struct_inner(mdt, sub, layout_map, data_types_map, depth + 1)
+    if inner is None:
+        return None
+    return f'<StructureMember Name="{name}" DataType="{mdt}">{inner}</StructureMember>'
+
+
+def _decorated_struct_inner(dt_name: str, image: bytes, layout_map: Dict,
+                            data_types_map: Dict, depth: int) -> Optional[str]:
+    """Render the INNER member list of a struct (no <Structure> wrapper)."""
+    if depth > 24:
+        return None
+    layout = _resolve_layout(dt_name, layout_map, data_types_map)
+    if layout is None:
+        return None
+    if _is_string_layout(layout):
+        return _render_string_inner(layout, image)
+    parts: List[str] = []
+    for (name, mdt, off, bit, hidden, dims, def_radix) in layout:
+        if hidden:
+            continue
+        frag = _decorated_member(name, mdt, off, bit, dims, def_radix,
+                                 image, layout_map, data_types_map, depth)
+        if frag is None:
+            return None
+        parts.append(frag)
+    return "".join(parts)
+
+
+def _struct_stride(dt_name: str, layout_map: Dict, data_types_map: Dict
+                   ) -> Optional[int]:
+    """Per-element byte stride of a struct datatype.
+
+    Uses the TagInfo Size if cached on the layout map (key "@size@<NAME>"); else
+    falls back to max(member_offset + member_width) over the layout.
+    """
+    sz = layout_map.get("@size@" + dt_name.upper())
+    if isinstance(sz, int) and sz > 0:
+        return sz
+    layout = _resolve_layout(dt_name, layout_map, data_types_map)
+    if layout is None:
+        return None
+    span = 0
+    for (_n, mdt, off, _bit, _hidden, dims, _r) in layout:
+        if mdt in _ATOMIC:
+            w = _ATOMIC[mdt][0]
+        else:
+            w = _struct_stride(mdt, layout_map, data_types_map)
+            if w is None:
+                return None
+        n = 1
+        if dims:
+            for d in dims:
+                n *= d
+        end = off + w * n
+        if end > span:
+            span = end
+    # round up to 4-byte alignment (Logix struct padding)
+    if span % 4:
+        span += 4 - (span % 4)
+    return span or None
+
+
+def render_decorated_layout(dt_base: str, dimensions: Optional[str], image: bytes,
+                            layout_map: Dict, data_types_map: Dict) -> Optional[str]:
+    """Layout-driven Decorated rendering (Step 6d). Returns inner XML or None.
+
+    Falls back (returns None) for anything it cannot decode so the caller keeps
+    today's behaviour. Handles: atomic scalar/array (delegated), and struct /
+    array-of-struct using the TagInfo byte-offset map for full member fidelity.
+    """
+    if not layout_map:
+        return None
+    total, dim_parts = _dims_total(dimensions)
+
+    # Atomic scalar/array: the existing path is already correct & byte-faithful.
+    if dt_base in _ATOMIC:
+        return render_decorated(dt_base, dimensions, image, data_types_map)
+
+    # Struct datatype must be present in the layout map.
+    if dt_base.upper() not in layout_map:
+        return None
+
+    if total == 0:
+        return _decorated_struct_layout(dt_base, image, layout_map, data_types_map)
+
+    # Array of struct.
+    stride = _struct_stride(dt_base, layout_map, data_types_map)
+    if stride is None:
+        return None
+    dim_str = ",".join(str(d) for d in dim_parts)
+    elems = []
+    for i in range(total):
+        sub = image[i * stride:(i + 1) * stride]
+        inner = _decorated_struct_inner(dt_base, sub, layout_map, data_types_map, 1)
+        if inner is None:
+            return None
+        # OEM wraps each array-of-struct element's members in <Structure>.
+        elems.append(
+            f'<Element Index="[{i}]"><Structure DataType="{dt_base}">'
+            f'{inner}</Structure></Element>'
+        )
+    return (f'<Array DataType="{dt_base}" Dimensions="{dim_str}">'
+            f'{"".join(elems)}</Array>')
