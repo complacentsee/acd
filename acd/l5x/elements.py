@@ -12,7 +12,7 @@ from sqlite3 import Cursor
 from typing import List, Tuple, Dict, Union
 
 from acd.generated.comps.rx_generic import RxGeneric
-from acd.l5x.catalog_numbers import CATALOG_NUMBERS
+from acd.l5x.catalog_numbers import CATALOG_NUMBERS, CATALOG_NUMBERS_BY_MAJOR
 from acd.l5x.port_structures import PORT_STRUCTURES
 from acd.l5x import tag_value as _tag_value
 from acd.record.comps import CompsRecord
@@ -191,6 +191,18 @@ _ATOMIC_TAG_TYPES: frozenset = frozenset({
     "BOOL", "BIT", "SINT", "INT", "DINT", "LINT",
     "USINT", "UINT", "UDINT", "ULINT", "REAL", "LREAL",
 })
+
+# Bit-width of a base symbol's element type, used to decode an internal alias's
+# bit-offset (u32 @ record 0x26) into an array index + member bit. Structured
+# legacy types (TIMER/COUNTER/CONTROL = 3 DINTs) are 96 bits; only base element
+# types whose width is known appear here. A base whose element type is absent
+# (e.g. a module connection image) is left undecoded (no AliasFor emitted).
+_ALIAS_ELEM_BITS: Dict[str, int] = {
+    "BOOL": 1, "BIT": 1, "SINT": 8, "USINT": 8,
+    "INT": 16, "UINT": 16, "DINT": 32, "UDINT": 32, "REAL": 32,
+    "LINT": 64, "ULINT": 64, "LREAL": 64,
+    "TIMER": 96, "COUNTER": 96, "CONTROL": 96,
+}
 
 # Data types on which Logix NEVER writes a Constant attribute (a tag of these
 # types cannot be a constant): motion axes/groups, MESSAGE, and digital alarms.
@@ -807,6 +819,9 @@ class Module(L5xElement):
     # Each entry: (name, rpi_str, conn_type_str)
     _connections: List[Tuple[str, str, str]] = field(default_factory=list)
     _extended_properties: str = field(default="")
+    # True when the project's OPC UA server is enabled; module IO tag stubs then
+    # carry OpcUaAccess="None" (see ExportL5x.project_flags).
+    _opc_ua: bool = field(default=False)
 
     def __post_init__(self):
         super().__post_init__()
@@ -840,25 +855,28 @@ class Module(L5xElement):
         # <Communications> section — only emitted when a CommMethod is known.
         comm_xml = ""
         if self._comm_method is not None:
+            # When the project OPC UA server is on, every module ConfigTag/InputTag/
+            # OutputTag carries OpcUaAccess="None". Inject it after ExternalAccess so
+            # all stubs share one rule.
+            def _stub(tag: str, ext_access: str) -> str:
+                opc = ' OpcUaAccess="None"' if self._opc_ua else ''
+                return (
+                    f'<{tag} ExternalAccess="{ext_access}"{opc}>'
+                    f'<Comments/>'
+                    f'</{tag}>'
+                )
+
             conn_parts: List[str] = []
             for (conn_name, rpi_str, conn_type) in self._connections:
                 safe_name = html.escape(conn_name, quote=True)
                 # Derive InputTag / OutputTag stubs based on connection type.
                 if conn_type == "Output":
-                    tag_stubs = (
-                        '<OutputTag ExternalAccess="Read/Write">'
-                        '<Comments/>'
-                        '</OutputTag>'
-                    )
+                    tag_stubs = _stub("OutputTag", "Read/Write")
                 else:
                     # Input or InputOutput: include both stubs.
                     tag_stubs = (
-                        '<InputTag ExternalAccess="Read Only">'
-                        '<Comments/>'
-                        '</InputTag>'
-                        '<OutputTag ExternalAccess="Read/Write">'
-                        '<Comments/>'
-                        '</OutputTag>'
+                        _stub("InputTag", "Read Only")
+                        + _stub("OutputTag", "Read/Write")
                     )
                 conn_parts.append(
                     f'<Connection Name="{safe_name}" RPI="{rpi_str}" Type="{conn_type}"'
@@ -1050,7 +1068,7 @@ class Program(L5xElement):
     fault_routine_name: Union[str, None]  # None if absent (omitted from XML)
     disabled: str
     synchronize_redundancy_data_after_execution: Union[str, None]  # None → omit attr
-    use_as_folder: str
+    use_as_folder: Union[str, None]  # None -> omit attr (V10..V20 projects)
     tags: List[Tag]        # Tags section before Routines (matches L5X export order)
     routines: List[Routine]
 
@@ -1922,10 +1940,38 @@ class ModuleBuilder(L5xElementBuilder):
                 conn_type = "Input"
             connections.append((conn_name, "0.0", conn_type))
 
+        # CatalogNumber: prefer the (V,PT,PC,Major) override for hardware-revision
+        # ambiguous keys, then the (V,PT,PC) base table; finally fall back to any
+        # <CatNum> carried in the harvested ExtendedProperties XML.
+        catalog_number = CATALOG_NUMBERS_BY_MAJOR.get(
+            (vendor, product_type, product_code, major)
+        )
+        if not catalog_number:
+            catalog_number = CATALOG_NUMBERS.get(
+                (vendor, product_type, product_code), ""
+            )
+        if not catalog_number and extended_properties:
+            try:
+                _cm = re.search(r"<CatNum>([^<]+)</CatNum>", extended_properties)
+                if _cm:
+                    catalog_number = _cm.group(1)
+            except Exception:
+                pass
+
+        # Project-level OPC UA flag (see ExportL5x.project_flags); same pattern as
+        # TagBuilder. When the project's OPC UA server is on, module IO tag stubs
+        # carry OpcUaAccess="None".
+        try:
+            self._cur.execute("SELECT opc_ua FROM project_flags")
+            _pf = self._cur.fetchone()
+            _opc_ua = bool(_pf[0]) if _pf else False
+        except Exception:
+            _opc_ua = False
+
         return Module(
             name,           # L5xElement._name (private)
             name,           # Module.name
-            CATALOG_NUMBERS.get((vendor, product_type, product_code), ""),
+            catalog_number,
             vendor,
             product_type,
             product_code,
@@ -1944,6 +1990,7 @@ class ModuleBuilder(L5xElementBuilder):
             _comm_method=comm_method,
             _connections=connections,
             _extended_properties=extended_properties,
+            _opc_ua=_opc_ua,
         )
 
 
@@ -2105,6 +2152,98 @@ class TagBuilder(L5xElementBuilder):
         except Exception:
             return None
 
+    def _long_header_internal_alias_for(self, raw_rec: bytes) -> Union[str, None]:
+        """Build a V24+ long-header alias-to-internal-tag @AliasFor, byte-exact.
+
+        Distinct from ``_long_header_alias_for`` (which handles the module-I/O
+        ``&hex:`` sub-case): here the alias targets another *ordinary* tag in the
+        same scope, e.g. ``B3[0].1`` / ``F8[22]`` / ``Some_Tag.3``.
+
+        Encoding (cracked & validated 193/193 on a V32 project and 188/188 on a
+        V15 project, 0 false positives):
+          * ``main_record.data_table_instance`` -> the BASE tag's comps record;
+            its ``comp_name`` is the base symbol.  A genuine Base tag instead
+            points at its own ``$<hex>$`` RxData backing, and a module-I/O alias
+            points at an ``&hex:`` ref; both are excluded -> alias iff the target
+            name is a plain identifier (not ``$``/``&``-prefixed).
+          * u32 @ raw_rec[0x26] = the BIT OFFSET of the aliased element within the
+            base symbol.
+          * The alias's own ``data_type`` selects bit-vs-element access: BOOL ->
+            a bit reference (``base[idx].bit``); otherwise a whole element
+            (``base[idx]``).  ``idx``/``bit`` come from dividing the bit offset by
+            the BASE element's bit width (DINT 32, INT 16, SINT 8, TIMER 96, ...).
+          * A scalar base (dimension_1 == 0) drops the ``[idx]`` subscript.
+
+        Returns the AliasFor string, or None on any failure / undecodable base
+        (e.g. a module connection image whose element width we cannot read) so
+        the caller keeps the tag as Base rather than emit a wrong Alias.
+        """
+        try:
+            r = RxGeneric.from_bytes(raw_rec)
+            if r.cip_type not in (0x6B, 0x68):
+                return None
+            dti = r.main_record.data_table_instance
+            if not dti or len(raw_rec) < 0x2A:
+                return None
+            self._cur.execute(
+                "SELECT comp_name, record FROM comps WHERE object_id=" + str(dti)
+            )
+            row = self._cur.fetchone()
+            if not row or not row[0]:
+                return None
+            base = row[0]
+            # Exclude module-I/O (&hex:) and a tag's own ($hex$) data backing:
+            # those are NOT internal aliases.
+            if base.startswith("&") or base.startswith("$"):
+                return None
+
+            # Resolve the alias's own element type (bit vs element access).
+            alias_dt_name = None
+            if r.main_record.data_type:
+                self._cur.execute(
+                    "SELECT comp_name FROM comps WHERE object_id="
+                    + str(r.main_record.data_type)
+                )
+                drow = self._cur.fetchone()
+                alias_dt_name = drow[0] if drow else None
+
+            # Resolve the BASE symbol's element bit-width + array-ness. Only a
+            # base whose element type is a known atomic/legacy-struct type is
+            # decodable; anything else (module image, UDT, ...) -> bail.
+            base_elem_bits = None
+            base_is_array = False
+            try:
+                br = RxGeneric.from_bytes(bytes(row[1]))
+                if br.main_record.data_type:
+                    self._cur.execute(
+                        "SELECT comp_name FROM comps WHERE object_id="
+                        + str(br.main_record.data_type)
+                    )
+                    bdrow = self._cur.fetchone()
+                    bdname = bdrow[0] if bdrow else None
+                    base_elem_bits = _ALIAS_ELEM_BITS.get(bdname)
+                    base_is_array = bool(getattr(br.main_record, "dimension_1", 0))
+            except Exception:
+                base_elem_bits = None
+            if base_elem_bits is None:
+                return None
+
+            bit_off = struct.unpack_from("<I", raw_rec, 0x26)[0]
+
+            if alias_dt_name in ("BOOL", "BIT"):
+                idx = bit_off // base_elem_bits
+                bit = bit_off % base_elem_bits
+                if base_is_array:
+                    return "%s[%d].%d" % (base, idx, bit)
+                return "%s.%d" % (base, bit) if idx == 0 else "%s[%d].%d" % (base, idx, bit)
+            else:
+                idx = bit_off // base_elem_bits
+                if base_is_array:
+                    return "%s[%d]" % (base, idx)
+                return base if idx == 0 else "%s[%d]" % (base, idx)
+        except Exception:
+            return None
+
     def _resolve_io_name(self, comp_name: str) -> Union[str, None]:
         """Resolve a module I/O tag's display name, or None if it is not one.
 
@@ -2235,6 +2374,20 @@ class TagBuilder(L5xElementBuilder):
                 _laf = None
             if _laf:
                 alias_for = _laf
+                constant = None
+
+        # --- V24+ long-header alias to another internal tag (e.g. B3[0].1) ---
+        # Separate from the module-I/O "&hex:" sub-case above: the alias targets
+        # an ordinary tag in the same scope. Gated on a byte-exact decode
+        # succeeding so a Base tag is never mis-emitted as an Alias. Fixes both
+        # the missing @AliasFor and the over-emitted Constant on these tags.
+        if not self._short_header and not is_io and not alias_for:
+            try:
+                _iaf = self._long_header_internal_alias_for(raw_rec)
+            except Exception:
+                _iaf = None
+            if _iaf:
+                alias_for = _iaf
                 constant = None
 
         # Alias tags export TagType="Alias", carry no Constant (it lives on the
@@ -3066,6 +3219,7 @@ class ProgramBuilder(L5xElementBuilder):
     _redundancy_enabled: bool = field(default=False)
     _short_header: bool = field(default=False)
     _taginfo_layout: Dict[str, object] = field(default_factory=dict)
+    _acd_major: int = field(default=0)
 
     def build(self) -> Program:
         self._cur.execute(
@@ -3170,8 +3324,19 @@ class ProgramBuilder(L5xElementBuilder):
         # for all programs in a redundant controller project.
         sync_redundancy = "true" if self._redundancy_enabled else None
 
+        # UseAsFolder: Studio 5000 only began emitting this Program attribute at
+        # V21. For V10..V20 ACDs the attribute is absent from the OEM L5X (the
+        # value, when present, is always "false" for non-folder programs). Gate
+        # emission on the ACD save-version: emit "false" for V21+ (matches OEM),
+        # omit (None) for older projects to avoid attr_extra over-emission.
+        # (The handful of V15-V20 projects re-exported by a newer Studio do
+        # carry it, but that depends on the *export tool* version, which is not
+        # recoverable from the ACD; keying on the ACD version is the only
+        # deterministic signal.)
+        use_as_folder: Union[str, None] = "false" if self._acd_major >= 21 else None
+
         return Program(name, name, "false", main_routine_name, fault_routine_name,
-                       disabled, sync_redundancy, "false", tags, routines)
+                       disabled, sync_redundancy, use_as_folder, tags, routines)
 
 
 _TASK_TYPE_MAP = {1: "EVENT", 2: "PERIODIC", 4: "CONTINUOUS"}
@@ -3243,6 +3408,9 @@ class ControllerBuilder(L5xElementBuilder):
     # decode tag value images into the Decorated <Data> tree. Empty -> the
     # zero-generator fallback is used (no behaviour change).
     _taginfo_layout: Dict[str, object] = field(default_factory=dict)
+    # ACD save-version major (e.g. 21, 36). 0 if unknown. Used to gate
+    # version-specific attribute emission (e.g. Program/@UseAsFolder).
+    _acd_major: int = field(default=0)
 
     def build(self) -> Controller:
         self._cur.execute(
@@ -3452,7 +3620,7 @@ class ControllerBuilder(L5xElementBuilder):
         for result in results:
             _program_object_id = result[1]
             programs.append(
-                ProgramBuilder(self._cur, _program_object_id, data_types_map, redundancy_enabled, _short_header=self._short_header, _taginfo_layout=self._taginfo_layout).build()
+                ProgramBuilder(self._cur, _program_object_id, data_types_map, redundancy_enabled, _short_header=self._short_header, _taginfo_layout=self._taginfo_layout, _acd_major=self._acd_major).build()
             )
 
         # Build comment_id → program name map for task scheduled-program resolution.
