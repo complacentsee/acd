@@ -119,6 +119,71 @@ class CommentsRecord:
         )
 
     @staticmethod
+    def _parse_short_desc_body(raw: bytes) -> Optional[tuple]:
+        """Parse a V10..V21 short-header OWN-description record (types 1/2).
+
+        These carry a component's own Description (tag/datatype/module/program/
+        routine) in UTF-16LE, unlike the V24+ long-header AsciiRecord whose text
+        is UTF-8.  Header (same as the operand record):
+          [0:4]   u32 record_length
+          [4:6]   u16 seq_number
+          [6:8]   u16 record_type   (1 or 2)
+          [8:10]  u16 sub_record_length (== the owner component's cip_type)
+          [10:14] u32 parent        (== the owner component's comment_id)
+        then the body (raw[14:]):
+          [0:4]   u32 member_ref    (0 for the component's own description,
+                                      nonzero for a sub-element description)
+          [4:8]   u32 rung_content  (nonzero for rung-level comments)
+          [8:15]  7 bytes (object_id/pad region)
+          [15:]   UTF-16LE NUL-terminated description text (CR/LF kept)
+
+        The description text starts at body offset 15 (odd within the record).
+        Returns the 9-tuple matching the comments table schema, or None.
+
+        Keying: the comment is stored with ``parent == comment_id`` (the raw
+        parent field) so the short-header own-description lookup mirrors the
+        existing short-header OPERAND lookup (which also keys on comment_id).
+        ``object_id`` is forced to 0 so the RoutineBuilder rung-comment join
+        (rung_index = object_id - 1) can never mis-assign one of these records to
+        a rung (rung_index = -1 is filtered): the short-header rung-comment ->
+        rung-number link is LCG-scrambled and not yet cracked, so we deliberately
+        do not attach rung comments here.
+        """
+        if len(raw) < 14:
+            return None
+        seq_number = struct.unpack_from("<H", raw, 4)[0]
+        cip_type = struct.unpack_from("<H", raw, 8)[0]
+        comment_id = struct.unpack_from("<I", raw, 10)[0]
+        body = raw[14:]
+        if len(body) < 16:
+            return None
+        member_ref = struct.unpack_from("<I", body, 0)[0]
+        rung_content = struct.unpack_from("<I", body, 4)[0]
+
+        pos = 15
+        cus = []
+        while pos + 1 < len(body):
+            cu = struct.unpack_from("<H", body, pos)[0]
+            pos += 2
+            if cu == 0:
+                break
+            cus.append(cu)
+        text = "".join(chr(c) for c in cus)
+        if not text:
+            return None
+        return (
+            seq_number,
+            cip_type,        # sub_record_length column carries the owner cip_type
+            0,               # object_id forced 0 (no rung mis-assignment)
+            text,
+            struct.unpack_from("<H", raw, 6)[0],  # record_type (1 or 2)
+            comment_id,      # parent column == owner comment_id (short-header key)
+            "",              # tag_reference (own descriptions have no operand)
+            rung_content,
+            member_ref,
+        )
+
+    @staticmethod
     def parse(dat_record: DatRecord, short_header: bool = False) -> Optional[tuple]:
         if dat_record.identifier != 64250:
             return None
@@ -141,6 +206,14 @@ class CommentsRecord:
                 # record types are deliberately excluded.
                 if rt in (0x03, 0x04, 0x05, 0x06, 0x07, 0x09, 0x0A, 0x0B):
                     parsed = CommentsRecord._parse_short_operand_body(raw_full)
+                    if parsed is not None:
+                        return parsed
+                # Own-description records (component Description text) in UTF-16LE.
+                # The shared FafaComents AsciiRecord decodes these as UTF-8 (the
+                # V24+ layout), which mangles short-header UTF-16 text, so parse
+                # them here. Falls through to the original parser on any failure.
+                if rt in (0x01, 0x02):
+                    parsed = CommentsRecord._parse_short_desc_body(raw_full)
                     if parsed is not None:
                         return parsed
             except Exception:

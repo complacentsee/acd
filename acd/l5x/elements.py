@@ -2080,6 +2080,24 @@ class TagBuilder(L5xElementBuilder):
                     comment_results = [("", desc_row[0])]
             except Exception:
                 comment_results = []
+        else:
+            # V10..V21 short-header own-description lookup. These type-1/2 records
+            # are keyed by parent == comment_id (the same scheme as the short
+            # operand comments) and carry the tag's own Description when
+            # member_ref == 0. Wrapped so any failure degrades to today's
+            # no-description behaviour (no regression).
+            try:
+                self._cur.execute(
+                    "SELECT record_string FROM comments "
+                    "WHERE parent=? AND member_ref=0 AND record_type IN (1,2) "
+                    "AND record_string!='' LIMIT 1",
+                    (r.comment_id,),
+                )
+                desc_row = self._cur.fetchone()
+                if desc_row and desc_row[0]:
+                    comment_results = [("", desc_row[0])]
+            except Exception:
+                comment_results = []
 
         # Operand-keyed member/bit/array comments (V10..V21 short-header only).
         # These are stored in the comments table keyed by parent == comment_id,
