@@ -2640,37 +2640,54 @@ class RoutineBuilder(L5xElementBuilder):
         # rung to its comment is RegnLink.Dat (the regn_link table): each rung_oid
         # is paired with its comment's rung_content, encoded as
         #   rc_hi  = rung_content >> 16
-        #   rc_lo7 = rung_content & 0x7f
-        # which is globally unique. rung_ids[i] is the SbRegion object_id of the
-        # rung at Number i (from region_map, ordered above), so joining this
-        # routine's rung_oids -> regn_link -> comments by the encoded rung_content
-        # yields rung_oid -> comment text, and the rung Number is the position of
-        # rung_oid in rung_ids. (The legacy "object_id - 1" scheme was wrong:
-        # the comment object_id is always 1.) Best-effort: if regn_link is empty
-        # (parse failed / stream absent) no rung comments are attached.
+        #   rc_lo7 = rung_content & 0x7f   (LONG header only)
+        # and a per-routine group_id == the routine's comps object_id. rung_ids[i]
+        # is the SbRegion object_id of the rung at Number i (region_map order), so
+        # regn_link gives rung_oid -> comment, and Number = position in rung_ids.
+        # (The legacy "object_id - 1" scheme was wrong: the comment object_id is
+        # always 1.) Best-effort: if regn_link is empty no comments are attached.
+        #
+        # The (rc_hi, rc_lo7) key is only 23 bits and NOT globally unique in large
+        # LONG-header projects (collisions make one comment match many rungs ->
+        # 2x over-emission), so we SCOPE both sides to this routine:
+        #   - rungs:    regn_link.group_id == this routine's comps object_id
+        #   - comments: c.parent / c.member_ref == this routine's keys, read from
+        #               the routine's own comps record (parent = comment_id*0x10000
+        #               + cip_type; member_ref = u32 at body offset 14). Within one
+        #               routine the key is unique. SHORT-header (V10-V21) comments
+        #               encode parent/member_ref differently and don't collide in
+        #               practice, so there we scope rungs by group_id and match the
+        #               16-bit rung_content (== rc_hi) without the comment scope.
         rung_comments: Dict[int, str] = {}
         try:
             if rung_ids:
                 oid_to_number = {oid: idx for idx, oid in enumerate(rung_ids)}
-                placeholders = ",".join("?" for _ in rung_ids)
-                # The encoded comment key differs by header family (see
-                # ExportL5x.populate_regn_link): LONG-header comments carry the
-                # full 32-bit rung_content, matched by (rc>>16, rc&0x7f); the
-                # SHORT-header (V10-V21) comment parser yields a 16-bit
-                # rung_content (== the hi16), matched directly against rc_hi. The
-                # rl.is_short flag (constant per file) selects the right branch.
-                self._cur.execute(
-                    "SELECT rl.rung_oid, c.record_string "
-                    "FROM regn_link rl "
-                    "JOIN comments c "
-                    "  ON (rl.is_short=1 AND c.rung_content = rl.rc_hi) "
-                    "  OR (rl.is_short=0 "
-                    "      AND (c.rung_content >> 16) = rl.rc_hi "
-                    "      AND (c.rung_content & 127) = rl.rc_lo7) "
-                    "WHERE c.record_type=1 AND c.rung_content!=0 "
-                    "  AND rl.rung_oid IN (" + placeholders + ")",
-                    rung_ids,
-                )
+                self._cur.execute("SELECT is_short FROM regn_link LIMIT 1")
+                _isr = self._cur.fetchone()
+                is_short = bool(_isr[0]) if _isr else False
+                if is_short:
+                    self._cur.execute(
+                        "SELECT rl.rung_oid, c.record_string FROM regn_link rl "
+                        "JOIN comments c ON c.rung_content = rl.rc_hi "
+                        "WHERE c.record_type=1 AND c.rung_content!=0 "
+                        "  AND rl.group_id=?",
+                        (self._object_id,),
+                    )
+                else:
+                    parent_key = (r.comment_id * 0x10000) + r.cip_type
+                    member_ref_key = (
+                        struct.unpack_from("<I", record, 14)[0]
+                        if len(record) >= 18 else -1
+                    )
+                    self._cur.execute(
+                        "SELECT rl.rung_oid, c.record_string FROM regn_link rl "
+                        "JOIN comments c "
+                        "  ON (c.rung_content >> 16) = rl.rc_hi "
+                        " AND (c.rung_content & 127) = rl.rc_lo7 "
+                        "WHERE c.record_type=1 AND c.rung_content!=0 "
+                        "  AND rl.group_id=? AND c.parent=? AND c.member_ref=?",
+                        (self._object_id, parent_key, member_ref_key),
+                    )
                 for rung_oid, rec_str in self._cur.fetchall():
                     number = oid_to_number.get(rung_oid)
                     if number is not None and rec_str and number not in rung_comments:
