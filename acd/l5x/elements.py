@@ -2253,15 +2253,32 @@ class TagBuilder(L5xElementBuilder):
 
         def _cls_attr():
             # Class only on controller-scope (cip 0x6b) Base tags of a safety
-            # project; Safety/Standard from the region partition hi16 @ record 0x36
-            # (0x00FB safety partition / 0x0008 standard). Aliases/IO/program-scope
-            # (cip 0x68) tags get no Class.
-            if not _pf[1] or is_io or tag_type != "Base":
+            # project; Safety/Standard from the region partition hi16 @ record
+            # 0x36. The safety-partition encoding is VERSION-SPECIFIC:
+            #   short header (V10-V21): safety partition hi16 == 0x00FB
+            #                           (standard partitions are 0x00xx/0x0cxx)
+            #   long  header (V24+):    safety partition hi16 high byte == 0x79
+            #                           (0x79xx; standard partitions are 0x70xx)
+            # A controller-scope Base tag in the safety partition -> "Safety";
+            # any other controller-scope Base tag in a safety project ->
+            # "Standard". This INCLUDES genuine module I/O tags, which the OEM
+            # emits as TagType="Base" IO="true" WITH a Class (e.g. a motion
+            # :SI/:SO -> Safety, a module :C/:I/:O -> Standard). Only Alias tags
+            # (tag_type != "Base") and program-scope tags (built by other
+            # builders) get no Class.
+            # Validated: tag-for-tag agreement with the OEM L5X on every
+            # name-overlapping controller Base tag for both a V20 and a V36
+            # safety project; emits nothing on V20/V34/V36 non-safety projects.
+            if not _pf[1] or tag_type != "Base":
                 return None
             if len(raw_rec) < 0x3A or int.from_bytes(raw_rec[10:12], "little") != 0x6B:
                 return None
             hi = (int.from_bytes(raw_rec[0x36:0x3A], "little") >> 16) & 0xFFFF
-            return "Safety" if hi == 0x00FB else ("Standard" if hi == 0x0008 else None)
+            if self._short_header:
+                is_safe_partition = hi == 0x00FB
+            else:
+                is_safe_partition = (hi >> 8) == 0x79
+            return "Safety" if is_safe_partition else "Standard"
 
         try:
             r = RxGeneric.from_bytes(raw_rec)
