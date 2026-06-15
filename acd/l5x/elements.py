@@ -192,6 +192,16 @@ _ATOMIC_TAG_TYPES: frozenset = frozenset({
     "USINT", "UINT", "UDINT", "ULINT", "REAL", "LREAL",
 })
 
+# Data types on which Logix NEVER writes a Constant attribute (a tag of these
+# types cannot be a constant): motion axes/groups, MESSAGE, and digital alarms.
+# Verified: 0 OEM tags of these types carry Constant. (Consumed tags also omit
+# Constant; handled separately via tag_type.)
+_NO_CONSTANT_TYPES: frozenset = frozenset({
+    "MESSAGE", "AXIS_CIP_DRIVE", "AXIS_SERVO_DRIVE", "AXIS_SERVO",
+    "AXIS_VIRTUAL", "AXIS_GENERIC", "AXIS_CONSUMED", "MOTION_GROUP",
+    "ALARM_DIGITAL", "ALARM_ANALOG",
+})
+
 # Default zero value string for each primitive in Decorated output.
 _PRIMITIVE_DECORATED_ZERO: Dict[str, str] = {
     "BOOL":  "0",
@@ -2232,6 +2242,14 @@ class TagBuilder(L5xElementBuilder):
             )
             data_type_results = self._cur.fetchall()
             data_type = data_type_results[0][0]
+
+        # OEM omits Constant on motion/MESSAGE/alarm tags (they cannot be
+        # constants) and on Consumed tags. We stamped Constant="false" above
+        # before the data type was known; drop it here for those cases.
+        if constant == "false":
+            _dtb = data_type.split("[")[0].upper() if data_type else ""
+            if _dtb in _NO_CONSTANT_TYPES or tag_type == "Consumed":
+                constant = None
 
         # Refine IO classification: a genuine module config/input/output tag
         # (Local:N:C/I/O) references a MODULE-DEFINED data type whose own name
