@@ -531,11 +531,12 @@ class ExportL5x:
     #   SHORT (V10-V21): marker 02 00 00 09; the short-header comment parser reads
     #                 a 16-bit rung_content (== the hi16), matched by rc==rc_hi.
     #
-    # VALIDATED: V34 Air Compressor (LONG) -> 897 records, 318/318 rung comments
-    # mapped, 121/121 OEM (Copia) ground-truth rung Numbers exact; V20 PROJ_P 2
-    # (SHORT) -> 2863 records, 296/299 ground-truth pairs. Best-effort: on any
-    # structural problem the table stays empty and RoutineBuilder falls back to
-    # today's behaviour (no rung comments) so nothing regresses.
+    # VALIDATED on real projects of both families against the OEM reference
+    # conversion (a long-header V34 project: 897 records, all rung comments mapped
+    # with exact rung Numbers; a short-header V20 project: ~99% of ground-truth
+    # pairs). Best-effort: on any structural problem the table stays empty and
+    # RoutineBuilder falls back to today's behaviour (no rung comments) so nothing
+    # regresses.
     def populate_regn_link(self):
         path = os.path.join(self._temp_dir, "RegnLink.Dat")
         try:

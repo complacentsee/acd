@@ -2005,7 +2005,7 @@ class TagBuilder(L5xElementBuilder):
         cracked, byte-exact suffix: ``<module>:<slot>:<type>.Data.<bit>`` (the
         ``.Data.`` member is implicit for embedded I/O).  Validated 13/13 on
         PROJ_A and 24/24 on PROJ_C.  The alias-into-alias sub-case (a
-        non-``Local`` parent module, e.g. ``PROJ_X``) uses a DIFFERENT
+        non-``Local`` parent module, e.g. ``<Module>``) uses a DIFFERENT
         byte-0x26 encoding and a ``.<bit>`` (no ``.Data``) suffix that is not yet
         cracked; for those we return None so the caller keeps the tag as Base
         rather than emit a wrong (and invalid) ``TagType="Alias"`` without a
@@ -2216,7 +2216,7 @@ class TagBuilder(L5xElementBuilder):
         # Refine IO classification: a genuine module config/input/output tag
         # (Local:N:C/I/O) references a MODULE-DEFINED data type whose own name
         # carries a ':' (e.g. AB:1756_DI:C:0). The other ':'-named module records
-        # (e.g. PROJ_X:1:I) are ALIASES into a parent module tag and
+        # (e.g. <Module>:1:I) are ALIASES into a parent module tag and
         # reference a primitive (SINT/INT/...). The OEM emits those as
         # TagType="Alias" AliasFor="<module>:<I|O>.Data[<slot>]" with no <Data>.
         # That target is fully derivable from the resolved I/O name, so we emit
@@ -2230,7 +2230,7 @@ class TagBuilder(L5xElementBuilder):
                 except Exception:
                     _io_alias = None
             if _io_alias:
-                # Per-point module I/O alias (e.g. PROJ_X:1:I). Keep the
+                # Per-point module I/O alias (e.g. <Module>:1:I). Keep the
                 # IO flag (emits IO="true", Radix="Binary"-styled alias) but make
                 # it an Alias with no DataType / no <Data>.
                 alias_for = _io_alias
@@ -2292,8 +2292,15 @@ class TagBuilder(L5xElementBuilder):
         # with the operand in tag_reference and the text in record_string.
         # Wrapped so any failure degrades to today's no-operand-comment behaviour.
         operand_comments: List[Tuple[str, str]] = []
-        if self._short_header:
-            # SHORT (V10..V21): keyed by parent == comment_id; record types 3..11.
+        if self._short_header and r.cip_type == 0x6B:
+            # SHORT (V10..V21): keyed by the bare comment_id; record types 3..11.
+            # Restricted to cip 0x6b: cip-0x68 tags share a constant comment_id
+            # (in some projects one comment_id spans dozens of cip-0x68 tags), so
+            # keying operand comments by comment_id there smears one tag's comments
+            # across many. cip-0x6b legit comments often share a comment_id too (so
+            # bare-cid uniqueness would wrongly drop them), but restricting to 0x6b
+            # removes the dominant 0x68 over-emission while keeping the bulk of
+            # correct comments.
             try:
                 self._cur.execute(
                     "SELECT tag_reference, record_string FROM comments "
@@ -2312,7 +2319,7 @@ class TagBuilder(L5xElementBuilder):
             # the operand string ("[0]", ".5", ".Member"), record_string the text.
             # Require BOTH non-empty (empty record_string marks an internal
             # multi-entry/member record Studio does NOT surface as a tag
-            # <Comment Operand=>, e.g. PLStgDecode). COLLISION-SAFE: only emit when
+            # <Comment Operand=>). COLLISION-SAFE: only emit when
             # the tag's comment key is owned by exactly one comp (unique_comment_key
             # table). cip-0x68 tags share a constant comment_id, some versions
             # collide on 0x6b, and $hash$ value backings reuse keys; those records
@@ -3306,15 +3313,15 @@ class ControllerBuilder(L5xElementBuilder):
             tag._taginfo_layout = self._taginfo_layout
             # Module I/O tags carry a ':' (Local:1:C) and are kept; the ':' filter
             # only drops other internal ':'-named records. Per-point I/O ALIAS
-            # tags (PROJ_X:1:I) carry no DataType (the value lives on the
+            # tags (<Module>:1:I) carry no DataType (the value lives on the
             # target) but a non-empty alias_for, so keep them via the IO/alias
             # path even though tag.data_type is empty.
             keep_typed = bool(tag.data_type)
             # Alias tags carry no DataType (the value lives on the target) but a
             # non-empty alias_for; keep them via the alias path. This covers both
-            # per-point I/O aliases (tag._io, e.g. PROJ_X:1:I) and ordinary
-            # user aliases into an I/O point (e.g. Part_Draft_Present ->
-            # Local:1:I.Data.0), which the long-path alias resolver builds.
+            # per-point I/O aliases (tag._io, e.g. <Module>:1:I) and ordinary user
+            # aliases into an I/O point (e.g. <UserTag> -> Local:1:I.Data.0), which
+            # the long-path alias resolver builds.
             keep_alias = bool(tag.alias_for)
             if (keep_typed or keep_alias) and not tag.name.startswith("$") and (tag._io or ":" not in tag.name) and not tag.name.startswith("__"):
                 tags.append(tag)

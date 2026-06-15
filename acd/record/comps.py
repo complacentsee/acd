@@ -18,17 +18,17 @@ _FDFD_IDENTIFIER = 65021  # 0xFDFD secondary / sub records
 # SHORTER than V24+ (the V24+ "long" header inserts a zero u32 at payload offset
 # 12, pushing object_id/parent/name +4). The shared kaitai FafaComps/FdfdComps
 # parsers use the LONG (V30+/V36) offsets, so on a short-header file they read
-# object_id/parent/name 4 bytes too far: ~444/6285 records survive, names lose 2
-# leading chars (FuncGen->ncGen), and parent_id reads the name bytes -> the
-# ControllerBuilder query "parent_id==0 AND record_type==256" returns 0 rows and
-# raises "Does not contain exactly one root controller node".
+# object_id/parent/name 4 bytes too far: most records fail to survive, names lose
+# 2 leading chars, and parent_id reads the name bytes -> the ControllerBuilder
+# query "parent_id==0 AND record_type==256" returns 0 rows and raises "Does not
+# contain exactly one root controller node".
 #
 # These are ABSOLUTE offsets within dat_record.record.record_buffer (the payload
 # after the 6-byte stream framing) and are IDENTICAL for FAFA and FDFD in the
 # short layout. record_type sits at offset 10 in BOTH families (so it parses
-# correctly today regardless). Verified against acdgen's proven v21 parse and on
-# v21_gm_FuncGen.ACD (6285/6285 FAFA names decode; controller query -> exactly 1)
-# and empirically across V10..V20 pool samples (word@12 != 0 == short header).
+# correctly today regardless). Verified against acdgen's proven v21 parse on a
+# real short-header project (all FAFA names decode; controller query -> exactly 1)
+# and empirically across V10..V20 sample projects (word@12 != 0 == short header).
 _SH_SEQ_OFF = 8     # u16 per-collection ordinal (cosmetic for export)
 _SH_RTYPE_OFF = 10  # u16 record_type (256=component, 0=collection)
 _SH_OBJID_OFF = 12  # u32 object_id (self_lcg / CompUId)
