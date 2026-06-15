@@ -435,6 +435,11 @@ class Tag(L5xElement):
     # e.g. ("[3]", "Hydraulic Pump\r\nStart"). Empty by default (long-header
     # path leaves these untouched).
     _operand_comments: List[Tuple[str, str]] = field(default_factory=list)
+    # Alias target (e.g. "Local:1:I.Data.10"); None for non-alias tags. When set,
+    # tag_type is "Alias", data_type is None (omitted), and NO <Data> child is
+    # emitted. This is populated only by the V10..V21 short-header TagBuilder
+    # path; defaults None so the long-header (V24+) path is unaffected.
+    alias_for: Union[str, None] = None
 
     @property
     def _l5x_exclude(self) -> bool:
@@ -509,11 +514,18 @@ class Tag(L5xElement):
         # Scalar STRING gets Format="L5K" (the L5K encoder handles it separately; we emit
         # nothing here — Decorated is not used for scalar STRING tags).
         # Everything else (UDTs, arrays, TIMER, COUNTER, etc.) gets Format="Decorated".
+        # Alias tags carry no <Data> child at all (the value lives on the alias
+        # target). Suppress all data emission when this is an alias.
+        is_alias = self.tag_type == "Alias" or self.alias_for is not None
         dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
-        l5k_zero = _PRIMITIVE_L5K_ZERO.get(dt_base) if not self.dimensions else None
+        l5k_zero = (
+            _PRIMITIVE_L5K_ZERO.get(dt_base)
+            if (not is_alias and not self.dimensions)
+            else None
+        )
         data_xml = f'<Data Format="L5K">\n{l5k_zero}\n</Data>' if l5k_zero is not None else ""
 
-        if not data_xml and dt_base not in _SKIP_DECORATED and dt_base != "STRING":
+        if not is_alias and not data_xml and dt_base not in _SKIP_DECORATED and dt_base != "STRING":
             # Generate Decorated data for non-primitive / array types
             decorated = _generate_decorated(dt_base, self.dimensions, self._data_types_map)
             if decorated:
@@ -1768,6 +1780,46 @@ class ModuleBuilder(L5xElementBuilder):
 class TagBuilder(L5xElementBuilder):
     _short_header: bool = field(default=False)
 
+    def _short_header_alias_for(self, raw_rec: bytes) -> Union[str, None]:
+        """Decode a V10..V21 short-header alias target, or None if not an alias.
+
+        Alias tags store their target in the record as a UTF-16 blob of the form
+        ``@<8hex CompUId>@<member path>`` (the same operand encoding used by
+        source-protection rungs), e.g. ``@2b09c452@.Data.10``.  The ``@hex@``
+        CompUId resolves to a module-element comps record whose name is itself a
+        ``&<8hex>:slot:type`` reference (e.g. ``&4d2cae27:1:I``); the ``&hex``
+        prefix resolves to the module's friendly name (``Local``).  The result is
+        ``Local:1:I.Data.10``.
+
+        Returns None for non-alias tags (no ``@hex@`` blob) and on any failure so
+        the caller falls back to today's Base-tag behaviour.
+        """
+        try:
+            s = raw_rec.decode("utf-16-le", errors="replace")
+            m = re.search(r"@([0-9a-fA-F]+)@(\.?[^\x00@]*)", s)
+            if not m:
+                return None
+            self._cur.execute(
+                "SELECT comp_name FROM comps WHERE object_id=" + str(int(m.group(1), 16))
+            )
+            row = self._cur.fetchone()
+            if not row or not row[0]:
+                return None
+            name = row[0]
+            member = m.group(2)
+            mm = re.match(r"&([0-9a-fA-F]+)(:.*)$", name)
+            if mm:
+                self._cur.execute(
+                    "SELECT comp_name FROM comps WHERE object_id="
+                    + str(int(mm.group(1), 16))
+                )
+                prow = self._cur.fetchone()
+                if prow and prow[0]:
+                    name = prow[0] + mm.group(2)
+            return name + member
+        except Exception:
+            return None
+
     def build(self) -> Tag:
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
@@ -1786,16 +1838,37 @@ class TagBuilder(L5xElementBuilder):
             external_access = "Read/Write"
             constant = None
 
+        # --- V10..V21 short-header (Step 6a) ---
+        # Alias detection + the Base-tag Constant="false" OEM invariant. Both are
+        # gated to the short-header path so the long-header (V24+) export is
+        # byte-for-byte unchanged. The long path's 0x278/0x279 offsets do not hold
+        # the Constant flag for short-header records (observed 0), so we apply the
+        # OEM invariant instead: Logix always emits Constant="false" on Base
+        # non-IO tags. IO tags (':' in name) are excluded from export upstream.
+        alias_for: Union[str, None] = None
+        if self._short_header:
+            alias_for = self._short_header_alias_for(raw_rec)
+            if alias_for is None and constant is None:
+                constant = "false"
+
+        # Alias tags export TagType="Alias", carry no Constant (it lives on the
+        # target), and omit DataType (None -> attribute omitted).
+        tag_type = "Alias" if alias_for else "Base"
+        if alias_for:
+            constant = None
+
         try:
             r = RxGeneric.from_bytes(raw_rec)
         except Exception as e:
             return Tag(
-                results[0][0], results[0][0], "Base", "", None, external_access, constant, None, 0, []
+                results[0][0], results[0][0], tag_type, None if alias_for else "",
+                None, external_access, constant, None, 0, [], alias_for=alias_for
             )
 
         if r.cip_type != 0x6B and r.cip_type != 0x68:
             return Tag(
-                results[0][0], results[0][0], "Base", "", None, external_access, constant, None, 0, []
+                results[0][0], results[0][0], tag_type, None if alias_for else "",
+                None, external_access, constant, None, 0, [], alias_for=alias_for
             )
         if r.main_record.data_type == 0xFFFFFFFF:
             data_type = ""
@@ -1876,10 +1949,12 @@ class TagBuilder(L5xElementBuilder):
                 dim_parts.append(str(r.main_record.dimension_3))
             dimensions = ",".join(dim_parts) if dim_parts else None
             return Tag(
-                results[0][0], results[0][0], "Base", data_type, radix,
+                results[0][0], results[0][0], tag_type,
+                None if alias_for else data_type, radix,
                 external_access, constant, dimensions, r.main_record.data_table_instance,
                 comment_results,
                 _operand_comments=operand_comments,
+                alias_for=alias_for,
             )
 
         name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
@@ -1899,8 +1974,8 @@ class TagBuilder(L5xElementBuilder):
         return Tag(
             name,
             name,
-            "Base",
-            data_type,
+            tag_type,
+            None if alias_for else data_type,
             radix,
             external_access,
             constant,
@@ -1908,6 +1983,7 @@ class TagBuilder(L5xElementBuilder):
             r.main_record.data_table_instance,
             comment_results,
             _operand_comments=operand_comments,
+            alias_for=alias_for,
         )
 
 
