@@ -1115,11 +1115,15 @@ class DataTypeBuilder(L5xElementBuilder):
                 extended_record.value
             )
 
-        string_family_int = struct.unpack("<I", extended_records[0x6C])[0]
+        def _ext_u32(key, default=0):
+            v = extended_records.get(key)
+            return struct.unpack("<I", v)[0] if v is not None and len(v) >= 4 else default
+
+        string_family_int = _ext_u32(0x6C)
         string_family = "StringFamily" if string_family_int == 1 else "NoFamily"
 
-        built_in = struct.unpack("<I", extended_records[0x67])[0]
-        module_defined = struct.unpack("<I", extended_records[0x69])[0]
+        built_in = _ext_u32(0x67)
+        module_defined = _ext_u32(0x69)
 
         class_type = "User"
         if module_defined > 0:
@@ -1936,8 +1940,12 @@ def _parse_aoi_nameless(data: bytes) -> dict:
     # EditedDate FILETIME (always last 8 bytes)
     ft = struct.unpack_from("<Q", data, len(data) - 8)[0]
     if ft:
-        dt = datetime(1601, 1, 1) + timedelta(microseconds=ft // 10)
-        result["edited_date"] = dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+        try:
+            dt = datetime(1601, 1, 1) + timedelta(microseconds=ft // 10)
+            result["edited_date"] = dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+        except (OverflowError, OSError, ValueError):
+            # garbage/out-of-range FILETIME in some real-world records
+            result["edited_date"] = ""
     else:
         result["edited_date"] = ""
 
@@ -2100,13 +2108,21 @@ class ProgramBuilder(L5xElementBuilder):
         results = self._cur.fetchall()
 
         prog_record = bytes(results[0][3])
-        r = RxGeneric.from_bytes(prog_record)
-
         name = results[0][0]
+
+        # V10..V21 program bodies are source-protected/opaque -> degrade to a
+        # name-only Program rather than crashing.
+        try:
+            r = RxGeneric.from_bytes(prog_record)
+            exts: Dict[int, bytes] = {e.attribute_id: bytes(e.value) for e in r.extended_records}
+            _prog_comment_parent = (r.comment_id * 0x10000) + r.cip_type
+        except Exception:
+            r = None
+            exts = {}
+            _prog_comment_parent = None
 
         # --- MainRoutineName and FaultRoutineName from extended records ---
         # ext[0x12D] = MainRoutine object_id, ext[0x066] = FaultRoutine object_id
-        exts: Dict[int, bytes] = {e.attribute_id: bytes(e.value) for e in r.extended_records}
         main_routine_name: Union[str, None] = None
         fault_routine_name: Union[str, None] = None
         if 0x12D in exts and len(exts[0x12D]) >= 4:
@@ -2138,13 +2154,14 @@ class ProgramBuilder(L5xElementBuilder):
             + " AND comp_name='RxRoutineCollection'"
         )
         collection_results = self._cur.fetchall()
-        collection_id = collection_results[0][1]
-
-        self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
-            + str(collection_id)
-        )
-        routine_results = self._cur.fetchall()
+        routine_results = []
+        if collection_results:
+            collection_id = collection_results[0][1]
+            self._cur.execute(
+                "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
+                + str(collection_id)
+            )
+            routine_results = self._cur.fetchall()
 
         routines = []
         for child in routine_results:
@@ -2160,22 +2177,25 @@ class ProgramBuilder(L5xElementBuilder):
         if len(results) > 1:
             raise Exception("Contains more than one program tag collection")
 
-        self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
-            + str(results[0][1])
-        )
-        results = self._cur.fetchall()
         tags: List[Tag] = []
-        for result in results:
-            tag = TagBuilder(self._cur, result[1]).build()
-            tag._data_types_map = self._data_types_map
-            tags.append(tag)
+        if results:
+            self._cur.execute(
+                "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
+                + str(results[0][1])
+            )
+            for result in self._cur.fetchall():
+                tag = TagBuilder(self._cur, result[1]).build()
+                tag._data_types_map = self._data_types_map
+                tags.append(tag)
 
-        self._cur.execute(
-            "SELECT tag_reference, record_string FROM comments WHERE parent="
-            + str((r.comment_id * 0x10000) + r.cip_type)
-        )
-        comment_results = self._cur.fetchall()
+        if _prog_comment_parent is not None:
+            self._cur.execute(
+                "SELECT tag_reference, record_string FROM comments WHERE parent="
+                + str(_prog_comment_parent)
+            )
+            comment_results = self._cur.fetchall()
+        else:
+            comment_results = []
 
         # SynchronizeRedundancyDataAfterExecution: present only for redundant controllers.
         # The binary does not expose a per-program flag for this attribute — it is implicit
@@ -2199,7 +2219,12 @@ class TaskBuilder(L5xElementBuilder):
         name, record = row[0], row[1]
 
         # All task config fields live within ext[0x01], accessed via absolute BLOB offsets.
-        # These offsets were reverse-engineered from CIPDemo_RevEng.ACD.
+        # These offsets were reverse-engineered from PROJ_N.ACD (V36). V10..V21
+        # task bodies are shorter/source-protected, so emit a valid default PERIODIC task
+        # rather than reading out-of-range -> the L5X skeleton still exports.
+        record = bytes(record)
+        if len(record) < 0x112F:
+            return Task(name, name, "PERIODIC", "10", "10", "10", "false", "false", None, [])
         rate_us = struct.unpack_from("<I", record, 0x106C)[0]
         type_val = struct.unpack_from("<H", record, 0x10F6)[0]
         priority = struct.unpack_from("<H", record, 0x10F8)[0]
@@ -2214,7 +2239,10 @@ class TaskBuilder(L5xElementBuilder):
         prog_count = struct.unpack_from("<H", record, 0x5A)[0]
         scheduled_programs = []
         for i in range(prog_count):
-            cid = struct.unpack_from("<I", record, 0x5A + 2 + i * 4)[0]
+            off = 0x5A + 2 + i * 4
+            if off + 4 > len(record):  # bound by the actual buffer (real files vary)
+                break
+            cid = struct.unpack_from("<I", record, off)[0]
             prog_name = comment_id_to_program.get(cid)
             if prog_name:
                 scheduled_programs.append(ScheduledProgram(prog_name, prog_name))
@@ -2247,18 +2275,27 @@ class ControllerBuilder(L5xElementBuilder):
         if len(results) != 1:
             raise Exception("Does not contain exactly one root controller node")
 
-        r = RxGeneric.from_bytes(results[0][4])
-        self._cur.execute(
-            "SELECT tag_reference, record_string FROM comments WHERE parent="
-            + str((r.comment_id * 0x10000) + r.cip_type)
-        )
-        comment_results = self._cur.fetchall()
-
-        extended_records: Dict[int, bytes] = {}
-        for extended_record in r.extended_records:
-            extended_records[extended_record.attribute_id] = bytes(
-                extended_record.value
+        # V10..V21 component BODIES are source-protected/opaque to the V36
+        # RxGeneric parser; degrade body-derived fields to defaults rather than
+        # crashing so the L5X skeleton (names + hierarchy) still exports.
+        try:
+            r = RxGeneric.from_bytes(results[0][4])
+            extended_records: Dict[int, bytes] = {
+                er.attribute_id: bytes(er.value) for er in r.extended_records
+            }
+            _comment_parent = (r.comment_id * 0x10000) + r.cip_type
+        except Exception:
+            r = None
+            extended_records = {}
+            _comment_parent = None
+        if _comment_parent is not None:
+            self._cur.execute(
+                "SELECT tag_reference, record_string FROM comments WHERE parent="
+                + str(_comment_parent)
             )
+            comment_results = self._cur.fetchall()
+        else:
+            comment_results = []
 
         def _decode_utf16(key):
             raw = extended_records.get(key)
@@ -2279,7 +2316,7 @@ class ControllerBuilder(L5xElementBuilder):
             _cp_str = _cp_raw.decode("utf-16-le", errors="replace").rstrip("\x00")
             if _cp_str:
                 _comm_path_prefix = _cp_str
-        else:
+        elif r is not None:
             # LastAttributeRecord tail: located after the (count_record - 1) parsed records.
             # Header layout: parent_id(4) + unique_tag_id(4) + record_format_version(2) +
             #   cip_type(2) + comment_id(2) = 14 bytes, then main_record(60), then
@@ -2300,21 +2337,28 @@ class ControllerBuilder(L5xElementBuilder):
                         if _cp_str:
                             _comm_path_prefix = _cp_str
 
-        if 0x75 in extended_records:
+        if 0x75 in extended_records and len(extended_records[0x75]) >= 4:
             sn_raw = hex(struct.unpack("<I", extended_records[0x75])[0])[2:].zfill(8)
             project_sn = f"16#{sn_raw[:4]}_{sn_raw[4:]}"
         else:
             project_sn = "Unknown"
 
-        raw_modified_date = struct.unpack("<Q", extended_records[0x66])[0] / 10000000
-        last_modified_date = (
-            datetime(1601, 1, 1) + timedelta(seconds=raw_modified_date)
-        ).strftime("%a %b %d %H:%M:%S %Y")
+        _DEFAULT_DATE = "Mon Jan 01 00:00:00 2001"
+        if 0x66 in extended_records and len(extended_records[0x66]) >= 8:
+            raw_modified_date = struct.unpack("<Q", extended_records[0x66])[0] / 10000000
+            last_modified_date = (
+                datetime(1601, 1, 1) + timedelta(seconds=raw_modified_date)
+            ).strftime("%a %b %d %H:%M:%S %Y")
+        else:
+            last_modified_date = _DEFAULT_DATE
 
-        raw_created_date = struct.unpack("<Q", extended_records[0x65])[0] / 10000000
-        project_creation_date = (
-            datetime(1601, 1, 1) + timedelta(seconds=raw_created_date)
-        ).strftime("%a %b %d %H:%M:%S %Y")
+        if 0x65 in extended_records and len(extended_records[0x65]) >= 8:
+            raw_created_date = struct.unpack("<Q", extended_records[0x65])[0] / 10000000
+            project_creation_date = (
+                datetime(1601, 1, 1) + timedelta(seconds=raw_created_date)
+            ).strftime("%a %b %d %H:%M:%S %Y")
+        else:
+            project_creation_date = _DEFAULT_DATE
 
         # MajorRev and MinorRev: derived later from the root controller module (see below)
 

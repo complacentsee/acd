@@ -19,7 +19,7 @@ from acd.l5x.elements import (
     RSLogix5000Content,
 )
 from acd.record.comments import CommentsRecord
-from acd.record.comps import CompsRecord
+from acd.record.comps import CompsRecord, record_uses_short_header
 from acd.record.nameless import NamelessRecord
 from acd.record.sbregion import SbRegionRecord
 from acd.record.v21_source_protection import build_uid_name_map, is_v21_version
@@ -120,9 +120,27 @@ class ExportL5x:
         # with the largest record because the smaller/later entry is typically a truncated
         # or partial record (e.g. record_type=271 vs 259 for routines) that fails to parse
         # correctly with RxGeneric. The full record is always the largest one.
+        # V10..V21 store comps with a 4-byte-SHORTER FAFA/FDFD header than V24+
+        # (the shared kaitai parser uses V24+/V36 offsets). Autodetect the header
+        # family STRUCTURALLY (a long-header record has a zero u32 at payload+12;
+        # a short-header record has the nonzero self_lcg there) from the first
+        # FAFA component record, so V10..V21 parse correctly without a version
+        # table. Verified across V10..V36 pool samples.
+        self._comps_short_header: bool = False
+        for record in comps_db.records.record:
+            if record.identifier == 64250:  # 0xFAFA
+                self._comps_short_header = record_uses_short_header(
+                    record.record.record_buffer
+                )
+                break
+        log.info(
+            "Comps header family: {}",
+            "SHORT(<=V21)" if self._comps_short_header else "LONG(V24+)",
+        )
+
         comps_by_id = {}
         for record in comps_db.records.record:
-            t = CompsRecord.parse(record)
+            t = CompsRecord.parse(record, self._comps_short_header)
             if t is not None:
                 oid = t[0]
                 if oid not in comps_by_id or len(t[5]) > len(comps_by_id[oid][5]):
@@ -206,6 +224,12 @@ class ExportL5x:
         return self._project
 
     def populate_region_map(self):
+        # The Region Map body is parsed at V24+/V36-specific absolute offsets
+        # (70/78). For V10..V21 short-header projects the body layout differs, so
+        # these offsets read garbage -> skip (rung<->region linkage for
+        # short-header is a separate follow-on, like the V21 rung path).
+        if getattr(self, "_comps_short_header", False):
+            return
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id=0 AND comp_name='Region Map'"
         )
@@ -227,7 +251,9 @@ class ExportL5x:
         identifier_offset = 78
         record_length_absolute = identifier_offset + region_length - 4
         c = 0
-        while identifier_offset <= (record_length_absolute - 16):
+        while identifier_offset <= (record_length_absolute - 16) and (
+            identifier_offset + 16 <= len(record)
+        ):
             parent_id_identifier = struct.unpack(
                 "I", record[identifier_offset : identifier_offset + 4]
             )[0]
