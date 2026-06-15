@@ -2666,12 +2666,20 @@ class RoutineBuilder(L5xElementBuilder):
                 _isr = self._cur.fetchone()
                 is_short = bool(_isr[0]) if _isr else False
                 if is_short:
+                    # SHORT-header: scope the comment side to this routine too, to
+                    # drop cross-routine 16-bit rc_hi collisions (precision). The
+                    # short-header rung comment's parent column is
+                    #   0x6d0000 | (routine comment_id & 0xffff)
+                    # (the short comment parser stores parent == comment_id; the
+                    # 0x6d high byte is the rung-comment record tag). Verified on
+                    # V20 (1767 -> exact 1727) and V16 (102, unchanged).
+                    short_parent_key = 0x6D0000 | (r.comment_id & 0xFFFF)
                     self._cur.execute(
                         "SELECT rl.rung_oid, c.record_string FROM regn_link rl "
                         "JOIN comments c ON c.rung_content = rl.rc_hi "
                         "WHERE c.record_type=1 AND c.rung_content!=0 "
-                        "  AND rl.group_id=?",
-                        (self._object_id,),
+                        "  AND rl.group_id=? AND c.parent=?",
+                        (self._object_id, short_parent_key),
                     )
                 else:
                     parent_key = (r.comment_id * 0x10000) + r.cip_type
