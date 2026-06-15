@@ -170,7 +170,7 @@ def encrypt(pt: bytes, iv: bytes = b"\x00" * 16) -> bytes:
 # ---------------------------------------------------------------------------
 # framing / detection
 # ---------------------------------------------------------------------------
-def looks_like_v21_rung(rbuf: bytes) -> bool:
+def looks_like_source_protected_rung(rbuf: bytes) -> bool:
     """True iff the buffer carries the V21 source-protection header scaffold.
 
     Version-independent: matches the fixed magic that V21 rungs carry and that
@@ -192,7 +192,7 @@ def is_nop(rbuf: bytes) -> bool:
 
 def is_cipher_form(rbuf: bytes) -> bool:
     """True for a bodied (encrypted) V21 rung."""
-    return looks_like_v21_rung(rbuf) and len(rbuf) > _FRAMED_LEN
+    return looks_like_source_protected_rung(rbuf) and len(rbuf) > _FRAMED_LEN
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +298,7 @@ def decode_rung(
     """
     if is_nop(rbuf):
         return _NOP_TEXT
-    if not looks_like_v21_rung(rbuf):
+    if not looks_like_source_protected_rung(rbuf):
         raise ValueError("not a V21 source-protected Rung NT buffer")
     first_char = chr(rbuf[0])
     ct = rbuf[_FRAMED_LEN:]

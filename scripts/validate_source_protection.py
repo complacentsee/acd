@@ -6,7 +6,7 @@ the ground-truth L5X exported by Studio.
 
 Because the on-disk V21 body is intentionally lossy by the final ~8-15 UTF-16
 chars (the engine stores the ciphertext truncated by the last 16 plaintext
-bytes — see acd.record.v21_source_protection), exact full-text recovery is only
+bytes — see acd.record.source_protection), exact full-text recovery is only
 possible for rungs whose whole text fits in the recoverable prefix (all NOPs and
 the short rungs).  This script reports BOTH:
 
@@ -28,7 +28,7 @@ sys.path.insert(0, _ROOT)
 from acd.database.dbextract import DbExtract  # noqa: E402
 from acd.record.comps import CompsRecord  # noqa: E402
 from acd.record.sbregion import SbRegionRecord  # noqa: E402
-from acd.record.v21_source_protection import (  # noqa: E402
+from acd.record.source_protection import (  # noqa: E402
     build_uid_name_map,
     is_v21_version,
 )
@@ -57,7 +57,7 @@ def run_validation(acd_path=DEFAULT_ACD, l5x_path=DEFAULT_L5X):
 
     Returns a dict with the decoded/ground-truth rung lists and the match
     tallies (exact / nop_exact / cipher_exact / prefix_ok / n).  Used by both
-    the CLI below and ``test/test_v21_source_protection.py``.
+    the CLI below and ``test/test_source_protection.py``.
     """
     tmp = tempfile.mkdtemp(prefix="v21val_")
     unzip = Unzip(acd_path)

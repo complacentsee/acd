@@ -22,7 +22,7 @@ from acd.record.comments import CommentsRecord
 from acd.record.comps import CompsRecord, record_uses_short_header
 from acd.record.nameless import NamelessRecord
 from acd.record.sbregion import SbRegionRecord
-from acd.record.v21_source_protection import build_uid_name_map, is_v21_version
+from acd.record.source_protection import build_uid_name_map, is_v21_version
 
 
 def detect_acd_version(acd_filename: os.PathLike) -> Optional[str]:
@@ -94,7 +94,7 @@ class ExportL5x:
         )
 
         # Detect the Studio version (V21 source-protects SbRegion rungs
-        # differently from V30+ — see acd.record.v21_source_protection).
+        # differently from V30+ — see acd.record.source_protection).
         self._acd_version: Optional[str] = detect_acd_version(self.input_filename)
         log.info("Detected ACD version: {}", self._acd_version)
 

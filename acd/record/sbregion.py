@@ -7,10 +7,10 @@ from typing import Dict, Optional
 from acd.database.dbextract import DatRecord
 
 from acd.generated.sbregion.fafa_sbregions import FafaSbregions
-from acd.record.v21_source_protection import (
+from acd.record.source_protection import (
     decode_rung as v21_decode_rung,
     is_v21_version,
-    looks_like_v21_rung,
+    looks_like_source_protected_rung,
 )
 
 
@@ -26,7 +26,7 @@ class SbRegionRecord:
             return
 
         if r.header.language_type == "Rung NT" or r.header.language_type == "REGION NT":
-            if looks_like_v21_rung(r.record_buffer):
+            if looks_like_source_protected_rung(r.record_buffer):
                 # V21 source-protection (EncryptionConfig 5): the rung buffer is
                 # AES-encrypted neutral text, not the V30+ plaintext UTF-16.
                 # Decrypt it and resolve @HEX@ ids to names via the comps table.
@@ -86,7 +86,7 @@ class SbRegionRecord:
         # UTF-16 yields CJK garbage, so branch to the V21 decryption path.
         # Detect V21 by ACD version when known, falling back to the V21 header
         # signature (so the V30+ path is only ever taken for genuine plaintext).
-        if is_v21_version(version) or looks_like_v21_rung(r.record_buffer):
+        if is_v21_version(version) or looks_like_source_protected_rung(r.record_buffer):
             text = v21_decode_rung(r.record_buffer, name_lookup=name_lookup.get)
             return (r.header.identifier, text, "")
 

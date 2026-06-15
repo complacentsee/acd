@@ -1,7 +1,7 @@
 """Tests for V21 'Rung NT' source-protection (EncryptionConfig 5) READ support.
 
 The headline validation against the v21_gm_FuncGen corpus (94 rungs) is run by
-``scripts/validate_v21_source_protection.py``.  Its ACD/L5X fixtures are now
+``scripts/validate_source_protection.py``.  Its ACD/L5X fixtures are now
 embedded in ``resources/`` so ``test_v21_gm_corpus_read`` exercises the real
 fork read path end-to-end here.  The remaining unit tests are self-contained:
 they pin the AES primitive (FIPS-197 KAT + V21 key), the cipher mode
@@ -13,13 +13,13 @@ import os
 import sys
 
 from acd.record._aes import AES
-from acd.record import v21_source_protection as v21
+from acd.record import source_protection as v21
 
 # scripts/ is not a package; add it to the path to reuse the validation driver.
 sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
 )
-import validate_v21_source_protection as v21val  # noqa: E402
+import validate_source_protection as v21val  # noqa: E402
 
 
 # --- vendored AES primitive --------------------------------------------------
@@ -72,7 +72,7 @@ def test_decrypt_recoverable_matches_full_blocks():
 def test_nop_rung_wire_bytes_and_decode():
     nop = bytes.fromhex("4eaa96aa0a050000a05d5569550d")
     assert v21.is_nop(nop)
-    assert v21.looks_like_v21_rung(nop)
+    assert v21.looks_like_source_protected_rung(nop)
     assert not v21.is_cipher_form(nop)
     assert v21.decode_rung(nop) == "NOP();"
 
@@ -80,7 +80,7 @@ def test_nop_rung_wire_bytes_and_decode():
 def test_looks_like_v21_rejects_plaintext_utf16():
     # V30+ plaintext UTF-16 'XIC(' never matches the V21 scaffold.
     plain = "XIC(@e2da9d52@)OTE(@bb593e67@);".encode("utf-16-le")
-    assert not v21.looks_like_v21_rung(plain)
+    assert not v21.looks_like_source_protected_rung(plain)
 
 
 def test_is_v21_version():
@@ -98,7 +98,7 @@ def test_decode_recovers_verifiable_prefix():
     text = "XIO(@1f9611fa@)OTE(@9db369e9@);"
     pt = bytes([v21._PREFIX_BYTE]) + text[1:].encode("utf-16-le")
     rbuf = v21._build_test_rbuf(text[0], v21.encrypt(pt))
-    assert v21.looks_like_v21_rung(rbuf)
+    assert v21.looks_like_source_protected_rung(rbuf)
     dec = v21.decode_rung(rbuf)
     assert text.startswith(dec)            # never fabricates beyond the body
     assert dec == "XIO(@1f9611fa@)OTE("    # first complete operand recovered

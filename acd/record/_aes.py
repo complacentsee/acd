@@ -1,7 +1,7 @@
 """Minimal, dependency-free AES-128/192/256 ECB block primitive.
 
 Vendored so that V21 source-protection rung decryption (see
-``acd.record.v21_source_protection``) has no third-party dependency
+``acd.record.source_protection``) has no third-party dependency
 (``cryptography``/``pycryptodome`` are *not* required by this package).
 
 Only the two raw 16-byte block operations are exposed:
@@ -11,13 +11,13 @@ Only the two raw 16-byte block operations are exposed:
     pt_block = aes.decrypt_block(ct_block16)
 
 Block chaining (CBC / the V21 CFB-style final partial) is implemented by the
-caller in :mod:`acd.record.v21_source_protection`.  This module is intentionally
+caller in :mod:`acd.record.source_protection`.  This module is intentionally
 a textbook implementation: it is used only to decrypt a handful of short rung
 buffers per project, so clarity is preferred over raw throughput.
 
 Validated against the AES FIPS-197 known-answer vectors and against the
 ``cryptography`` reference for the V21 key (SHA256(keymatl5)); see
-``test/test_v21_source_protection.py``.
+``test/test_source_protection.py``.
 """
 from __future__ import annotations
 
