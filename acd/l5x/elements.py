@@ -183,6 +183,15 @@ _PRIMITIVE_RADIX: Dict[str, str] = {
     "LREAL": "Float",
 }
 
+# Atomic data types that carry a Radix attribute on a <Tag>. Unlike the Decorated
+# member rule, BOOL/BIT DO take a tag-level Radix. Logix Designer emits Radix ONLY
+# for these (and arrays of them); every structured type — TIMER, COUNTER, CONTROL,
+# MESSAGE, STRING, PID, UDT_*, AB:* module types, etc. — omits it.
+_ATOMIC_TAG_TYPES: frozenset = frozenset({
+    "BOOL", "BIT", "SINT", "INT", "DINT", "LINT",
+    "USINT", "UINT", "UDINT", "ULINT", "REAL", "LREAL",
+})
+
 # Default zero value string for each primitive in Decorated output.
 _PRIMITIVE_DECORATED_ZERO: Dict[str, str] = {
     "BOOL":  "0",
@@ -545,6 +554,17 @@ class Tag(L5xElement):
                 f' ExternalAccess="{self.external_access}" IO="true"></Tag>'
             )
         else:
+            # OEM emits Radix only for atomic-typed tags (and atomic arrays);
+            # suppress it on structured/UDT/STRING/module-defined types (TIMER,
+            # COUNTER, CONTROL, UDT_*, AB:*, ...), which Logix never writes Radix
+            # on. data_type may be an array ("DINT[10]") -> test the base type.
+            # Only suppress when the type is KNOWN and non-atomic. If data_type is
+            # empty (an unresolved short-header tag), leave radix as-is — those are
+            # predominantly atomic (OEM still writes their Radix) and suppressing
+            # would under-emit.
+            _dtb = self.data_type.split("[")[0].upper() if self.data_type else ""
+            if self.radix is not None and _dtb and _dtb not in _ATOMIC_TAG_TYPES:
+                self.radix = None
             base = super().to_xml()
 
         # --- Comments child element (operand-keyed member/bit/array comments) ---
