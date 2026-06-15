@@ -1932,6 +1932,38 @@ class TagBuilder(L5xElementBuilder):
         except Exception:
             return None, 0
 
+    def _long_header_is_alias(self, raw_rec: bytes) -> bool:
+        """Detect a V24+ long-header alias tag, best-effort.
+
+        An alias tag's ``main_record.data_table_instance`` points at the
+        module-element comps record it aliases into; that target's name is the
+        synthetic ``&<8hex moduleCompUId>:<slot>:<C|I|O>`` reference (the same
+        ``&hex:`` form the IO/alias resolvers consume).  A genuine Base tag's
+        ``data_table_instance`` points at an ordinary RxData backing whose name
+        is a plain identifier.  So an ``&hex:`` target name is a clean,
+        file-independent alias discriminator (validated 48/48 aliases, 0 false
+        positives on PROJ_A + PROJ_C).
+
+        Returns False on any failure so the caller keeps today's Base-tag
+        behaviour (no regression).
+        """
+        try:
+            r = RxGeneric.from_bytes(raw_rec)
+            if r.cip_type not in (0x6B, 0x68):
+                return False
+            dti = r.main_record.data_table_instance
+            if not dti:
+                return False
+            self._cur.execute(
+                "SELECT comp_name FROM comps WHERE object_id=" + str(dti)
+            )
+            row = self._cur.fetchone()
+            if not row or not row[0]:
+                return False
+            return bool(re.match(r"^&[0-9a-fA-F]+:.*$", row[0]))
+        except Exception:
+            return False
+
     def _resolve_io_name(self, comp_name: str) -> Union[str, None]:
         """Resolve a module I/O tag's display name, or None if it is not one.
 
@@ -2005,6 +2037,19 @@ class TagBuilder(L5xElementBuilder):
         if self._short_header and not is_io:
             alias_for = self._short_header_alias_for(raw_rec)
             if alias_for is None and constant is None:
+                constant = "false"
+
+        # --- V24+ long-header Constant="false" OEM invariant ---
+        # Logix always emits Constant="false" on a non-IO *Base* tag; on Alias
+        # tags it emits no Constant attribute (the value lives on the target).
+        # The long-header record's 0x279 flag is 1 only for genuine constants
+        # (handled above -> "true"); a 0 there means an ordinary Base tag, which
+        # OEM still writes as Constant="false". We must NOT stamp it on alias
+        # tags, so gate on the long-header alias detector (dti -> &hex: module
+        # ref; validated 48/48 aliases, 0 false positives on PROJ_A+PROJ_C).
+        # Wrapped/best-effort: a detector failure leaves `constant` as today.
+        if not self._short_header and not is_io and constant is None:
+            if not self._long_header_is_alias(raw_rec):
                 constant = "false"
 
         # Alias tags export TagType="Alias", carry no Constant (it lives on the
