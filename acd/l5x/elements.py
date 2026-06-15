@@ -2288,13 +2288,13 @@ class TagBuilder(L5xElementBuilder):
             except Exception:
                 comment_results = []
 
-        # Operand-keyed member/bit/array comments. Stored in the comments table
-        # with the operand in tag_reference and the text in record_string.
+        # Operand-keyed member/bit/array comments (V10..V21 short-header only).
+        # These are stored in the comments table keyed by parent == comment_id,
+        # with the operand in the tag_reference column and the text in
+        # record_string. The long-header path leaves operand_comments empty.
         # Wrapped so any failure degrades to today's no-operand-comment behaviour.
         operand_comments: List[Tuple[str, str]] = []
         if self._short_header:
-            # SHORT (V10..V21): keyed by parent == comment_id; record types
-            # 3..11 (the manual short operand parser, comments.py).
             try:
                 self._cur.execute(
                     "SELECT tag_reference, record_string FROM comments "
@@ -2305,34 +2305,6 @@ class TagBuilder(L5xElementBuilder):
                 for op_ref, op_text in self._cur.fetchall():
                     if op_ref:
                         operand_comments.append((op_ref, op_text or ""))
-            except Exception:
-                operand_comments = []
-        elif r.cip_type == 0x6B:
-            # LONG (V24+): keyed by parent == comment_id*0x10000 + cip_type, as
-            # FafaComents utf_16_record (record_type 3/4/13/14): tag_reference is
-            # the operand string ("[0]", ".5", ".Member") and record_string is the
-            # text. Require BOTH non-empty: empty record_string marks an internal
-            # multi-entry/member record that Studio does NOT surface as a tag
-            # <Comment Operand=> (verified on V34 — e.g. PLStgDecode).
-            #
-            # Restricted to cip 0x6b: those tags have a UNIQUE comment_id (V34:
-            # 347/347), so parent_key identifies exactly one tag. cip-0x68 tags
-            # all share a constant comment_id (0xb55c) -> parent_key is NOT unique
-            # and the query would smear one tag's operand comments across 137 tags
-            # (the dominant over-emission). Those (and cip-0x6a "$hash$" backing
-            # keyed) comments are omitted rather than mis-attributed (missing,
-            # never wrong); recovering them needs a non-comment_id tag key.
-            try:
-                parent_key = (r.comment_id * 0x10000) + r.cip_type
-                self._cur.execute(
-                    "SELECT tag_reference, record_string FROM comments "
-                    "WHERE parent=? AND record_type IN (3,4,13,14) "
-                    "AND tag_reference!='' AND record_string!=''",
-                    (parent_key,),
-                )
-                for op_ref, op_text in self._cur.fetchall():
-                    if op_ref and op_text:
-                        operand_comments.append((op_ref, op_text))
             except Exception:
                 operand_comments = []
 
