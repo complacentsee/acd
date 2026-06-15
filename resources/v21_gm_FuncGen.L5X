@@ -1,0 +1,1100 @@
+﻿<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<RSLogix5000Content SchemaRevision="1.0" SoftwareRevision="21.03" TargetName="FuncGen" TargetType="Controller" ContainsContext="false" Owner="Windows User" ExportDate="Sun Jun 14 11:32:58 2026" ExportOptions="DecoratedData ForceProtectedEncoding AllProjDocTrans">
+<Controller Use="Target" Name="FuncGen" ProcessorType="1756-L73" MajorRev="21" MinorRev="11" TimeSlice="20" ShareUnusedTimeSlice="1" ProjectCreationDate="Sat Jun 13 12:20:10 2026" LastModifiedDate="Sat Jun 13 12:20:30 2026" SFCExecutionControl="CurrentActive" SFCRestartPosition="MostRecent"
+ SFCLastScan="DontScan" ProjectSN="16#006c_62cb" MatchProjectToController="false" CanUseRPIFromProducer="false" InhibitAutomaticFirmwareUpdate="0" PassThroughConfiguration="EnabledWithAppend" DownloadProjectDocumentationAndExtendedProperties="true">
+<RedundancyInfo Enabled="false" KeepTestEditsOnSwitchOver="false" IOMemoryPadPercentage="90" DataTablePadPercentage="50"/>
+<Security Code="0" ChangesToDetect="16#ffff_ffff_ffff_ffff"/>
+<SafetyInfo/>
+<DataTypes/>
+<Modules>
+<Module Name="Local" CatalogNumber="1756-L73" Vendor="1" ProductType="14" ProductCode="94" Major="21" Minor="11" ParentModule="Local" ParentModPortId="1" Inhibited="false" MajorFault="true"
+>
+<EKey State="ExactMatch"/>
+<Ports>
+<Port Id="1" Address="2" Type="ICP" Upstream="false">
+<Bus Size="4"/>
+</Port>
+</Ports>
+</Module>
+</Modules>
+<AddOnInstructionDefinitions/>
+<Tags/>
+<Programs>
+<Program Name="BSLOnly" TestEdits="false" MainRoutineName="MainRoutine" Disabled="false">
+<Tags>
+<Tag Name="BitIn" TagType="Base" DataType="BOOL" Radix="Decimal" Constant="false" ExternalAccess="Read/Write">
+<Data>00</Data>
+<Data Format="Decorated">
+<DataValue DataType="BOOL" Radix="Decimal" Value="0"/>
+</Data>
+</Tag>
+<Tag Name="Go" TagType="Base" DataType="BOOL" Radix="Decimal" Constant="false" ExternalAccess="Read/Write">
+<Data>00</Data>
+<Data Format="Decorated">
+<DataValue DataType="BOOL" Radix="Decimal" Value="0"/>
+</Data>
+</Tag>
+<Tag Name="ShiftArr" TagType="Base" DataType="DINT" Dimensions="4" Radix="Decimal" Constant="false" ExternalAccess="Read/Write">
+<Data>00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00</Data>
+<Data Format="Decorated">
+<Array DataType="DINT" Dimensions="4" Radix="Decimal">
+<Element Index="[0]" Value="0"/>
+<Element Index="[1]" Value="0"/>
+<Element Index="[2]" Value="0"/>
+<Element Index="[3]" Value="0"/>
+</Array>
+</Data>
+</Tag>
+<Tag Name="ShiftCtl" TagType="Base" DataType="CONTROL" Constant="false" ExternalAccess="Read/Write">
+<Data>00 00 00 00 40 00 00 00 00 00 00 00</Data>
+<Data Format="Decorated">
+<Structure DataType="CONTROL">
+<DataValueMember Name="LEN" DataType="DINT" Radix="Decimal" Value="64"/>
+<DataValueMember Name="POS" DataType="DINT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="EN" DataType="BOOL" Value="0"/>
+<DataValueMember Name="EU" DataType="BOOL" Value="0"/>
+<DataValueMember Name="DN" DataType="BOOL" Value="0"/>
+<DataValueMember Name="EM" DataType="BOOL" Value="0"/>
+<DataValueMember Name="ER" DataType="BOOL" Value="0"/>
+<DataValueMember Name="UL" DataType="BOOL" Value="0"/>
+<DataValueMember Name="IN" DataType="BOOL" Value="0"/>
+<DataValueMember Name="FD" DataType="BOOL" Value="0"/>
+</Structure>
+</Data>
+</Tag>
+</Tags>
+<Routines>
+<Routine Name="MainRoutine" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[XIC(Go)UNK(BSL);]]>
+</Text>
+</Rung>
+<Rung Number="1" Type="N">
+<Text>
+<![CDATA[XIC(Go)UNK(BSR);]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+</Routines>
+</Program>
+<Program Name="MainProgram" TestEdits="false" MainRoutineName="MainRoutine" Disabled="false">
+<Tags/>
+<Routines>
+<Routine Name="MainRoutine" Type="RLL"/>
+</Routines>
+</Program>
+<Program Name="MiscOps" TestEdits="false" MainRoutineName="MainRoutine" Disabled="false">
+<Tags>
+<Tag Name="BitIn" TagType="Base" DataType="BOOL" Radix="Decimal" Constant="false" ExternalAccess="Read/Write">
+<Data>00</Data>
+<Data Format="Decorated">
+<DataValue DataType="BOOL" Radix="Decimal" Value="0"/>
+</Data>
+</Tag>
+<Tag Name="D1" TagType="Base" DataType="DINT" Radix="Decimal" Constant="false" ExternalAccess="Read/Write">
+<Data>32 00 00 00</Data>
+<Data Format="Decorated">
+<DataValue DataType="DINT" Radix="Decimal" Value="50"/>
+</Data>
+</Tag>
+<Tag Name="D2" TagType="Base" DataType="DINT" Radix="Decimal" Constant="false" ExternalAccess="Read/Write">
+<Data>01 00 00 00</Data>
+<Data Format="Decorated">
+<DataValue DataType="DINT" Radix="Decimal" Value="1"/>
+</Data>
+</Tag>
+<Tag Name="D3" TagType="Base" DataType="DINT" Radix="Decimal" Constant="false" ExternalAccess="Read/Write">
+<Data>64 00 00 00</Data>
+<Data Format="Decorated">
+<DataValue DataType="DINT" Radix="Decimal" Value="100"/>
+</Data>
+</Tag>
+<Tag Name="F1" TagType="Base" DataType="BOOL" Radix="Decimal" Constant="false" ExternalAccess="Read/Write">
+<Data>00</Data>
+<Data Format="Decorated">
+<DataValue DataType="BOOL" Radix="Decimal" Value="0"/>
+</Data>
+</Tag>
+<Tag Name="F2" TagType="Base" DataType="BOOL" Radix="Decimal" Constant="false" ExternalAccess="Read/Write">
+<Data>00</Data>
+<Data Format="Decorated">
+<DataValue DataType="BOOL" Radix="Decimal" Value="0"/>
+</Data>
+</Tag>
+<Tag Name="Go" TagType="Base" DataType="BOOL" Radix="Decimal" Constant="false" ExternalAccess="Read/Write">
+<Data>00</Data>
+<Data Format="Decorated">
+<DataValue DataType="BOOL" Radix="Decimal" Value="0"/>
+</Data>
+</Tag>
+<Tag Name="OSF1" TagType="Base" DataType="BOOL" Radix="Decimal" Constant="false" ExternalAccess="Read/Write">
+<Data>00</Data>
+<Data Format="Decorated">
+<DataValue DataType="BOOL" Radix="Decimal" Value="0"/>
+</Data>
+</Tag>
+<Tag Name="OSR1" TagType="Base" DataType="BOOL" Radix="Decimal" Constant="false" ExternalAccess="Read/Write">
+<Data>00</Data>
+<Data Format="Decorated">
+<DataValue DataType="BOOL" Radix="Decimal" Value="0"/>
+</Data>
+</Tag>
+<Tag Name="R1" TagType="Base" DataType="REAL" Radix="Float" Constant="false" ExternalAccess="Read/Write">
+<Data>00 00 48 42</Data>
+<Data Format="Decorated">
+<DataValue DataType="REAL" Radix="Float" Value="50.0"/>
+</Data>
+</Tag>
+<Tag Name="R2" TagType="Base" DataType="REAL" Radix="Float" Constant="false" ExternalAccess="Read/Write">
+<Data>00 00 00 00</Data>
+<Data Format="Decorated">
+<DataValue DataType="REAL" Radix="Float" Value="0.0"/>
+</Data>
+</Tag>
+<Tag Name="R3" TagType="Base" DataType="REAL" Radix="Float" Constant="false" ExternalAccess="Read/Write">
+<Data>00 00 C8 42</Data>
+<Data Format="Decorated">
+<DataValue DataType="REAL" Radix="Float" Value="100.0"/>
+</Data>
+</Tag>
+<Tag Name="ShiftArr" TagType="Base" DataType="DINT" Dimensions="4" Radix="Decimal" Constant="false" ExternalAccess="Read/Write">
+<Data>00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00</Data>
+<Data Format="Decorated">
+<Array DataType="DINT" Dimensions="4" Radix="Decimal">
+<Element Index="[0]" Value="0"/>
+<Element Index="[1]" Value="0"/>
+<Element Index="[2]" Value="0"/>
+<Element Index="[3]" Value="0"/>
+</Array>
+</Data>
+</Tag>
+<Tag Name="ShiftCtl" TagType="Base" DataType="CONTROL" Constant="false" ExternalAccess="Read/Write">
+<Data>00 00 00 00 40 00 00 00 00 00 00 00</Data>
+<Data Format="Decorated">
+<Structure DataType="CONTROL">
+<DataValueMember Name="LEN" DataType="DINT" Radix="Decimal" Value="64"/>
+<DataValueMember Name="POS" DataType="DINT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="EN" DataType="BOOL" Value="0"/>
+<DataValueMember Name="EU" DataType="BOOL" Value="0"/>
+<DataValueMember Name="DN" DataType="BOOL" Value="0"/>
+<DataValueMember Name="EM" DataType="BOOL" Value="0"/>
+<DataValueMember Name="ER" DataType="BOOL" Value="0"/>
+<DataValueMember Name="UL" DataType="BOOL" Value="0"/>
+<DataValueMember Name="IN" DataType="BOOL" Value="0"/>
+<DataValueMember Name="FD" DataType="BOOL" Value="0"/>
+</Structure>
+</Data>
+</Tag>
+</Tags>
+<Routines>
+<Routine Name="MainRoutine" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[LIM(D2,D1,D3)OTE(F1);]]>
+</Text>
+</Rung>
+<Rung Number="1" Type="N">
+<Text>
+<![CDATA[LIM(0,D1,100)OTE(F1);]]>
+</Text>
+</Rung>
+<Rung Number="2" Type="N">
+<Text>
+<![CDATA[LIM(10,D1,90)OTE(F1);]]>
+</Text>
+</Rung>
+<Rung Number="3" Type="N">
+<Text>
+<![CDATA[LIM(R2,R1,R3)OTE(F1);]]>
+</Text>
+</Rung>
+<Rung Number="4" Type="N">
+<Text>
+<![CDATA[LIM(0.0,R1,100.0)OTE(F1);]]>
+</Text>
+</Rung>
+<Rung Number="5" Type="N">
+<Text>
+<![CDATA[XIC(Go)UNK(BSL);]]>
+</Text>
+</Rung>
+<Rung Number="6" Type="N">
+<Text>
+<![CDATA[XIC(Go)UNK(BSR);]]>
+</Text>
+</Rung>
+<Rung Number="7" Type="N">
+<Text>
+<![CDATA[XIC(Go)OSR(OSR1,F1);]]>
+</Text>
+</Rung>
+<Rung Number="8" Type="N">
+<Text>
+<![CDATA[XIC(Go)OSR(OSR1,F2);]]>
+</Text>
+</Rung>
+<Rung Number="9" Type="N">
+<Text>
+<![CDATA[XIC(Go)OSF(OSF1,F1);]]>
+</Text>
+</Rung>
+<Rung Number="10" Type="N">
+<Text>
+<![CDATA[XIC(Go)OSF(OSF1,F2);]]>
+</Text>
+</Rung>
+<Rung Number="11" Type="N">
+<Text>
+<![CDATA[LIM(0,D1,100)MOV(1,D2);]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+</Routines>
+</Program>
+<Program Name="ProgAlpha" TestEdits="false" MainRoutineName="Main" Disabled="false">
+<Tags/>
+<Routines>
+<Routine Name="Main" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub01" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+<Rung Number="1" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+<Rung Number="2" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+<Rung Number="3" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub02" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub03" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub04" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub05" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub06" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+<Rung Number="1" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+<Rung Number="2" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+<Rung Number="3" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub07" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub08" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+<Rung Number="1" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+<Rung Number="2" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+</Routines>
+</Program>
+<Program Name="ProgBeta" TestEdits="false" MainRoutineName="Main" Disabled="false">
+<Tags/>
+<Routines>
+<Routine Name="Main" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub01" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+<Rung Number="1" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+<Rung Number="2" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub02" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub03" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub04" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub05" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+<Rung Number="1" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+<Rung Number="2" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+<Rung Number="3" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+<Rung Number="4" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub06" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub07" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub08" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+</Routines>
+</Program>
+<Program Name="ProgDelta" TestEdits="false" MainRoutineName="Main" Disabled="false">
+<Tags/>
+<Routines>
+<Routine Name="Main" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub01" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub02" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub03" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub04" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub05" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub06" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub07" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub08" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+</Routines>
+</Program>
+<Program Name="ProgGamma" TestEdits="false" MainRoutineName="Main" Disabled="false">
+<Tags/>
+<Routines>
+<Routine Name="Main" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub01" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub02" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub03" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub04" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub05" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub06" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub07" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+<Routine Name="Sub08" Type="RLL">
+<RLLContent>
+<Rung Number="0" Type="N">
+<Text>
+<![CDATA[NOP();]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+</Routines>
+</Program>
+<Program Name="SignalGen" TestEdits="false" MainRoutineName="MainRoutine" Disabled="false">
+<Description>
+<![CDATA[Signal generator for trend testing. Set SG_Enable=1 to start. Generates sine, cosine, ramps, triangle, square, stepped, and composite waveforms.]]>
+</Description>
+<Tags>
+<Tag Name="SG_Angle" TagType="Base" DataType="REAL" Radix="Float" Constant="false" ExternalAccess="Read/Write">
+<Description>
+<![CDATA[Slow angle accumulator (radians, 0 to 2*PI, ~5s period)]]>
+</Description>
+<Data>4B 35 C0 40</Data>
+<Data Format="Decorated">
+<DataValue DataType="REAL" Radix="Float" Value="6.0065055"/>
+</Data>
+</Tag>
+<Tag Name="SG_AngleFast" TagType="Base" DataType="REAL" Radix="Float" Constant="false" ExternalAccess="Read/Write">
+<Description>
+<![CDATA[Fast angle accumulator (radians, 0 to 2*PI, ~1.7s period)]]>
+</Description>
+<Data>A5 53 54 40</Data>
+<Data Format="Decorated">
+<DataValue DataType="REAL" Radix="Float" Value="3.3176053"/>
+</Data>
+</Tag>
+<Tag Name="SG_Composite" TagType="Base" DataType="REAL" Radix="Float" Constant="false" ExternalAccess="Read/Write">
+<Description>
+<![CDATA[Composite: slow sine + fast sine ripple, ~10-90 range]]>
+</Description>
+<Data>26 4A 15 42</Data>
+<Data Format="Decorated">
+<DataValue DataType="REAL" Radix="Float" Value="37.32241"/>
+</Data>
+</Tag>
+<Tag Name="SG_Cosine" TagType="Base" DataType="REAL" Radix="Float" Constant="false" ExternalAccess="Read/Write">
+<Description>
+<![CDATA[Cosine wave: -1.0 to 1.0, ~5s period]]>
+</Description>
+<Data>83 43 76 3F</Data>
+<Data Format="Decorated">
+<DataValue DataType="REAL" Radix="Float" Value="0.96196765"/>
+</Data>
+</Tag>
+<Tag Name="SG_Enable" TagType="Base" DataType="BOOL" Radix="Decimal" Constant="false" ExternalAccess="Read/Write">
+<Description>
+<![CDATA[Master enable - set to 1 to run signal generation]]>
+</Description>
+<Data>01</Data>
+<Data Format="Decorated">
+<DataValue DataType="BOOL" Radix="Decimal" Value="1"/>
+</Data>
+</Tag>
+<Tag Name="SG_RampFast" TagType="Base" DataType="REAL" Radix="Float" Constant="false" ExternalAccess="Read/Write">
+<Description>
+<![CDATA[Fast sawtooth ramp: 0.0 to 100.0, ~2.5s period]]>
+</Description>
+<Data>DD CC 0C 42</Data>
+<Data Format="Decorated">
+<DataValue DataType="REAL" Radix="Float" Value="35.20006"/>
+</Data>
+</Tag>
+<Tag Name="SG_RampSlow" TagType="Base" DataType="REAL" Radix="Float" Constant="false" ExternalAccess="Read/Write">
+<Description>
+<![CDATA[Slow sawtooth ramp: 0.0 to 100.0, ~10s period]]>
+</Description>
+<Data>2E 33 23 40</Data>
+<Data Format="Decorated">
+<DataValue DataType="REAL" Radix="Float" Value="2.5499988"/>
+</Data>
+</Tag>
+<Tag Name="SG_Sine" TagType="Base" DataType="REAL" Radix="Float" Constant="false" ExternalAccess="Read/Write">
+<Description>
+<![CDATA[Sine wave: -1.0 to 1.0, ~5s period]]>
+</Description>
+<Data>13 DC 8B BE</Data>
+<Data Format="Decorated">
+<DataValue DataType="REAL" Radix="Float" Value="-0.2731634"/>
+</Data>
+</Tag>
+<Tag Name="SG_SineFast" TagType="Base" DataType="REAL" Radix="Float" Constant="false" ExternalAccess="Read/Write">
+<Description>
+<![CDATA[Fast sine wave: -1.0 to 1.0, ~1.7s period]]>
+</Description>
+<Data>BF 4E 33 BE</Data>
+<Data Format="Decorated">
+<DataValue DataType="REAL" Radix="Float" Value="-0.17510508"/>
+</Data>
+</Tag>
+<Tag Name="SG_SineScaled" TagType="Base" DataType="REAL" Radix="Float" Constant="false" ExternalAccess="Read/Write">
+<Description>
+<![CDATA[Sine wave scaled: 0.0 to 100.0, ~5s period]]>
+</Description>
+<Data>08 5E 11 42</Data>
+<Data Format="Decorated">
+<DataValue DataType="REAL" Radix="Float" Value="36.341827"/>
+</Data>
+</Tag>
+<Tag Name="SG_Square" TagType="Base" DataType="REAL" Radix="Float" Constant="false" ExternalAccess="Read/Write">
+<Description>
+<![CDATA[Square wave: 0.0 or 100.0, ~5s period]]>
+</Description>
+<Data>00 00 00 00</Data>
+<Data Format="Decorated">
+<DataValue DataType="REAL" Radix="Float" Value="0.0"/>
+</Data>
+</Tag>
+<Tag Name="SG_Stepped" TagType="Base" DataType="REAL" Radix="Float" Constant="false" ExternalAccess="Read/Write">
+<Description>
+<![CDATA[5-level staircase: 0, 25, 50, 75, 100 - ~5s period]]>
+</Description>
+<Data>00 00 C8 42</Data>
+<Data Format="Decorated">
+<DataValue DataType="REAL" Radix="Float" Value="100.0"/>
+</Data>
+</Tag>
+<Tag Name="SG_Temp" TagType="Base" DataType="REAL" Radix="Float" Constant="false" ExternalAccess="Read/Write">
+<Description>
+<![CDATA[Scratch variable for intermediate calculations]]>
+</Description>
+<Data>6F 22 E0 BF</Data>
+<Data Format="Decorated">
+<DataValue DataType="REAL" Radix="Float" Value="-1.7510508"/>
+</Data>
+</Tag>
+<Tag Name="SG_Tick" TagType="Base" DataType="TIMER" Constant="false" ExternalAccess="Read/Write">
+<Description>
+<![CDATA[5ms base tick timer]]>
+</Description>
+<Data>83 30 0D C0 05 00 00 00 01 00 00 00</Data>
+<Data Format="Decorated">
+<Structure DataType="TIMER">
+<DataValueMember Name="PRE" DataType="DINT" Radix="Decimal" Value="5"/>
+<DataValueMember Name="ACC" DataType="DINT" Radix="Decimal" Value="1"/>
+<DataValueMember Name="EN" DataType="BOOL" Value="1"/>
+<DataValueMember Name="TT" DataType="BOOL" Value="1"/>
+<DataValueMember Name="DN" DataType="BOOL" Value="0"/>
+</Structure>
+</Data>
+</Tag>
+<Tag Name="SG_Triangle" TagType="Base" DataType="REAL" Radix="Float" Constant="false" ExternalAccess="Read/Write">
+<Description>
+<![CDATA[Triangle wave: 0.0 to 100.0, ~10s period]]>
+</Description>
+<Data>C5 CC 8C 40</Data>
+<Data Format="Decorated">
+<DataValue DataType="REAL" Radix="Float" Value="4.3999963"/>
+</Data>
+</Tag>
+<Tag Name="SG_TriDir" TagType="Base" DataType="BOOL" Radix="Decimal" Constant="false" ExternalAccess="Read/Write">
+<Description>
+<![CDATA[Triangle direction: 0=rising, 1=falling]]>
+</Description>
+<Data>01</Data>
+<Data Format="Decorated">
+<DataValue DataType="BOOL" Radix="Decimal" Value="1"/>
+</Data>
+</Tag>
+</Tags>
+<Routines>
+<Routine Name="MainRoutine" Type="RLL">
+<Description>
+<![CDATA[Signal generator main routine - all signals driven by 5ms tick timer]]>
+</Description>
+<RLLContent>
+<Rung Number="0" Type="N">
+<Comment>
+<![CDATA[Master enable and 5ms tick timer]]>
+</Comment>
+<Text>
+<![CDATA[XIC(SG_Enable)TON(SG_Tick,?,?);]]>
+</Text>
+</Rung>
+<Rung Number="1" Type="N">
+<Comment>
+<![CDATA[Slow angle accumulator: 2*PI / 1000 ticks = 0.006283 rad/tick (~5s full cycle)]]>
+</Comment>
+<Text>
+<![CDATA[XIC(SG_Tick.DN)ADD(SG_Angle,0.006283,SG_Angle);]]>
+</Text>
+</Rung>
+<Rung Number="2" Type="N">
+<Comment>
+<![CDATA[Reset slow angle at 2*PI]]>
+</Comment>
+<Text>
+<![CDATA[GEQ(SG_Angle,6.283185)MOV(0.0,SG_Angle);]]>
+</Text>
+</Rung>
+<Rung Number="3" Type="N">
+<Comment>
+<![CDATA[Fast angle accumulator: 3x speed (~1.67s full cycle)]]>
+</Comment>
+<Text>
+<![CDATA[XIC(SG_Tick.DN)ADD(SG_AngleFast,0.01885,SG_AngleFast);]]>
+</Text>
+</Rung>
+<Rung Number="4" Type="N">
+<Comment>
+<![CDATA[Reset fast angle at 2*PI]]>
+</Comment>
+<Text>
+<![CDATA[GEQ(SG_AngleFast,6.283185)MOV(0.0,SG_AngleFast);]]>
+</Text>
+</Rung>
+<Rung Number="5" Type="N">
+<Comment>
+<![CDATA[Sine wave: -1.0 to 1.0, ~5s period]]>
+</Comment>
+<Text>
+<![CDATA[SIN(SG_Angle,SG_Sine);]]>
+</Text>
+</Rung>
+<Rung Number="6" Type="N">
+<Comment>
+<![CDATA[Cosine wave: -1.0 to 1.0, ~5s period]]>
+</Comment>
+<Text>
+<![CDATA[COS(SG_Angle,SG_Cosine);]]>
+</Text>
+</Rung>
+<Rung Number="7" Type="N">
+<Comment>
+<![CDATA[Sine scaled step 1: multiply by 50]]>
+</Comment>
+<Text>
+<![CDATA[MUL(SG_Sine,50.0,SG_SineScaled);]]>
+</Text>
+</Rung>
+<Rung Number="8" Type="N">
+<Comment>
+<![CDATA[Sine scaled step 2: offset by 50 (result: 0 to 100)]]>
+</Comment>
+<Text>
+<![CDATA[ADD(SG_SineScaled,50.0,SG_SineScaled);]]>
+</Text>
+</Rung>
+<Rung Number="9" Type="N">
+<Comment>
+<![CDATA[Fast sine wave: -1.0 to 1.0, ~1.67s period]]>
+</Comment>
+<Text>
+<![CDATA[SIN(SG_AngleFast,SG_SineFast);]]>
+</Text>
+</Rung>
+<Rung Number="10" Type="N">
+<Comment>
+<![CDATA[Slow sawtooth ramp: +0.05 per tick (0 to 100 in ~10s)]]>
+</Comment>
+<Text>
+<![CDATA[XIC(SG_Tick.DN)ADD(SG_RampSlow,0.05,SG_RampSlow);]]>
+</Text>
+</Rung>
+<Rung Number="11" Type="N">
+<Comment>
+<![CDATA[Reset slow ramp at 100]]>
+</Comment>
+<Text>
+<![CDATA[GEQ(SG_RampSlow,100.0)MOV(0.0,SG_RampSlow);]]>
+</Text>
+</Rung>
+<Rung Number="12" Type="N">
+<Comment>
+<![CDATA[Fast sawtooth ramp: +0.2 per tick (0 to 100 in ~2.5s)]]>
+</Comment>
+<Text>
+<![CDATA[XIC(SG_Tick.DN)ADD(SG_RampFast,0.2,SG_RampFast);]]>
+</Text>
+</Rung>
+<Rung Number="13" Type="N">
+<Comment>
+<![CDATA[Reset fast ramp at 100]]>
+</Comment>
+<Text>
+<![CDATA[GEQ(SG_RampFast,100.0)MOV(0.0,SG_RampFast);]]>
+</Text>
+</Rung>
+<Rung Number="14" Type="N">
+<Comment>
+<![CDATA[Triangle: switch to falling at 100]]>
+</Comment>
+<Text>
+<![CDATA[GEQ(SG_Triangle,100.0)OTL(SG_TriDir);]]>
+</Text>
+</Rung>
+<Rung Number="15" Type="N">
+<Comment>
+<![CDATA[Triangle: switch to rising at 0]]>
+</Comment>
+<Text>
+<![CDATA[LEQ(SG_Triangle,0.0)OTU(SG_TriDir);]]>
+</Text>
+</Rung>
+<Rung Number="16" Type="N">
+<Comment>
+<![CDATA[Triangle rising: +0.1 per tick (0 to 100 in ~5s)]]>
+</Comment>
+<Text>
+<![CDATA[XIC(SG_Tick.DN)XIO(SG_TriDir)ADD(SG_Triangle,0.1,SG_Triangle);]]>
+</Text>
+</Rung>
+<Rung Number="17" Type="N">
+<Comment>
+<![CDATA[Triangle falling: -0.1 per tick (100 to 0 in ~5s)]]>
+</Comment>
+<Text>
+<![CDATA[XIC(SG_Tick.DN)XIC(SG_TriDir)SUB(SG_Triangle,0.1,SG_Triangle);]]>
+</Text>
+</Rung>
+<Rung Number="18" Type="N">
+<Comment>
+<![CDATA[Square wave high: angle < PI => 100]]>
+</Comment>
+<Text>
+<![CDATA[LES(SG_Angle,3.141593)MOV(100.0,SG_Square);]]>
+</Text>
+</Rung>
+<Rung Number="19" Type="N">
+<Comment>
+<![CDATA[Square wave low: angle >= PI => 0]]>
+</Comment>
+<Text>
+<![CDATA[GEQ(SG_Angle,3.141593)MOV(0.0,SG_Square);]]>
+</Text>
+</Rung>
+<Rung Number="20" Type="N">
+<Comment>
+<![CDATA[Stepped wave: level 0 (angle 0 to 1.257)]]>
+</Comment>
+<Text>
+<![CDATA[LES(SG_Angle,1.256637)MOV(0.0,SG_Stepped);]]>
+</Text>
+</Rung>
+<Rung Number="21" Type="N">
+<Comment>
+<![CDATA[Stepped wave: level 25 (angle 1.257 to 2.513)]]>
+</Comment>
+<Text>
+<![CDATA[GEQ(SG_Angle,1.256637)LES(SG_Angle,2.513274)MOV(25.0,SG_Stepped);]]>
+</Text>
+</Rung>
+<Rung Number="22" Type="N">
+<Comment>
+<![CDATA[Stepped wave: level 50 (angle 2.513 to 3.770)]]>
+</Comment>
+<Text>
+<![CDATA[GEQ(SG_Angle,2.513274)LES(SG_Angle,3.769911)MOV(50.0,SG_Stepped);]]>
+</Text>
+</Rung>
+<Rung Number="23" Type="N">
+<Comment>
+<![CDATA[Stepped wave: level 75 (angle 3.770 to 5.027)]]>
+</Comment>
+<Text>
+<![CDATA[GEQ(SG_Angle,3.769911)LES(SG_Angle,5.026548)MOV(75.0,SG_Stepped);]]>
+</Text>
+</Rung>
+<Rung Number="24" Type="N">
+<Comment>
+<![CDATA[Stepped wave: level 100 (angle 5.027 to 2*PI)]]>
+</Comment>
+<Text>
+<![CDATA[GEQ(SG_Angle,5.026548)MOV(100.0,SG_Stepped);]]>
+</Text>
+</Rung>
+<Rung Number="25" Type="N">
+<Comment>
+<![CDATA[Composite step 1: slow sine * 40]]>
+</Comment>
+<Text>
+<![CDATA[MUL(SG_Sine,40.0,SG_Composite);]]>
+</Text>
+</Rung>
+<Rung Number="26" Type="N">
+<Comment>
+<![CDATA[Composite step 2: fast sine * 10 into temp]]>
+</Comment>
+<Text>
+<![CDATA[MUL(SG_SineFast,10.0,SG_Temp);]]>
+</Text>
+</Rung>
+<Rung Number="27" Type="N">
+<Comment>
+<![CDATA[Composite step 3: add fast component]]>
+</Comment>
+<Text>
+<![CDATA[ADD(SG_Composite,SG_Temp,SG_Composite);]]>
+</Text>
+</Rung>
+<Rung Number="28" Type="N">
+<Comment>
+<![CDATA[Composite step 4: offset to center at 50 (result: ~10 to ~90)]]>
+</Comment>
+<Text>
+<![CDATA[ADD(SG_Composite,50.0,SG_Composite);]]>
+</Text>
+</Rung>
+<Rung Number="29" Type="N">
+<Comment>
+<![CDATA[Reset tick timer to restart cycle]]>
+</Comment>
+<Text>
+<![CDATA[XIC(SG_Tick.DN)RES(SG_Tick);]]>
+</Text>
+</Rung>
+</RLLContent>
+</Routine>
+</Routines>
+</Program>
+</Programs>
+<Tasks>
+<Task Name="MainTask" Type="CONTINUOUS" Priority="10" Watchdog="500" DisableUpdateOutputs="false" InhibitTask="false">
+<ScheduledPrograms>
+<ScheduledProgram Name="MainProgram"/>
+<ScheduledProgram Name="SignalGen"/>
+<ScheduledProgram Name="ProgAlpha"/>
+<ScheduledProgram Name="ProgBeta"/>
+<ScheduledProgram Name="ProgDelta"/>
+<ScheduledProgram Name="ProgGamma"/>
+<ScheduledProgram Name="BSLOnly"/>
+<ScheduledProgram Name="MiscOps"/>
+</ScheduledPrograms>
+</Task>
+</Tasks>
+<CST MasterID="0"/>
+<WallClockTime LocalTimeAdjustment="0" TimeZone="0"/>
+<Trends/>
+<DataLogs/>
+<TimeSynchronize Priority1="128" Priority2="128" PTPEnable="false"/>
+</Controller>
+</RSLogix5000Content>

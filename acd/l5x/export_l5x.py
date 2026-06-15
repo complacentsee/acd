@@ -1,11 +1,12 @@
 import argparse
 import os
+import re
 import sqlite3
 import struct
 from dataclasses import dataclass
 from pathlib import Path
 from sqlite3 import Cursor
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 from acd.database.dbextract import DbExtract
 from acd.zip.unzip import Unzip
@@ -21,6 +22,24 @@ from acd.record.comments import CommentsRecord
 from acd.record.comps import CompsRecord
 from acd.record.nameless import NamelessRecord
 from acd.record.sbregion import SbRegionRecord
+from acd.record.v21_source_protection import build_uid_name_map, is_v21_version
+
+
+def detect_acd_version(acd_filename: os.PathLike) -> Optional[str]:
+    """Read the 'Saved - VNN.../NNNN.NNN' Studio version string from an ACD.
+
+    The version banner lives in the plaintext Version.Log at the very start of
+    the ACD container, so a short read of the file head suffices.  Returns the
+    last (most recent) saved version string, or None if not found.  Used to
+    select the V21 source-protection rung path (see acd.record.sbregion).
+    """
+    try:
+        with open(acd_filename, "rb") as fh:
+            head = fh.read(8192).decode("latin1")
+    except OSError:
+        return None
+    matches = re.findall(r"Saved - (V[\d.]+/[\d.]+)", head)
+    return matches[-1] if matches else None
 
 
 @dataclass
@@ -74,6 +93,11 @@ class ExportL5x:
             "CREATE TABLE nameless(object_id int, parent_id int, record BLOB NOT NULL)"
         )
 
+        # Detect the Studio version (V21 source-protects SbRegion rungs
+        # differently from V30+ — see acd.record.v21_source_protection).
+        self._acd_version: Optional[str] = detect_acd_version(self.input_filename)
+        log.info("Detected ACD version: {}", self._acd_version)
+
         log.info("Extracting ACD database file")
         unzip = Unzip(self.input_filename)
         unzip.write_files(self._temp_dir)
@@ -116,11 +140,24 @@ class ExportL5x:
         )
         self.populate_region_map()
 
+        # V21 stores comps with a different FAFA layout than V30+ (the shared
+        # comps parser reads object_id 4 bytes too far for V21), so the V21 rung
+        # @HEX@ -> name resolution needs a V21-correct object_id -> name map.
+        # Build it from Comps.Dat with V21 offsets and use it ONLY for the rung
+        # path; the V30+ name_lookup / _id_to_name (write-back) is untouched.
+        rung_name_lookup = name_lookup
+        if is_v21_version(self._acd_version):
+            v21_map = build_uid_name_map(comps_db)
+            if v21_map:
+                # V21 map wins for the rung path; keep any V30+ entries as fallback.
+                rung_name_lookup = {**name_lookup, **v21_map}
+                log.info("Built V21 rung name map: {} entries", len(v21_map))
+
         log.info(
             "Getting records from ACD SbRegion file and storing in sqllite database"
         )
         sb_region_db = DbExtract(os.path.join(self._temp_dir, "SbRegion.Dat")).read()
-        rung_tuples = [t for record in sb_region_db.records.record if (t := SbRegionRecord.parse(record, name_lookup)) is not None]
+        rung_tuples = [t for record in sb_region_db.records.record if (t := SbRegionRecord.parse(record, rung_name_lookup, self._acd_version)) is not None]
         self._cur.executemany("INSERT INTO rungs VALUES (?,?,?)", rung_tuples)
         self._db.commit()
 
