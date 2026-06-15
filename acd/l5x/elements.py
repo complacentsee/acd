@@ -115,6 +115,13 @@ class DataType(L5xElement):
     cls: str
     members: List[Member]
     _description: Union[str, None] = field(default=None)
+    # V10..V21 short-header projects store their *full* lean datatype set
+    # (User + ProductDefined + IO) in Comps.Dat and the OEM L5X emits all of
+    # them verbatim — so for those files we must NOT apply the V24+ exclusion
+    # that drops ProductDefined / ':'-named (IO) types. Set True only by the
+    # short-header DataTypeBuilder path; defaults False so the V24+/V36 long
+    # path keeps its exact prior behaviour.
+    _emit_predefined: bool = field(default=False)
 
     def __post_init__(self):
         super().__post_init__()
@@ -122,10 +129,19 @@ class DataType(L5xElement):
 
     @property
     def _l5x_exclude(self) -> bool:
+        if self._emit_predefined:
+            return False
         return self.cls == "ProductDefined" or ":" in self.name
 
     def to_xml(self) -> str:
         base = super().to_xml()
+        # V10..V21: atomic base types (BOOL/DINT/...) have no members and the
+        # OEM emits them as self-closing DataTypes — drop the empty <Members/>
+        # wrapper the generic serializer would otherwise add. Scoped to the
+        # short-header emit path (_emit_predefined) so the long path is
+        # untouched.
+        if self._emit_predefined and not self.members:
+            base = base.replace("<Members></Members>", "").replace("<Members/>", "")
         if not self._description:
             return base
         desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
@@ -945,6 +961,31 @@ class RSLogix5000Content(L5xElement):
         self._export_name = "RSLogix5000Content"
 
 
+# Atomic/primitive Logix base types: emitted as empty self-closing DataTypes
+# (no <Members>) by the OEM L5X even though Comps stores a self-member for them.
+_ATOMIC_TYPES = {"BOOL", "SINT", "USINT", "INT", "UINT", "DINT", "UDINT",
+                 "LINT", "ULINT", "REAL", "LREAL", "BYTE", "WORD", "DWORD",
+                 "LWORD"}
+
+
+def _decode_utf16z(buf: bytes) -> str:
+    """Decode a NUL-terminated UTF-16LE string (walk u16 units to 0x0000).
+
+    Used for V10..V21 short-header inline member names (stored at offset 0 of
+    each datatype extended record).
+    """
+    units = []
+    for i in range(0, len(buf) - 1, 2):
+        u = buf[i] | (buf[i + 1] << 8)
+        if u == 0:
+            break
+        units.append(u)
+    try:
+        return "".join(chr(u) for u in units)
+    except ValueError:
+        return ""
+
+
 def radix_enum(i: int) -> str:
     if i == 0:
         return "NullType"
@@ -995,8 +1036,18 @@ class MemberBuilder(L5xElementBuilder):
     # Fallback target name for Pattern-2 BIT members (0x68==0, 0x6c==0xFFFFFFFF).
     # Set by DataTypeBuilder to the most recent preceding hidden SINT/INT in member order.
     _fallback_target: Union[str, None] = field(default=None)
+    # V10..V21 short-header members are NOT separate Comps records: their name +
+    # field layout live inside the owning datatype's extended record (the same
+    # 168-byte blob passed in via `record`, with the UTF-16LE member name at
+    # offset 0). When `_short_name` is set we skip the by-object_id Comps lookup
+    # (there is none) and decode straight from `record`. Defaults None so the
+    # V24+/V36 long path is unaffected.
+    _short_name: Union[str, None] = field(default=None)
 
     def build(self) -> Member:
+        if self._short_name is not None:
+            return self._build_short()
+
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
             + str(self._object_id)
@@ -1092,9 +1143,75 @@ class MemberBuilder(L5xElementBuilder):
 
         return Member(name, name, data_type, dimension, radix, hidden, target, bit_number, external_access, description)
 
+    def _build_short(self) -> Member:
+        """Build a Member for a V10..V21 short-header datatype.
+
+        The member's name (`_short_name`) and its 168-byte field record
+        (`self.record`) come from the owning datatype's extended record — there
+        is no per-member Comps record to query. Field offsets are IDENTICAL to
+        the long path (0x54 radix .. 0x78 cip); only the name source and the
+        description lookup differ. Wrapped so a malformed short record degrades
+        to a plain BOOL/empty member instead of crashing the whole datatype.
+        """
+        name = self._short_name
+        try:
+            dimension = struct.unpack_from("<I", self.record, 0x5C)[0]
+            radix = radix_enum(struct.unpack_from("<I", self.record, 0x54)[0])
+            data_type_id = struct.unpack_from("<I", self.record, 0x58)[0]
+            hidden = bool(struct.unpack_from("<I", self.record, 0x70)[0])
+            external_access = external_access_enum(
+                struct.unpack_from("<I", self.record, 0x74)[0]
+            )
+
+            self._cur.execute(
+                "SELECT comp_name FROM comps WHERE object_id=" + str(data_type_id)
+            )
+            dt_row = self._cur.fetchone()
+            data_type = dt_row[0] if dt_row else ""
+
+            target: Union[str, None] = None
+            bit_number: Union[int, None] = None
+            if data_type == "BOOL":
+                # V10..V21 BIT rule (validated 5735/5735 on PROJ_D): a BOOL
+                # member is a BIT alias UNLESS 0x68 == 0x800 (a real standalone
+                # BOOL). The bit index is 0x64; the backing field is the
+                # non-BIT member whose byte range covers 0x6c (or 0x60 when
+                # 0x6c == 0xFFFFFFFF) -> resolved via the byte-range
+                # offset60_to_name map (target+bit 2832/2832 correct).
+                val_68 = struct.unpack_from("<I", self.record, 0x68)[0]
+                if val_68 != 0x800:
+                    data_type = "BIT"
+                    dimension = 0
+                    bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
+                    target_key = struct.unpack_from("<I", self.record, 0x6C)[0]
+                    if target_key != 0xFFFFFFFF:
+                        target = self._offset60_to_name.get(target_key)
+                    else:
+                        val_60 = struct.unpack_from("<I", self.record, 0x60)[0]
+                        target = self._offset60_to_name.get(val_60)
+                    if target is None:
+                        target = self._fallback_target
+            else:
+                # A bogus dimension (e.g. 0xFFFC0000) sometimes appears in the
+                # 0x5C slot for non-array scalar members; clamp implausible
+                # values to 0 so we don't emit a garbage Dimension attribute.
+                if dimension > 0x10000:
+                    dimension = 0
+            return Member(name, name, data_type, dimension, radix, hidden,
+                          target, bit_number, external_access, None)
+        except Exception:
+            return Member(name, name, "", 0, "Decimal", False, None, None, "Read/Write")
+
 
 @dataclass
 class DataTypeBuilder(L5xElementBuilder):
+    # V10..V21 short-header datatypes carry their members inline (extended
+    # records 0x6E+) instead of as child Comps records, and the OEM L5X emits
+    # the full lean set (User + ProductDefined + IO). Set True by the
+    # short-header ControllerBuilder path; defaults False -> identical V24+
+    # behaviour.
+    _short_header: bool = field(default=False)
+
     def build(self) -> DataType:
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
@@ -1107,7 +1224,9 @@ class DataTypeBuilder(L5xElementBuilder):
         try:
             r = RxGeneric.from_bytes(results[0][3])
         except Exception as e:
-            return DataType(name, name, "NoFamily", "User", [])
+            dt = DataType(name, name, "NoFamily", "User", [])
+            dt._emit_predefined = self._short_header
+            return dt
 
         extended_records: Dict[int, bytes] = {}
         for extended_record in r.extended_records:
@@ -1126,10 +1245,19 @@ class DataTypeBuilder(L5xElementBuilder):
         module_defined = _ext_u32(0x69)
 
         class_type = "User"
-        if module_defined > 0:
-            class_type = "IO"
-        if built_in & 0x03:
-            class_type = "ProductDefined"
+        if self._short_header:
+            # V10..V21: module-defined (IO) types ALSO have built_in&3 set, so IO
+            # must take precedence (verified 142/142 vs OEM on PROJ_D). The long
+            # path keeps its original precedence below, untouched.
+            if module_defined > 0:
+                class_type = "IO"
+            elif built_in & 0x03:
+                class_type = "ProductDefined"
+        else:
+            if module_defined > 0:
+                class_type = "IO"
+            if built_in & 0x03:
+                class_type = "ProductDefined"
         if 0x64 in extended_records and len(extended_records[0x64]) == 0x04:
             member_count = struct.unpack("<I", extended_records[0x64])[0]
         else:
@@ -1191,6 +1319,102 @@ class DataTypeBuilder(L5xElementBuilder):
                     )
                 except Exception:
                     pass
+        elif (
+            self._short_header
+            and member_count > 0
+            and name.upper() not in _ATOMIC_TYPES
+        ):
+            # V10..V21 short-header: members live inline as extended records
+            # 0x6E, 0x6E+1, ... (one 168-byte blob each, member name at offset 0
+            # as UTF-16LE). There is no child member-collection record, so build
+            # each Member straight from its ext blob. Best-effort: a malformed
+            # blob is skipped, leaving today's empty-members fallback for the
+            # rest of the type. Atomic base types (BOOL/SINT/.../REAL) carry a
+            # single self-referential member in Comps but the OEM L5X emits them
+            # as empty self-closing DataTypes, so skip member emission for them.
+            short_recs: List[tuple] = []  # (name, blob)
+            for idx2 in range(member_count):
+                key2 = 0x6E + idx2
+                if key2 not in extended_records:
+                    break
+                blob = bytes(extended_records[key2])
+                mname = _decode_utf16z(blob[0:0x40]) if len(blob) >= 2 else ""
+                short_recs.append((mname, blob))
+
+            # The kaitai RxGeneric parser only counts (count_record - 1)
+            # extended records; the FINAL member is carried in the trailing
+            # LastAttributeRecord (same layout the controller CommPath uses).
+            # Recover it so datatypes don't lose their last member.
+            if len(short_recs) < member_count:
+                try:
+                    raw_rec = bytes(results[0][3])
+                    rec_offset = 82
+                    for _er in r.extended_records:
+                        rec_offset += 4 + 4 + len(bytes(_er.value))
+                    tail = raw_rec[rec_offset:]
+                    if len(tail) >= 8:
+                        last_len = struct.unpack_from("<I", tail, 4)[0]
+                        actual = last_len - 4
+                        if actual > 0 and len(tail) >= 8 + actual:
+                            tail_blob = tail[8: 8 + actual]
+                            tail_name = _decode_utf16z(tail_blob[0:0x40])
+                            if tail_name:
+                                short_recs.append((tail_name, tail_blob))
+                except Exception:
+                    pass
+
+            # offset60 -> backing-field name map (non-BIT members only), so BIT
+            # members can resolve their Target, mirroring the long path. A BIT
+            # member's 0x6c is the BYTE offset of the bit it occupies; for a
+            # multi-byte backing field (INT/DINT) that byte offset can land
+            # past the backing field's own 0x60 (e.g. the high byte of an INT),
+            # so we map EVERY byte the backing field covers to its name (sizes
+            # below). _build_short still tries the exact 0x60 first.
+            _BACKING_SIZE = {"SINT": 1, "USINT": 1, "BYTE": 1, "BOOL": 1,
+                             "INT": 2, "UINT": 2, "WORD": 2,
+                             "DINT": 4, "UDINT": 4, "DWORD": 4,
+                             "LINT": 8, "ULINT": 8, "LWORD": 8}
+            offset60_to_name = {}
+            for mname, blob in short_recs:
+                if len(blob) < 0x78:
+                    continue
+                dt_id_b = struct.unpack_from("<I", blob, 0x58)[0]
+                self._cur.execute(
+                    "SELECT comp_name FROM comps WHERE object_id=" + str(dt_id_b)
+                )
+                _row = self._cur.fetchone()
+                base = _row[0] if _row else ""
+                val_68_2 = struct.unpack_from("<I", blob, 0x68)[0]
+                # A BIT alias (BOOL with 0x68 != 0x800) is NOT a backing field;
+                # every other member (atomic scalar, or a real BOOL with
+                # 0x68==0x800) backs the bits that overlay its byte range.
+                if base == "BOOL" and val_68_2 != 0x800:
+                    continue
+                val_60 = struct.unpack_from("<I", blob, 0x60)[0]
+                sz = _BACKING_SIZE.get(base, 1)
+                offset60_to_name[val_60] = mname
+                for b_off in range(val_60, val_60 + sz):
+                    offset60_to_name.setdefault(b_off, mname)
+
+            last_hidden_backing = None
+            for mname, blob in short_recs:
+                if not mname:
+                    continue
+                if len(blob) >= 0x74:
+                    is_hidden = bool(struct.unpack_from("<I", blob, 0x70)[0])
+                    if is_hidden:
+                        last_hidden_backing = mname
+                try:
+                    children.append(
+                        MemberBuilder(
+                            self._cur, -1, blob,
+                            offset60_to_name,
+                            last_hidden_backing,
+                            _short_name=mname,
+                        ).build()
+                    )
+                except Exception:
+                    pass
 
         # --- Description ---
         description: Union[str, None] = None
@@ -1202,7 +1426,9 @@ class DataTypeBuilder(L5xElementBuilder):
         if desc_row and desc_row[0]:
             description = desc_row[0]
 
-        return DataType(name, name, string_family, class_type, children, description)
+        dt = DataType(name, name, string_family, class_type, children, description)
+        dt._emit_predefined = self._short_header
+        return dt
 
 
 @dataclass
@@ -2267,6 +2493,11 @@ class TaskBuilder(L5xElementBuilder):
 
 @dataclass
 class ControllerBuilder(L5xElementBuilder):
+    # True for V10..V21 short-header projects (set by ExportL5x). Routes the
+    # datatype build through the inline-member / full-lean-set path; defaults
+    # False so V24+/V36 export is byte-for-byte unchanged.
+    _short_header: bool = field(default=False)
+
     def build(self) -> Controller:
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record_type, record FROM comps WHERE parent_id=0 AND record_type=256"
@@ -2403,9 +2634,16 @@ class ControllerBuilder(L5xElementBuilder):
         all_data_types_map: Dict[str, DataType] = {}
         for result in results:
             _data_type_object_id = result[1]
-            dt = DataTypeBuilder(self._cur, _data_type_object_id).build()
+            dt = DataTypeBuilder(
+                self._cur, _data_type_object_id, _short_header=self._short_header
+            ).build()
             all_data_types_map[dt.name.upper()] = dt
-            if dt.cls == "User":
+            if self._short_header:
+                # V10..V21 OEM L5X emits the full lean set (User + ProductDefined
+                # + IO); _l5x_exclude is disabled via _emit_predefined so the
+                # serializer keeps all of them. (The long path keeps User-only.)
+                data_types.append(dt)
+            elif dt.cls == "User":
                 data_types.append(dt)
 
         # data_types_map: case-insensitive name → DataType for all types (User + ProductDefined).

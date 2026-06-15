@@ -207,7 +207,9 @@ class ExportL5x:
     @property
     def controller(self):
         if self._controller is None:
-            self._controller = ControllerBuilder(self._cur).build()
+            self._controller = ControllerBuilder(
+                self._cur, _short_header=self._comps_short_header
+            ).build()
         return self._controller
 
     @property
