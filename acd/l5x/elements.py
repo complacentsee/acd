@@ -480,6 +480,33 @@ class Tag(L5xElement):
     # Radix/Constant/Dimensions are suppressed (OEM never emits them on IO tags).
     # Defaults False so every non-IO tag (both header families) is unchanged.
     _io: bool = False
+    # OpcUaAccess="None" is emitted on every <Tag> when the project's OPC UA
+    # server is enabled (V36+; see ExportL5x.project_flags). Default False.
+    _opc_ua: bool = False
+    # Class="Standard"/"Safety" for controller-scope Base tags in a safety
+    # project; None omits the attribute. Default None.
+    _class_attr: Union[str, None] = None
+
+    def _inject_tag_attrs(self, base: str) -> str:
+        """Insert OpcUaAccess / Class attributes into the opening <Tag ...> of base.
+
+        Inserted right before the first '>' of the element (attribute order is not
+        significant to consumers/the comparator). No-op when neither applies.
+        """
+        extra = ""
+        if self._class_attr:
+            extra += f' Class="{self._class_attr}"'
+        if self._opc_ua:
+            extra += ' OpcUaAccess="None"'
+        if not extra:
+            return base
+        i = base.find(">")
+        if i < 0:
+            return base
+        # handle self-closing "/>"
+        if i > 0 and base[i - 1] == "/":
+            return base[: i - 1] + extra + base[i - 1:]
+        return base[:i] + extra + base[i:]
 
     @property
     def _l5x_exclude(self) -> bool:
@@ -547,7 +574,7 @@ class Tag(L5xElement):
             # No DataType, no <Data> (the value lives on the alias target). The
             # whole element is returned here; the Data/Description machinery below
             # is skipped (an alias carries none of it).
-            return (
+            return self._inject_tag_attrs(
                 f'<Tag Name="{html.escape(self.name, quote=True)}"'
                 f' TagType="Alias" Radix="Binary"'
                 f' AliasFor="{html.escape(self.alias_for, quote=True)}"'
@@ -558,7 +585,7 @@ class Tag(L5xElement):
             #   Name TagType DataType ExternalAccess IO="true"
             # (no Radix/Constant/Dimensions, which OEM never writes on IO tags).
             dt_attr = f' DataType="{html.escape(self.data_type, quote=True)}"' if self.data_type else ""
-            base = (
+            base = self._inject_tag_attrs(
                 f'<Tag Name="{html.escape(self.name, quote=True)}"'
                 f' TagType="{self.tag_type}"{dt_attr}'
                 f' ExternalAccess="{self.external_access}" IO="true"></Tag>'
@@ -575,7 +602,7 @@ class Tag(L5xElement):
             _dtb = self.data_type.split("[")[0].upper() if self.data_type else ""
             if self.radix is not None and _dtb and _dtb not in _ATOMIC_TAG_TYPES:
                 self.radix = None
-            base = super().to_xml()
+            base = self._inject_tag_attrs(super().to_xml())
 
         # --- Comments child element (operand-keyed member/bit/array comments) ---
         comments_xml = self._build_comments_xml()
@@ -2216,6 +2243,26 @@ class TagBuilder(L5xElementBuilder):
         if alias_for:
             constant = None
 
+        # Project-level OpcUaAccess / Class flags (see ExportL5x.project_flags).
+        try:
+            self._cur.execute("SELECT opc_ua, is_safety FROM project_flags")
+            _pf = self._cur.fetchone() or (0, 0)
+        except Exception:
+            _pf = (0, 0)
+        _opc_ua = bool(_pf[0])
+
+        def _cls_attr():
+            # Class only on controller-scope (cip 0x6b) Base tags of a safety
+            # project; Safety/Standard from the region partition hi16 @ record 0x36
+            # (0x00FB safety partition / 0x0008 standard). Aliases/IO/program-scope
+            # (cip 0x68) tags get no Class.
+            if not _pf[1] or is_io or tag_type != "Base":
+                return None
+            if len(raw_rec) < 0x3A or int.from_bytes(raw_rec[10:12], "little") != 0x6B:
+                return None
+            hi = (int.from_bytes(raw_rec[0x36:0x3A], "little") >> 16) & 0xFFFF
+            return "Safety" if hi == 0x00FB else ("Standard" if hi == 0x0008 else None)
+
         try:
             r = RxGeneric.from_bytes(raw_rec)
         except Exception as e:
@@ -2224,6 +2271,7 @@ class TagBuilder(L5xElementBuilder):
                 _nm, _nm, tag_type, None if alias_for else "",
                 None, external_access, constant, None, 0, [],
                 alias_for=alias_for, _io=is_io,
+                _opc_ua=_opc_ua, _class_attr=_cls_attr(),
             )
 
         if r.cip_type != 0x6B and r.cip_type != 0x68:
@@ -2232,6 +2280,7 @@ class TagBuilder(L5xElementBuilder):
                 _nm, _nm, tag_type, None if alias_for else "",
                 None, external_access, constant, None, 0, [],
                 alias_for=alias_for, _io=is_io,
+                _opc_ua=_opc_ua, _class_attr=_cls_attr(),
             )
         if r.main_record.data_type == 0xFFFFFFFF:
             data_type = ""
@@ -2412,6 +2461,7 @@ class TagBuilder(L5xElementBuilder):
                 _value_type_code=value_type_code,
                 _short_header=self._short_header,
                 _io=is_io,
+                _opc_ua=_opc_ua, _class_attr=_cls_attr(),
             )
 
         name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
@@ -2450,6 +2500,7 @@ class TagBuilder(L5xElementBuilder):
             _value_type_code=value_type_code,
             _short_header=self._short_header,
             _io=is_io,
+            _opc_ua=_opc_ua, _class_attr=_cls_attr(),
         )
 
 

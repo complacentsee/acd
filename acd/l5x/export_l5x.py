@@ -190,6 +190,46 @@ class ExportL5x:
             [(k,) for k, n in _key_counts.items() if n == 1],
         )
 
+        # Project-level flags consumed by TagBuilder for OpcUaAccess and Class:
+        #   opc_ua  : the project's OPC UA server is enabled -> every <Tag>,
+        #             ConfigTag/InputTag/OutputTag carries OpcUaAccess="None".
+        #             Concrete signal: V36+ AND the named controller record
+        #             (cip 0x8e, parent_id 0) has extended-attribute 0x81 present
+        #             (validated 20/20 on V36; gated to V36+ because the same id
+        #             carries a different meaning pre-V36).
+        #   is_safety: the project contains a safety memory partition -> safety
+        #             controller; controller-scope Base tags then carry Class.
+        #             Concrete signal: any cip-0x6b comp whose region id
+        #             (u4 @ record 0x36) has hi16 == 0x00FB (the safety partition).
+        _major = 0
+        try:
+            _m = re.match(r"V(\d+)", self._acd_version or "")
+            _major = int(_m.group(1)) if _m else 0
+        except Exception:
+            _major = 0
+        _opc = 0
+        _safety = 0
+        for _t in comps_by_id.values():
+            _rec = _t[5]
+            if len(_rec) < 14:
+                continue
+            _cip = int.from_bytes(_rec[10:12], "little")
+            if _safety == 0 and _cip == 0x6B and len(_rec) >= 0x3A:
+                if ((int.from_bytes(_rec[0x36:0x3A], "little") >> 16) & 0xFFFF) == 0x00FB:
+                    _safety = 1
+            if _opc == 0 and _major >= 36 and _cip == 0x8E and _t[1] == 0:
+                try:
+                    from acd.generated.comps.rx_generic import RxGeneric as _RxG
+                    _r = _RxG.from_bytes(_rec)
+                    if any(e.attribute_id == 0x81 for e in _r.extended_records):
+                        _opc = 1
+                except Exception:
+                    pass
+        self._cur.execute("CREATE TABLE project_flags(opc_ua int, is_safety int)")
+        self._cur.execute(
+            "INSERT INTO project_flags VALUES (?, ?)", (_opc, _safety)
+        )
+
         # Full-payload table for the tag-value reader (Step 6b); separate so the
         # deduped comps table and every existing query stay byte-for-byte the same.
         self._cur.execute(
