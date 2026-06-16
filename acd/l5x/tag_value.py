@@ -857,9 +857,13 @@ def _render_string_inner(layout, image: bytes) -> Optional[str]:
             if length <= 0 or length > len(raw):
                 length = len(raw.split(b"\x00", 1)[0])
             text = _ascii_string_cdata(raw[:length])
+            # OEM wraps non-empty STRING DATA member content in single quotes
+            # (the L5K string-literal form, embedded quotes already $-escaped);
+            # an empty string (LEN 0) is emitted as empty CDATA, no quotes.
+            cdata = f"'{text}'" if text else ""
             parts.append(
                 f'<DataValueMember Name="{name}" DataType="STRING" '
-                f'Radix="ASCII">\n<![CDATA[{text}]]>\n</DataValueMember>'
+                f'Radix="ASCII">\n<![CDATA[{cdata}]]>\n</DataValueMember>'
             )
         else:
             return None
