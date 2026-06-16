@@ -154,7 +154,14 @@ class ExportL5x:
         # (Step 6b) needs the full payload. Keep the LARGEST full payload per id.
         full_by_id: Dict[int, bytes] = {}
         for record in comps_db.records.record:
-            t = CompsRecord.parse(record, self._comps_short_header)
+            # An anomalous comps record can run its name/StrzUtf16 field past the
+            # buffer end (kaitai read_u2le EOF) and raise inside parse; skip the
+            # bad record rather than aborting the whole export (mirrors the guarded
+            # full-payload read just below).
+            try:
+                t = CompsRecord.parse(record, self._comps_short_header)
+            except Exception:  # noqa: BLE001
+                continue
             if t is not None:
                 oid = t[0]
                 if oid not in comps_by_id or len(t[5]) > len(comps_by_id[oid][5]):

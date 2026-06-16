@@ -18,6 +18,23 @@ from acd.l5x import tag_value as _tag_value
 from acd.record.comps import CompsRecord
 
 
+# XML 1.0 forbids the C0 control characters except TAB (0x09), LF (0x0A) and
+# CR (0x0D). ``html.escape`` only rewrites markup metacharacters (& < > " '), so
+# any raw control byte in a decoded field passes through verbatim and makes the
+# emitted document not-well-formed (the reader then raises and the whole file is
+# unparseable). Some on-disk slots land on bytes that are not real text — e.g. a
+# source-protected AOI's vendor slot decodes ciphertext, and a V30 vendor read at
+# a V34+ offset lands on zero bytes — so strip the illegal characters before
+# emitting. Legitimate L5X attribute/text values never contain these bytes, so
+# this only cleans the already-corrupt cases.
+_XML_ILLEGAL_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _xml_sane(s: str) -> str:
+    """Drop characters XML 1.0 forbids in attribute/element content."""
+    return _XML_ILLEGAL_RE.sub("", s)
+
+
 @dataclass
 class L5xElementBuilder:
     _cur: Cursor
@@ -80,7 +97,7 @@ class L5xElement:
                     _overrides = getattr(self, "_xml_attr_overrides", {})
                     xml_attr_name = _overrides.get(attribute, attribute.title().replace("_", ""))
                     attribute_list.append(
-                        f'{xml_attr_name}="{html.escape(str(attribute_value), quote=True)}"'
+                        f'{xml_attr_name}="{html.escape(_xml_sane(str(attribute_value)), quote=True)}"'
                     )
 
         _export_name = (
@@ -3349,8 +3366,12 @@ def _parse_aoi_nameless(data: bytes) -> dict:
     # CreatedDate FILETIME (8 bytes, Windows FILETIME in 100-ns units)
     ft = struct.unpack_from("<Q", data, offset)[0]
     if ft:
-        dt = datetime(1601, 1, 1) + timedelta(microseconds=ft // 10)
-        result["created_date"] = dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+        try:
+            dt = datetime(1601, 1, 1) + timedelta(microseconds=ft // 10)
+            result["created_date"] = dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+        except (OverflowError, OSError, ValueError):
+            # garbage/out-of-range FILETIME in some real-world records
+            result["created_date"] = ""
     else:
         result["created_date"] = ""
     offset += 8
@@ -3487,8 +3508,16 @@ class AoiBuilder(L5xElementBuilder):
         revision = f"{rev_major}.{rev_minor}"
 
         # --- Vendor from comps record ---
+        # The u16 length @0xA6 / UTF-8 @0xA8 layout is V34+; on older records (e.g.
+        # V30) the slot lands on zero bytes, and on a source-protected AOI it lands
+        # on ciphertext. Sanitize the decoded value (drop XML-illegal control bytes)
+        # and treat an empty result as absent so the attribute is omitted rather
+        # than emitting control bytes / an empty Vendor="".
         vlen = struct.unpack_from("<H", aoi_record, 0xA6)[0] if len(aoi_record) > 0xA8 else 0
-        vendor: Union[str, None] = aoi_record[0xA8:0xA8+vlen].decode("utf-8", errors="replace") if vlen > 0 else None
+        vendor: Union[str, None] = None
+        if vlen > 0:
+            _vendor = _xml_sane(aoi_record[0xA8:0xA8 + vlen].decode("utf-8", errors="replace"))
+            vendor = _vendor if _vendor.strip() else None
 
         # --- Metadata from large nameless record ---
         self._cur.execute(
@@ -3827,8 +3856,14 @@ class ControllerBuilder(L5xElementBuilder):
     _acd_major: int = field(default=0)
 
     def build(self) -> Controller:
+        # The root controller is the named FAFA component at parent_id=0 /
+        # record_type=256. A few projects also carry an anomalous empty-named
+        # FDFD sub-record that decodes to the same parent/type; exclude empty
+        # names so it isn't mistaken for a second controller. The real controller
+        # always carries the project name, so named-only never drops it.
         self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record_type, record FROM comps WHERE parent_id=0 AND record_type=256"
+            "SELECT comp_name, object_id, parent_id, record_type, record FROM comps "
+            "WHERE parent_id=0 AND record_type=256 AND comp_name IS NOT NULL AND comp_name != ''"
         )
         results = self._cur.fetchall()
         if len(results) != 1:
