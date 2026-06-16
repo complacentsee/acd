@@ -1396,6 +1396,17 @@ class Controller(L5xElement):
         )
 
 
+# Matches an emitted tag-value Format="L5K" <Data> block: group 1 = the open tag
+# through "<![CDATA[", group 2 = the (single-line) bracket-list body, group 3 =
+# the "]]>" terminator. Used to re-wrap the body at export time. Only <Data> is
+# wrapped: the reference wraps tag-value L5K lists (4216 blocks) but never wraps
+# AOI <DefaultData Format="L5K"> (5841 blocks, 0 wrapped), so those stay single-line.
+_L5K_CDATA_RE = re.compile(
+    r'(<Data\b[^>]*\bFormat="L5K"[^>]*>\s*<!\[CDATA\[)(.*?)(\]\]>)',
+    re.S,
+)
+
+
 @dataclass
 class RSLogix5000Content(L5xElement):
     """Controller Project"""
@@ -1412,6 +1423,25 @@ class RSLogix5000Content(L5xElement):
     def __post_init__(self):
         super().__post_init__()
         self._export_name = "RSLogix5000Content"
+
+    def to_xml(self) -> str:
+        xml = super().to_xml()
+        # Reproduce Logix Designer's L5K bracket-list line wrap. The writer wraps
+        # long Format="L5K" <Data>/<DefaultData> CDATA at an 81 value-character
+        # budget with a per-format-version tab indent (SoftwareRevision >= 32 -> 2
+        # tabs, else 5). Done as a single post-pass over the assembled document so
+        # the indent is resolved once from the controller revision. Best-effort:
+        # if the revision can't be parsed, leave the single-line form.
+        try:
+            major = int(str(self.software_revision).split(".")[0])
+        except (ValueError, AttributeError, IndexError):
+            return xml
+        depth = 2 if major >= 32 else 5
+
+        def _rewrap(m: "re.Match") -> str:
+            return m.group(1) + _tag_value._wrap_l5k(m.group(2), depth) + m.group(3)
+
+        return _L5K_CDATA_RE.sub(_rewrap, xml)
 
 
 # Atomic/primitive Logix base types: emitted as empty self-closing DataTypes

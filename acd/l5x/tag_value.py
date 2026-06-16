@@ -424,6 +424,51 @@ def render_hex(image: bytes) -> str:
     return " \n".join(lines)
 
 
+def _wrap_l5k(flat: str, depth: int, budget: int = 81) -> str:
+    """Re-wrap a flat one-line L5K bracket list exactly as Logix Designer does.
+
+    The writer wraps a long ``Format="L5K"`` bracket list by inserting
+    ``"\\n" + "\\t"*depth`` before a ``,`` or ``]`` once the VALUE-character column
+    reaches ``budget`` (81). Only value characters count toward the column —
+    ``[``, ``]`` and ``,`` contribute 0, and a nested ``[...]`` sub-list is never
+    broken (it accumulates into the surrounding column). ``depth`` is the writer's
+    per-format-version indent (2 tabs for SoftwareRevision >= 32, else 5).
+
+    Reproduces the reference wrap byte-exact (4216/4216 corpus blocks). Scalars
+    and any non-bracket body pass through unchanged.
+    """
+    if not flat or flat[0] != "[":
+        return flat
+    out: List[str] = []
+    col = 0
+    in_str = False
+    for ch in flat:
+        if in_str:
+            out.append(ch)
+            col += 1
+            if ch == "'":
+                in_str = False
+            continue
+        if ch == "'":
+            in_str = True
+            out.append(ch)
+            col += 1
+            continue
+        if ch == "," or ch == "]":
+            if col >= budget:
+                out.append("\n")
+                out.append("\t" * depth)
+                col = 0
+            out.append(ch)             # separators/closers cost 0 columns
+            continue
+        if ch == "[":
+            out.append(ch)             # openers cost 0 and never trigger a wrap
+            continue
+        out.append(ch)                 # value chars count 1 column each
+        col += 1
+    return "".join(out)
+
+
 # Built-in struct status/control-word BOOL flag bit positions (within word 0).
 _BUILTIN_FLAG_BITS: Dict[str, Dict[str, int]] = {
     "TIMER": {"EN": 31, "TT": 30, "DN": 29},
