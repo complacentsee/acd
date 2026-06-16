@@ -1901,7 +1901,12 @@ class DataTypeBuilder(L5xElementBuilder):
                 if key2 not in extended_records:
                     break
                 blob = bytes(extended_records[key2])
-                mname = _decode_utf16z(blob[0:0x40]) if len(blob) >= 2 else ""
+                # The inline member name is NUL-terminated UTF-16LE starting at
+                # byte 0; the next member field (radix u32) begins at 0x54, so the
+                # name field spans 0..0x53. Decode up to that boundary (0x40 cut
+                # names longer than 32 chars). _decode_utf16z stops at the first
+                # NUL, so shorter names are unaffected.
+                mname = _decode_utf16z(blob[0:0x54]) if len(blob) >= 2 else ""
                 short_recs.append((mname, blob))
 
             # The kaitai RxGeneric parser only counts (count_record - 1)
@@ -1920,7 +1925,8 @@ class DataTypeBuilder(L5xElementBuilder):
                         actual = last_len - 4
                         if actual > 0 and len(tail) >= 8 + actual:
                             tail_blob = tail[8: 8 + actual]
-                            tail_name = _decode_utf16z(tail_blob[0:0x40])
+                            # Same name-field boundary as the inline path (0x54).
+                            tail_name = _decode_utf16z(tail_blob[0:0x54])
                             if tail_name:
                                 short_recs.append((tail_name, tail_blob))
                 except Exception:
@@ -2847,12 +2853,24 @@ class TagBuilder(L5xElementBuilder):
                 member_ref = 0
                 if len(raw_rec) >= 18:
                     member_ref = struct.unpack_from("<I", raw_rec, 14)[0]
+                parent_key = (r.comment_id * 0x10000) + r.cip_type
+                # The tag's own Description is the row at (parent_key, member_ref).
+                # A tag's own description carries an empty tag_reference; an
+                # operand comment (array element/bit member) shares the same key
+                # and member_ref but has a non-empty tag_reference. Suppress the
+                # latter so it does not leak in as the Description. Only inspect
+                # the row the original lookup already selected (do not search for
+                # a different tag_reference='' row): under a shared/sentinel key,
+                # searching would surface another tag's description and
+                # mis-attribute it. So this can only drop an operand leak, never
+                # add a description.
                 self._cur.execute(
-                    "SELECT record_string FROM comments WHERE parent=? AND member_ref=? LIMIT 1",
-                    ((r.comment_id * 0x10000) + r.cip_type, member_ref),
+                    "SELECT record_string, tag_reference FROM comments "
+                    "WHERE parent=? AND member_ref=? LIMIT 1",
+                    (parent_key, member_ref),
                 )
                 desc_row = self._cur.fetchone()
-                if desc_row and desc_row[0]:
+                if desc_row and desc_row[0] and not desc_row[1]:
                     comment_results = [("", desc_row[0])]
             except Exception:
                 comment_results = []
