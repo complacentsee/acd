@@ -293,9 +293,10 @@ class ExportL5x:
         # NB: the ACD stores multi-line descriptions / rung+operand comments with
         # CRLF, and genuine Logix Designer L5X export keeps CRLF inside the CDATA
         # (its whole file is CRLF). We deliberately PRESERVE CRLF here so our
-        # output is byte-faithful to Rockwell. (The Copia OEM reference normalizes
-        # to bare LF; that is Copia's quirk, not Rockwell's, so the gauntlet
-        # comparator normalizes newlines instead of us changing the output.)
+        # output is byte-faithful to Rockwell. (Some third-party OEM reference
+        # converters normalize to bare LF; that is their quirk, not Rockwell's, so
+        # the gauntlet comparator normalizes newlines instead of us changing the
+        # output.)
         self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?)", comment_tuples)
         self._db.commit()
 
