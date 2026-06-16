@@ -394,10 +394,17 @@ class ExportL5x:
     @property
     def controller(self):
         if self._controller is None:
+            _major = 0
+            try:
+                _m = re.match(r"V(\d+)", self._acd_version or "")
+                _major = int(_m.group(1)) if _m else 0
+            except Exception:
+                _major = 0
             self._controller = ControllerBuilder(
                 self._cur,
                 _short_header=self._comps_short_header,
                 _taginfo_layout=getattr(self, "_taginfo_layout", {}),
+                _acd_major=_major,
             ).build()
         return self._controller
 
