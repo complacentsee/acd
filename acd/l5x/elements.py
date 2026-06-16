@@ -168,6 +168,24 @@ _PRIMITIVE_L5K_ZERO: Dict[str, str] = {
     "LREAL": "0.00000000e+000",
 }
 
+# Raw byte width of each atomic primitive (for the V10..V21 short-header raw-hex
+# <DefaultData>/<Data> zero image: e.g. DINT -> "00 00 00 00"). BOOL stores as a
+# single byte in this image (OEM emits "00").
+_PRIMITIVE_BYTE_WIDTH: Dict[str, int] = {
+    "BOOL":  1,
+    "BIT":   1,
+    "SINT":  1,
+    "USINT": 1,
+    "INT":   2,
+    "UINT":  2,
+    "DINT":  4,
+    "UDINT": 4,
+    "REAL":  4,
+    "LINT":  8,
+    "ULINT": 8,
+    "LREAL": 8,
+}
+
 # Radix string used in Decorated DataValueMember for each numeric primitive.
 # BOOL and BIT use no Radix attribute; REAL/LREAL use "Float"; all integers use "Decimal".
 _PRIMITIVE_RADIX: Dict[str, str] = {
@@ -452,6 +470,109 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
     return f'<Data Format="Decorated">\n{body}\n</Data>'
 
 
+def _build_default_data(data_type: Union[str, None],
+                        dimensions: Union[str, None],
+                        value_bytes: Union[bytes, None],
+                        short_header: bool,
+                        data_types_map: Dict[str, "DataType"],
+                        taginfo_layout: Dict[str, object]) -> str:
+    """Build the AOI-scoped <DefaultData> child pair for a Parameter/LocalTag.
+
+    OEM emits, on every value-bearing AOI Parameter (Input/Output) and every
+    LocalTag, two children mirroring a regular <Tag>'s value block but spelled
+    <DefaultData> instead of <Data>:
+        <DefaultData Format="L5K"><![CDATA[<l5k>]]></DefaultData>
+        <DefaultData Format="Decorated"><tree></DefaultData>
+    The Decorated body is byte-identical to a Tag's <Data Format="Decorated">.
+
+    When value_bytes is None (no design-value image available) the type's ZERO
+    image is emitted (correct for the ~88.5% of OEM defaults that are all-zero;
+    a fresh-tag default). Returns "" (degrade to today's no-DefaultData
+    behaviour) on any failure or for types that carry no value block.
+    """
+    try:
+        dt_base = data_type.split("[")[0].upper() if data_type else ""
+        if not dt_base or dt_base in _SKIP_DECORATED:
+            return ""
+
+        # ---- L5K (first) block ----
+        # render_l5k/render_decorated reuse, exactly as Tag.to_xml: a real value
+        # image drops in once Stage 2 fills value_bytes; until then the zero
+        # default is used.
+        decorated_inner = None
+        l5k_text = None
+
+        if value_bytes is not None:
+            if taginfo_layout:
+                try:
+                    decorated_inner = _tag_value.render_decorated_layout(
+                        dt_base, dimensions, value_bytes,
+                        taginfo_layout, data_types_map
+                    )
+                except Exception:
+                    decorated_inner = None
+            if decorated_inner is None:
+                decorated_inner = _tag_value.render_decorated(
+                    dt_base, dimensions, value_bytes, data_types_map
+                )
+            if short_header:
+                l5k_text = _tag_value.render_hex(value_bytes)
+                first = "<DefaultData>" + l5k_text + "</DefaultData>"
+                ok_first = bool(value_bytes)
+            else:
+                l5k_text = _tag_value.render_l5k(
+                    dt_base, dimensions, value_bytes, data_types_map
+                )
+                first = f'<DefaultData Format="L5K">\n<![CDATA[{l5k_text}]]>\n</DefaultData>'
+                ok_first = l5k_text is not None
+        else:
+            # No value image -> zero default for this data type.
+            if dimensions is None and dt_base in _PRIMITIVE_L5K_ZERO:
+                # Scalar primitive first block. The first <DefaultData> mirrors a
+                # Tag's first <Data> block and is version-styled:
+                #   LONG (V24+):  <DefaultData Format="L5K"><![CDATA[0]]>...
+                #   SHORT(V10-21): <DefaultData>00 00 00 00</DefaultData> (raw hex)
+                if short_header:
+                    width = _PRIMITIVE_BYTE_WIDTH.get(dt_base, 0)
+                    if width <= 0:
+                        return ""
+                    first = "<DefaultData>" + _tag_value.render_hex(b"\x00" * width) + "</DefaultData>"
+                else:
+                    l5k_zero = _PRIMITIVE_L5K_ZERO[dt_base]
+                    first = f'<DefaultData Format="L5K">\n<![CDATA[{l5k_zero}]]>\n</DefaultData>'
+                ok_first = True
+                # Scalar primitives: build the matching single DataValue.
+                radix = _PRIMITIVE_RADIX.get(dt_base)
+                zero = _PRIMITIVE_DECORATED_ZERO.get(dt_base)
+                if dt_base in ("BOOL", "BIT"):
+                    decorated_inner = '<DataValue DataType="BOOL" Radix="Decimal" Value="0"/>'
+                elif radix is not None and zero is not None:
+                    decorated_inner = (
+                        f'<DataValue DataType="{dt_base}" Radix="{radix}" Value="{zero}"/>'
+                    )
+                else:
+                    decorated_inner = None
+            else:
+                # Array / struct with NO value image: OEM emits the pair
+                #   <DefaultData Format="L5K"><![CDATA[[0,0,0]]]> + <Decorated>...
+                # but the L5K bracketed-tree body cannot be synthesised reliably
+                # for the zero case here (it needs the per-member layout / Stage-2
+                # value image). Emitting only the Decorated half mis-aligns the
+                # comparator's occurrence matching (it would pair our lone
+                # Decorated against OEM's first L5K block, manufacturing spurious
+                # @Format / text diffs). So suppress entirely -> stays exactly
+                # today's element_missing (no regression); Stage 2 fills these.
+                return ""
+
+        decorated_block = (
+            f'<DefaultData Format="Decorated">\n{decorated_inner}\n</DefaultData>'
+            if decorated_inner is not None else ""
+        )
+        return (first if ok_first else "") + decorated_block
+    except Exception:
+        return ""
+
+
 @dataclass
 class Tag(L5xElement):
     name: str
@@ -732,6 +853,14 @@ class LocalTag(L5xElement):
     radix: Union[str, None]   # None for complex/UDT types (omitted from XML)
     external_access: str
     _description: Union[str, None] = field(default=None)
+    # AOI-scoped value image (mirrors Tag): populated by the builder so the
+    # <DefaultData> block can be emitted. All default to the no-value state so
+    # existing LocalTag() constructions are unaffected.
+    _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
+    _taginfo_layout: Dict[str, object] = field(default_factory=dict)
+    _value_bytes: Union[bytes, None] = None
+    _value_type_code: int = 0
+    _short_header: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -750,11 +879,20 @@ class LocalTag(L5xElement):
 
     def to_xml(self) -> str:
         base = super().to_xml()
-        if not self._description:
+        desc_xml = (
+            f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
+            if self._description else ""
+        )
+        # DefaultData: OEM emits it on EVERY LocalTag (after Description). Degrade
+        # to "" on any failure (still an element_missing, never malformed).
+        dd_xml = _build_default_data(
+            self.data_type, self.dimensions, self._value_bytes,
+            self._short_header, self._data_types_map, self._taginfo_layout,
+        )
+        if not desc_xml and not dd_xml:
             return base
-        desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
         idx = base.index(">")
-        return base[:idx + 1] + desc_xml + base[idx + 1:]
+        return base[:idx + 1] + desc_xml + dd_xml + base[idx + 1:]
 
 
 @dataclass
@@ -771,6 +909,13 @@ class Parameter(L5xElement):
     constant: Union[str, None]  # "false" for non-MESSAGE InOut, None otherwise (omitted)
     dimensions: Union[str, None]  # array size; None for scalars (omitted from XML)
     _description: Union[str, None] = field(default=None)
+    # AOI-scoped value image (mirrors Tag); defaults to the no-value state so
+    # existing Parameter() constructions are unaffected.
+    _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
+    _taginfo_layout: Dict[str, object] = field(default_factory=dict)
+    _value_bytes: Union[bytes, None] = None
+    _value_type_code: int = 0
+    _short_header: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -785,11 +930,24 @@ class Parameter(L5xElement):
 
     def to_xml(self) -> str:
         base = super().to_xml()
-        if not self._description:
+        desc_xml = (
+            f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
+            if self._description else ""
+        )
+        # DefaultData (validated gating on the full OEM pool):
+        #   - emitted on Input/Output params, NOT on InOut (933/933 had none);
+        #   - SUPPRESSED for the system params EnableIn/EnableOut (no DefaultData);
+        #   - suppressed for unknown / SKIP_DECORATED types (handled inside helper).
+        dd_xml = ""
+        if self.usage != "InOut" and self.name not in ("EnableIn", "EnableOut"):
+            dd_xml = _build_default_data(
+                self.data_type, self.dimensions, self._value_bytes,
+                self._short_header, self._data_types_map, self._taginfo_layout,
+            )
+        if not desc_xml and not dd_xml:
             return base
-        desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
         idx = base.index(">")
-        return base[:idx + 1] + desc_xml + base[idx + 1:]
+        return base[:idx + 1] + desc_xml + dd_xml + base[idx + 1:]
 
 
 @dataclass
@@ -3135,6 +3293,10 @@ def _parse_aoi_nameless(data: bytes) -> dict:
 
 @dataclass
 class AoiBuilder(L5xElementBuilder):
+    _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
+    _short_header: bool = field(default=False)
+    _taginfo_layout: Dict[str, object] = field(default_factory=dict)
+
     def build(self) -> AOI:
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
@@ -3212,12 +3374,29 @@ class AoiBuilder(L5xElementBuilder):
 
                 if is_param:
                     try:
-                        parameters.append(ParameterBuilder(self._cur, child_oid).build())
+                        p = ParameterBuilder(self._cur, child_oid).build()
+                        # Wire the value-emission maps so <DefaultData> can be
+                        # built (mirrors how TagBuilder receives them). Failure
+                        # to attach degrades to no-DefaultData, never crashes.
+                        try:
+                            p._data_types_map = self._data_types_map
+                            p._taginfo_layout = self._taginfo_layout
+                            p._short_header = self._short_header
+                        except Exception:
+                            pass
+                        parameters.append(p)
                     except Exception:
                         pass
                 else:
                     try:
-                        local_tags.append(LocalTagBuilder(self._cur, child_oid).build())
+                        lt = LocalTagBuilder(self._cur, child_oid).build()
+                        try:
+                            lt._data_types_map = self._data_types_map
+                            lt._taginfo_layout = self._taginfo_layout
+                            lt._short_header = self._short_header
+                        except Exception:
+                            pass
+                        local_tags.append(lt)
                     except Exception:
                         pass
 
@@ -3757,7 +3936,12 @@ class ControllerBuilder(L5xElementBuilder):
         aois: List[AOI] = []
         for result in results:
             _aoi_object_id = result[1]
-            aois.append(AoiBuilder(self._cur, _aoi_object_id).build())
+            aois.append(AoiBuilder(
+                self._cur, _aoi_object_id,
+                _data_types_map=data_types_map,
+                _short_header=self._short_header,
+                _taginfo_layout=self._taginfo_layout,
+            ).build())
 
         # Get the Module (IO) Collection and build all Module elements.
         self._cur.execute(
