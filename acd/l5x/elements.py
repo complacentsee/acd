@@ -2211,12 +2211,19 @@ class ModuleBuilder(L5xElementBuilder):
         parent_port   = struct.unpack("<H", e1[0x1A:0x1C])[0]
         slot          = struct.unpack("<I", e1[0x1C:0x20])[0]
 
-        # Hash-named modules are drive peripheral expansion cards. The ACD binary stores
-        # them with ProductType=123 and site-specific ProductCodes, but Logix exports them
-        # all as PT=0 PC=28 (RHINOBP-DRIVE-PERIPHERAL-MODULE) without a Name attribute.
-        if name == "?":
+        # Genuine drive-peripheral expansion cards are hash-named ("?") AND carry a
+        # PowerFlex drive product_type: 142/143 (PF753/755) export as ProductType=0
+        # ProductCode=28 (RHINOBP-DRIVE-PERIPHERAL-MODULE); 150/127 (PF525 and its
+        # DSI-port variant) export as ProductCode=29 (DSI-DRIVE-PERIPHERAL-MODULE).
+        # CATALOG_NUMBERS maps (vendor,0,28)/(vendor,0,29) so the lookup below
+        # resolves. Across the pool these four product_types account for every
+        # reference drive peripheral (99 RHINOBP + 36 DSI) with no false positives.
+        # Ordinary hash-named modules (unresolved 1756/1769 I/O cards, PT 7/10) keep
+        # their genuine PT/PC and real catalog -- the previous unconditional rewrite
+        # corrupted those into RHINOBP-DRIVE-PERIPHERAL-MODULE.
+        if name == "?" and vendor == 1 and product_type in (142, 143, 150, 127):
+            product_code = 29 if product_type in (150, 127) else 28
             product_type = 0
-            product_code = 28
 
         # Resolve parent module name from the modid→name map built by ControllerBuilder.
         parent_name = self._modid_to_name.get(parent_modid, "Local")
