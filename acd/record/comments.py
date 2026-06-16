@@ -203,6 +203,73 @@ class CommentsRecord:
         )
 
     @staticmethod
+    def _parse_long_operand_body(raw: bytes) -> Optional[tuple]:
+        """Parse a V24+ long-header operand/member/array comment from raw bytes.
+
+        The shared kaitai FafaComents only builds the Utf16Record (operand) body
+        for record_type 3/4/13/14; the other operand-bearing types (5/6/7/8 =
+        member/bit/array-element comments, and higher ordinals) fall to its
+        raw-bytes branch, where the downstream parse() raises on the missing
+        ``object_id`` attribute and the record is dropped. They use the SAME
+        Utf16Record layout, so decode it directly here. ``raw`` is the record
+        buffer:
+          [0:4]  record_length          [4:6]  seq_number
+          [6:8]  record_type            [8:10] sub_record_length
+          [10:14] parent (== comment_id*0x10000 + cip_type)
+        then body = raw[14:] (the Utf16Record):
+          [0:8]  unknown   [8:12] object_id   [12:16] unknown
+          [16:]  UTF-16LE NUL-term OPERAND, then 12 unknown bytes,
+                 then a UTF-8 NUL-term comment TEXT.
+
+        A real operand is a qualifier relative to the tag (leading '.' or '[');
+        requiring that plus printable text rejects the few non-operand records
+        that also reach the raw branch. Returns the comments 9-tuple or None.
+        """
+        if len(raw) < 14:
+            return None
+        seq_number = struct.unpack_from("<H", raw, 4)[0]
+        record_type = struct.unpack_from("<H", raw, 6)[0]
+        sub_record_length = struct.unpack_from("<H", raw, 8)[0]
+        parent = struct.unpack_from("<I", raw, 10)[0]
+        body = raw[14:]
+        if len(body) < 16:
+            return None
+        object_id = struct.unpack_from("<I", body, 8)[0]
+        pos = 16
+        cus = []
+        while pos + 1 < len(body):
+            cu = struct.unpack_from("<H", body, pos)[0]
+            pos += 2
+            if cu == 0:
+                break
+            cus.append(cu)
+        if not cus:
+            return None
+        operand = "".join(chr(c) for c in cus)
+        if operand[0] not in ".[":
+            return None
+        if any((ord(c) < 0x20 and c != "\t") for c in operand):
+            return None
+        tpos = pos + 12  # skip the 12-byte unknown_3 region
+        end = body.find(b"\x00", tpos)
+        if end < 0:
+            end = len(body)
+        text = body[tpos:end].decode("utf-8", errors="replace")
+        if not text:
+            return None
+        return (
+            seq_number,
+            sub_record_length,
+            object_id,
+            text,
+            record_type,
+            parent,
+            operand,
+            0,
+            0,
+        )
+
+    @staticmethod
     def parse(dat_record: DatRecord, short_header: bool = False) -> Optional[tuple]:
         if dat_record.identifier != 64250:
             return None
@@ -235,6 +302,19 @@ class CommentsRecord:
                 # dropped (e.g. rt 8, 12 and 15-36) without misparsing anything.
                 else:
                     parsed = CommentsRecord._parse_short_operand_body(raw_full)
+                    if parsed is not None:
+                        return parsed
+            except Exception:
+                pass
+        # V24+ long-header operand/member/array comments whose record_type is not
+        # one of the four the kaitai decodes (3/4/13/14). 1/2 = own descriptions,
+        # 12 = UDI metadata, 23/25 = controller records -- all handled below; every
+        # other type is an operand record the kaitai drops, so decode it here.
+        if not short_header and len(raw_full) >= 8:
+            try:
+                rt = struct.unpack_from("<H", raw_full, 6)[0]
+                if rt not in (0x01, 0x02, 0x03, 0x04, 0x0C, 0x0D, 0x0E, 0x17, 0x19):
+                    parsed = CommentsRecord._parse_long_operand_body(raw_full)
                     if parsed is not None:
                         return parsed
             except Exception:

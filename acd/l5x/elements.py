@@ -2965,28 +2965,30 @@ class TagBuilder(L5xElementBuilder):
             except Exception:
                 operand_comments = []
         else:
-            # LONG (V24+): keyed by parent == comment_id*0x10000 + cip_type, as
-            # FafaComents utf_16_record (record_type 3/4/13/14): tag_reference is
-            # the operand string ("[0]", ".5", ".Member"), record_string the text.
-            # Require BOTH non-empty (empty record_string marks an internal
-            # multi-entry/member record Studio does NOT surface as a tag
-            # <Comment Operand=>). COLLISION-SAFE: only emit when
-            # the tag's comment key is owned by exactly one comp (unique_comment_key
-            # table). cip-0x68 tags share a constant comment_id, some versions
-            # collide on 0x6b, and $hash$ value backings reuse keys; those records
-            # belong to / are shared with other tags and would over-emit, so they
-            # are omitted (missing, never mis-attributed).
+            # LONG (V24+): keyed by parent == comment_id*0x10000 + cip_type. The
+            # operand string ("[0]", ".5", ".Member") is in tag_reference, the text
+            # in record_string. record_type is NOT filtered: it is an ordinal, and
+            # the member/bit/array comments live under types beyond the kaitai's
+            # 3/4/13/14 (decoded by _parse_long_operand_body). Require both fields
+            # non-empty (empty record_string marks an internal multi-entry record
+            # Studio does not surface). COLLISION-SAFE: only emit when the key is
+            # owned by exactly one comp (unique_comment_key) -- cip-0x68 tags share
+            # a constant comment_id and would smear otherwise. A '.!<hex>' operand
+            # anywhere in the path is a module connection point Logix resolves to a
+            # member name (a separate feature), never surfaced as a tag comment; it
+            # is excluded as a substring ("[30].!0F83..." also occurs).
             try:
                 parent_key = (r.comment_id * 0x10000) + r.cip_type
                 self._cur.execute(
                     "SELECT c.tag_reference, c.record_string FROM comments c "
-                    "WHERE c.parent=? AND c.record_type IN (3,4,13,14) "
-                    "AND c.tag_reference!='' AND c.record_string!='' "
+                    "WHERE c.parent=? "
+                    "AND c.tag_reference!='' AND c.tag_reference!='__REVISION_NOTE__' "
+                    "AND c.record_string!='' "
                     "AND EXISTS (SELECT 1 FROM unique_comment_key u WHERE u.k=c.parent)",
                     (parent_key,),
                 )
                 for op_ref, op_text in self._cur.fetchall():
-                    if op_ref and op_text:
+                    if op_ref and op_text and ".!" not in op_ref:
                         operand_comments.append((op_ref, op_text))
             except Exception:
                 operand_comments = []
