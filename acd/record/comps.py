@@ -207,7 +207,7 @@ class CompsRecord:
         return attrs[0x66], type_code
 
     # ------------------------------------------------------------------ #
-    # AOI prototype-default reader (F3) — __DEFVAL_* consolidated image   #
+    # AOI prototype-default reader — __DEFVAL_* consolidated image        #
     # ------------------------------------------------------------------ #
     # AOI Parameter/LocalTag prototype DEFAULTS are NOT stored on the per-tag
     # cip-0x6b/0x6c record (its main_record@0x24 data_table_instance is 0/0xffffffff

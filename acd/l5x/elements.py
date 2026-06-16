@@ -501,9 +501,9 @@ def _build_default_data(data_type: Union[str, None],
         dt_decorated = data_type.split("[")[0] if data_type else dt_base
 
         # ---- L5K (first) block ----
-        # render_l5k/render_decorated reuse, exactly as Tag.to_xml: a real value
-        # image drops in once Stage 2 fills value_bytes; until then the zero
-        # default is used.
+        # render_l5k/render_decorated reuse, exactly as Tag.to_xml: when the
+        # AOI prototype value image is available it is used; otherwise the type's
+        # zero default is rendered.
         decorated_inner = None
         l5k_text = None
 
@@ -609,12 +609,12 @@ def _build_default_data(data_type: Union[str, None],
                 # Array / struct with NO value image: OEM emits the pair
                 #   <DefaultData Format="L5K"><![CDATA[[0,0,0]]]> + <Decorated>...
                 # but the L5K bracketed-tree body cannot be synthesised reliably
-                # for the zero case here (it needs the per-member layout / Stage-2
-                # value image). Emitting only the Decorated half mis-aligns the
-                # comparator's occurrence matching (it would pair our lone
-                # Decorated against OEM's first L5K block, manufacturing spurious
-                # @Format / text diffs). So suppress entirely -> stays exactly
-                # today's element_missing (no regression); Stage 2 fills these.
+                # without a value image (it needs the per-member layout + bytes).
+                # Emitting only the Decorated half mis-aligns the comparator's
+                # occurrence matching (it would pair our lone Decorated against
+                # OEM's first L5K block, manufacturing spurious @Format / text
+                # diffs). So suppress entirely -> no block rather than a skewed
+                # one. AOI params/localtags avoid this by feeding the real image.
                 return ""
 
         decorated_block = (
@@ -3369,7 +3369,7 @@ class AoiBuilder(L5xElementBuilder):
         aoi_record = bytes(results[0][3])
         name = results[0][0]
 
-        # --- F3: AOI Parameter/LocalTag prototype DefaultData value images ---
+        # --- AOI Parameter/LocalTag prototype DefaultData value images ---
         # Resolve the AOI's hidden __DEFVAL backing ONCE: a consolidated image of
         # the whole AOI struct. Each Parameter/LocalTag default is a slice at the
         # member's TagInfo byte offset/width. Best-effort: None on any failure ->

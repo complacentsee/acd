@@ -236,8 +236,8 @@ def _decorated_fixed(f: float, p: int, exp: int, neg: bool) -> str:
 
     The integer part always shows ALL its digits (the exact float32 integer, so
     large integral values like 138100384.0 keep every digit); the fraction shows
-    ``p - 1 - exp`` digits rounded HALF-AWAY-FROM-ZERO via the F1 routine. When
-    there is no fractional part the value is the exact rounded integer + ``.0``.
+    ``p - 1 - exp`` digits rounded HALF-AWAY-FROM-ZERO via ``_round_sig_haway``.
+    When there is no fractional part the value is the exact rounded integer + ``.0``.
     """
     frac_digits = p - 1 - exp
     sign = "-" if neg else ""
@@ -265,14 +265,14 @@ def _fmt_real_decorated(v: float) -> str:
     """Format a REAL value the way Logix writes it in a Decorated Value attribute.
 
     The Decorated REAL form uses C ``%g``-style GENERAL notation but with the
-    SAME digit/rounding machinery as the L5K CDATA form (F1: round HALF-AWAY,
-    float32 precision). The mantissa digits are the shortest round-trip decimal
-    (``p`` significant figures); the choice of notation is:
+    SAME digit/rounding machinery as the L5K CDATA form (:func:`_fmt_real`:
+    round HALF-AWAY, float32 precision). The mantissa digits are the shortest
+    round-trip decimal (``p`` significant figures); the choice of notation is:
 
       * SCIENTIFIC when the leading-digit exponent ``exp >= 9`` (large) OR the
         fixed form would need ``>= 10`` digits after the decimal point
-        (``p - 1 - exp >= 10``, very small). Scientific is the exact F1 9-sig
-        form: ``D.DDDDDDDDe(+/-)EEE`` (8 fractional digits, 3-digit exponent).
+        (``p - 1 - exp >= 10``, very small). Scientific reuses the 9-significant
+        -figure form: ``D.DDDDDDDDe(+/-)EEE`` (8 fractional digits, 3-digit exp).
       * FIXED otherwise: shortest round-trip rendered fixed-point, trailing
         zeros trimmed, integral values shown in full with a trailing ``.0``.
 
@@ -304,7 +304,7 @@ def _fmt_real_decorated(v: float) -> str:
         p = _shortest_sig(f)
         sci = (exp >= 9) or (p - 1 - exp >= 10)
         if sci:
-            return _fmt_real(f)                         # F1 9-sig scientific
+            return _fmt_real(f)                         # 9-sig scientific (L5K form)
         return _decorated_fixed(f, p, exp, f < 0.0)
 
 
@@ -317,7 +317,7 @@ def _fmt_lreal_decorated(v: float) -> str:
     HALF-AWAY rounding. The OEM pool contains no LREAL Decorated literals, so
     this is the shared-rule extrapolation (single-precision re-quant is NOT
     applied, which would corrupt high-precision doubles); the scientific branch
-    uses the double 17-sig F1 form via :func:`_fmt_lreal`-style rounding.
+    uses the double 9-sig form via :func:`_fmt_lreal`-style rounding.
     """
     import math
     f = v
