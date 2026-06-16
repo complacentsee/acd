@@ -1276,6 +1276,16 @@ class MemberBuilder(L5xElementBuilder):
     # (there is none) and decode straight from `record`. Defaults None so the
     # V24+/V36 long path is unaffected.
     _short_name: Union[str, None] = field(default=None)
+    # Owning datatype's class ("User"/"ProductDefined"/"IO"), passed down by
+    # DataTypeBuilder so BIT-overlay host resolution can branch: User keeps the
+    # preceding-hidden-integer rule; ProductDefined/IO use the offset-0 member
+    # (0x68==0) or the most-recent preceding non-BIT member (0x68 nonzero).
+    _owner_cls: str = field(default="User")
+    # Member-ordinal -> name list of the owning datatype (seq order). For
+    # ProductDefined/IO BIT members whose 0x6c==FFFFFFFF, the 0x68 field is the
+    # member-collection index of the host word (1-based effectively, but stored
+    # as the host's 0-based ordinal), so Target = _members_by_index[0x68].
+    _members_by_index: List[str] = field(default_factory=list)
 
     def build(self) -> Member:
         if self._short_name is not None:
@@ -1300,12 +1310,25 @@ class MemberBuilder(L5xElementBuilder):
 
         cip_data_typoe = struct.unpack_from("<I", self.record, 0x78)[0]
         dimension = struct.unpack_from("<I", self.record, 0x5C)[0]
+        # A bogus dimension (e.g. 0x20000) appears in the 0x5C slot for some
+        # non-array scalar members of predefined types; clamp implausible values
+        # to 0 so we don't emit a garbage Dimension attribute. (BIT members
+        # override dimension to 0 below regardless.)
+        if dimension > 0x10000:
+            dimension = 0
         radix = radix_enum(struct.unpack_from("<I", self.record, 0x54)[0])
         data_type_id = struct.unpack_from("<I", self.record, 0x58)[0]
         hidden = bool(struct.unpack_from("<I", self.record, 0x70)[0])
-        external_access = external_access_enum(
-            struct.unpack_from("<I", self.record, 0x74)[0]
-        )
+        # ExternalAccess is the single byte at 0xA0 of the member-descriptor
+        # ext-record (0=Read/Write, 2=Read Only, 3=None), NOT the u32 at 0x74
+        # (which is uniformly 1 and is not ExternalAccess). Fall back to the old
+        # 0x74 enum path only when the record is too short to hold 0xA0.
+        if len(self.record) > 0xA0:
+            external_access = external_access_enum(self.record[0xA0])
+        else:
+            external_access = external_access_enum(
+                struct.unpack_from("<I", self.record, 0x74)[0]
+            )
 
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
@@ -1332,29 +1355,35 @@ class MemberBuilder(L5xElementBuilder):
         if data_type == "BOOL":
             target_key = struct.unpack_from("<I", self.record, 0x6C)[0]
             val_68 = struct.unpack_from("<I", self.record, 0x68)[0]
-            if target_key != 0xFFFFFFFF:
-                # Pattern 1: direct backing-field reference via offset-60 map
-                data_type = "BIT"
-                # offset 0x5C holds a bit-offset into the host register, not an array
-                # size — force dimension to 0 so _member_decorated_xml treats this as
-                # a scalar rather than emitting thousands of <Element> entries.
-                dimension = 0
-                bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
-                target = self._offset60_to_name.get(target_key)
-            elif val_68 == 0:
-                # Pattern 2: BIT member without explicit backing-field pointer
-                data_type = "BIT"
-                dimension = 0  # same bit-offset field; not an array size
-                bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
-                target = self._fallback_target
-            elif val_68 == 1:
-                # Pattern 3: BIT member — 0x60 of this member equals 0x60 of the backing
-                # hidden field, allowing direct lookup in offset60_to_name.
+            # A BOOL member is a BIT overlay unless it is a real standalone BOOL
+            # (0x6c == FFFFFFFF and 0x68 == 0x800).
+            is_plain_bool = (target_key == 0xFFFFFFFF and val_68 == 0x800)
+            if not is_plain_bool:
+                # offset 0x5C holds a bit-offset into the host register, not an
+                # array size — force dimension to 0 so _member_decorated_xml
+                # treats this as a scalar rather than emitting many <Element>s.
                 data_type = "BIT"
                 dimension = 0
                 bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
-                val_60 = struct.unpack_from("<I", self.record, 0x60)[0]
-                target = self._offset60_to_name.get(val_60)
+                if target_key != 0xFFFFFFFF:
+                    # Pattern 1: explicit backing-field byte offset via 0x6c.
+                    target = self._offset60_to_name.get(target_key)
+                elif self._owner_cls in ("ProductDefined", "IO"):
+                    # Predefined / IO type: 0x68 is the member-collection ordinal
+                    # of the host word (0 -> the offset-0 member, e.g.
+                    # CONTROL/TIMER 'Control', PID 'CTL'; nonzero -> the host at
+                    # that member index, e.g. ulBoolInput2/AlarmControlFlags).
+                    if 0 <= val_68 < len(self._members_by_index):
+                        target = self._members_by_index[val_68]
+                    if target is None:
+                        target = self._offset60_to_name.get(0)
+                else:
+                    # User datatype: preceding hidden integer backing member.
+                    if val_68 == 1:
+                        val_60 = struct.unpack_from("<I", self.record, 0x60)[0]
+                        target = self._offset60_to_name.get(val_60)
+                    else:
+                        target = self._fallback_target
 
         # --- Description ---
         # The member's description is identified in the comments table by a
@@ -1392,9 +1421,14 @@ class MemberBuilder(L5xElementBuilder):
             radix = radix_enum(struct.unpack_from("<I", self.record, 0x54)[0])
             data_type_id = struct.unpack_from("<I", self.record, 0x58)[0]
             hidden = bool(struct.unpack_from("<I", self.record, 0x70)[0])
-            external_access = external_access_enum(
-                struct.unpack_from("<I", self.record, 0x74)[0]
-            )
+            # ExternalAccess = byte at 0xA0 (0=Read/Write, 2=Read Only, 3=None),
+            # not the u32 at 0x74. Fall back to 0x74 only for short records.
+            if len(self.record) > 0xA0:
+                external_access = external_access_enum(self.record[0xA0])
+            else:
+                external_access = external_access_enum(
+                    struct.unpack_from("<I", self.record, 0x74)[0]
+                )
 
             self._cur.execute(
                 "SELECT comp_name FROM comps WHERE object_id=" + str(data_type_id)
@@ -1487,9 +1521,11 @@ class DataTypeBuilder(L5xElementBuilder):
             elif built_in & 0x03:
                 class_type = "ProductDefined"
         else:
+            # IO precedence (module-defined types also carry built_in&3, so IO
+            # must win) to match the OEM class assignment.
             if module_defined > 0:
                 class_type = "IO"
-            if built_in & 0x03:
+            elif built_in & 0x03:
                 class_type = "ProductDefined"
         if 0x64 in extended_records and len(extended_records[0x64]) == 0x04:
             member_count = struct.unpack("<I", extended_records[0x64])[0]
@@ -1516,6 +1552,10 @@ class DataTypeBuilder(L5xElementBuilder):
             # offset via [0x6c].  Non-BIT members have [0x6c]=0xFFFFFFFF and 0x68=0x800.
             # Only include non-BIT members (0x68==0x800) so that BIT members sharing the
             # same 0x60 value as their backing field do not overwrite the backing entry.
+            _BACKING_SIZE = {"SINT": 1, "USINT": 1, "BYTE": 1, "BOOL": 1,
+                             "INT": 2, "UINT": 2, "WORD": 2,
+                             "DINT": 4, "UDINT": 4, "DWORD": 4,
+                             "LINT": 8, "ULINT": 8, "LWORD": 8}
             offset60_to_name: Dict[int, str] = {}
             for idx2, child2 in enumerate(children_results):
                 key2 = 0x6E + idx2
@@ -1528,6 +1568,27 @@ class DataTypeBuilder(L5xElementBuilder):
                     if target_key2 == 0xFFFFFFFF and val_68_2 == 0x800:
                         val_60 = struct.unpack_from("<I", rec2, 0x60)[0]
                         offset60_to_name[val_60] = child2[0]
+                        # A BIT member's 0x6c is a BYTE offset that can land in
+                        # the high byte of a multi-byte backing word (e.g. an INT
+                        # at 0x0e covering bytes 0x0e..0x0f). Map every byte the
+                        # backing field covers to its name so Pattern-1 lookups by
+                        # the exact byte resolve. setdefault keeps the first (the
+                        # word's own 0x60) authoritative for collisions.
+                        dt_id_2 = struct.unpack_from("<I", rec2, 0x58)[0]
+                        self._cur.execute(
+                            "SELECT comp_name FROM comps WHERE object_id="
+                            + str(dt_id_2)
+                        )
+                        _row2 = self._cur.fetchone()
+                        _base2 = _row2[0] if _row2 else ""
+                        for _b in range(val_60, val_60 + _BACKING_SIZE.get(_base2, 1)):
+                            offset60_to_name.setdefault(_b, child2[0])
+
+            # Member-ordinal -> name list (seq order). For ProductDefined/IO BIT
+            # members whose 0x6c==FFFFFFFF, 0x68 is the member-collection ordinal
+            # of the host word (e.g. CONTROL idx0 host, ALARM_ANALOG bits ->
+            # AlarmControlFlags at idx10, MMC bits -> ulBoolInput2/3CV* hosts).
+            members_by_index: List[str] = [c[0] for c in children_results]
 
             # Some ACD files have mismatched member_count vs children list — iterate what we have.
             # Track the most recent preceding hidden SINT (fallback target for Pattern-2 BIT members).
@@ -1548,6 +1609,8 @@ class DataTypeBuilder(L5xElementBuilder):
                             self._cur, child[1], bytes(extended_records[key]),
                             offset60_to_name,
                             last_hidden_backing,
+                            _owner_cls=class_type,
+                            _members_by_index=members_by_index,
                         ).build()
                     )
                 except Exception:
@@ -3542,6 +3605,25 @@ class ControllerBuilder(L5xElementBuilder):
         )
         results = self._cur.fetchall()
 
+        # Names of add-on-instruction definitions: these own datatype records too,
+        # but the OEM L5X emits them only as AddOnInstructionDefinitions, never as
+        # DataTypes. Everything else (User + ProductDefined + IO) IS emitted as a
+        # DataType, matching the OEM emit-set exactly.
+        aoi_names: set = set()
+        self._cur.execute(
+            "SELECT object_id FROM comps WHERE parent_id="
+            + str(self._object_id)
+            + " AND comp_name='RxUDIDefinitionCollection'"
+        )
+        _aoi_coll_row = self._cur.fetchone()
+        if _aoi_coll_row is not None:
+            self._cur.execute(
+                "SELECT comp_name FROM comps WHERE parent_id="
+                + str(_aoi_coll_row[0])
+                + " AND record_type=256"
+            )
+            aoi_names = {row[0] for row in self._cur.fetchall()}
+
         data_types: List[DataType] = []
         # all_data_types_map includes ProductDefined types (excluded from L5X output but
         # needed for generating Decorated XML for tags that reference those types).
@@ -3557,7 +3639,12 @@ class ControllerBuilder(L5xElementBuilder):
                 # + IO); _l5x_exclude is disabled via _emit_predefined so the
                 # serializer keeps all of them. (The long path keeps User-only.)
                 data_types.append(dt)
-            elif dt.cls == "User":
+            elif dt.name not in aoi_names:
+                # V24+/V36: emit every datatype that is not an AOI definition
+                # (User + ProductDefined + IO), matching the OEM emit-set.
+                # _emit_predefined disables _l5x_exclude so ProductDefined and
+                # ':'-named IO types are kept.
+                dt._emit_predefined = True
                 data_types.append(dt)
 
         # data_types_map: case-insensitive name → DataType for all types (User + ProductDefined).
