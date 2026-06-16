@@ -3004,14 +3004,43 @@ class TagBuilder(L5xElementBuilder):
         )
 
 
-def _aoi_tag_usage_flags(ext01: bytes) -> int:
-    """Return the usage-flags byte from an AOI tag record's ext[0x01] blob.
+def _aoi_tag_usage(ext01: bytes, short_header: bool = False) -> Tuple[Union[str, None], bool, bool]:
+    """Return (usage, required, visible) for an AOI tag record's ext[0x01] blob.
 
-    Returns 0 if the record is too short.  The caller is responsible for
-    interpreting the bits (0x04=Input, 0x08=Output; both set = InOut;
-    neither set = local tag).
+    ``usage`` is ``'Input'|'Output'|'InOut'|'Local'`` (or ``None`` if the blob is
+    too short).  The encoding differs by header family:
+
+    * Long header (V24+): the usage bits and the required/visible flags share one
+      byte at ext01[0x20E] — 0x04=Input, 0x08=Output (both=InOut, neither=Local),
+      0x20=Required, 0x40=Visible.
+    * Short header (V10..V21): the direction is the LOW nibble of ext01[0x20F]
+      (4=Input, 5=Output/InOut, 6=Local) — that byte's HIGH nibble is the radix.
+      Nibble 5 is Output for a plain output but InOut for a by-reference
+      parameter; the two are separated by the 0x80 bit of ext01[0x20E] (input
+      semantics, also set for Input). Required/Visible are at ext01[0x105]
+      (0x80=Required, 0x40=Visible; Required always implies Visible). In the long
+      layout 0x20E&0x0C is unrelated to usage, so a short-header parameter is
+      otherwise misread as a local tag.
     """
-    return ext01[0x20E] if len(ext01) > 0x20E else 0
+    if short_header:
+        if len(ext01) <= 0x20F:
+            return None, False, False
+        nibble = ext01[0x20F] & 0x0F
+        if nibble == 4:
+            usage = "Input"
+        elif nibble == 5:
+            usage = "InOut" if (ext01[0x20E] & 0x80) else "Output"
+        elif nibble == 6:
+            usage = "Local"
+        else:
+            usage = None
+        flags = ext01[0x105] if len(ext01) > 0x105 else 0
+        return usage, bool(flags & 0x80), bool(flags & 0x40)
+    if len(ext01) <= 0x20E:
+        return None, False, False
+    bits = ext01[0x20E]
+    usage = {0x04: "Input", 0x08: "Output", 0x0C: "InOut"}.get(bits & 0x0C, "Local")
+    return usage, bool(bits & 0x20), bool(bits & 0x40)
 
 
 def _aoi_tag_data_type(cur, raw_rec: bytes) -> str:
@@ -3031,6 +3060,8 @@ def _aoi_tag_data_type(cur, raw_rec: bytes) -> str:
 @dataclass
 class ParameterBuilder(L5xElementBuilder):
     """Build a Parameter from an AOI RxTagCollection child record."""
+
+    _short_header: bool = field(default=False)
 
     def build(self) -> Parameter:
         self._cur.execute(
@@ -3058,18 +3089,14 @@ class ParameterBuilder(L5xElementBuilder):
             return Parameter(name, name, "Base", data_type, "Input", None, "false", "false", "Read/Write", None, dimensions)
 
         ext01 = exts.get(0x01, b"")
-        flags = _aoi_tag_usage_flags(ext01)
-
-        usage_bits = flags & 0x0C
-        if usage_bits == 0x04:
-            usage = "Input"
-        elif usage_bits == 0x08:
-            usage = "Output"
-        else:
+        usage, required_b, visible_b = _aoi_tag_usage(ext01, self._short_header)
+        # AoiBuilder only routes Input/Output/InOut here; guard the Local/None
+        # edge to the prior InOut default so behaviour can't regress.
+        if usage not in ("Input", "Output", "InOut"):
             usage = "InOut"
 
-        required = "true" if (flags & 0x20) else "false"
-        visible = "true" if (flags & 0x40) else "false"
+        required = "true" if required_b else "false"
+        visible = "true" if visible_b else "false"
 
         # ExternalAccess (u16 at ext01[0x21E])
         # MESSAGE-type InOut parameters don't carry Constant in L5X; all others do.
@@ -3552,8 +3579,12 @@ class AoiBuilder(L5xElementBuilder):
             )
             for child_oid, child_rec in self._cur.fetchall():
                 child_rec = bytes(child_rec)
-                # Determine whether this is a parameter or a local tag by inspecting
-                # ext01[0x20E]: bits 0x04 (Input) or 0x08 (Output) indicate a parameter.
+                # Determine whether this is a parameter or a local tag from the
+                # AOI tag usage (Input/Output/InOut -> parameter; Local -> local
+                # tag). The usage encoding is header-family-specific (see
+                # _aoi_tag_usage); short-header projects store it in a different
+                # byte, so this must be version-aware or every short-header
+                # parameter is misread as a local tag.
                 is_param = False
                 try:
                     r_child = RxGeneric.from_bytes(child_rec)
@@ -3562,14 +3593,14 @@ class AoiBuilder(L5xElementBuilder):
                         for er in r_child.extended_records
                     }
                     ext01 = exts_child.get(0x01, b"")
-                    flags = _aoi_tag_usage_flags(ext01)
-                    is_param = bool(flags & 0x0C)
+                    usage, _, _ = _aoi_tag_usage(ext01, self._short_header)
+                    is_param = usage in ("Input", "Output", "InOut")
                 except Exception:
                     pass
 
                 if is_param:
                     try:
-                        p = ParameterBuilder(self._cur, child_oid).build()
+                        p = ParameterBuilder(self._cur, child_oid, _short_header=self._short_header).build()
                         # Wire the value-emission maps so <DefaultData> can be
                         # built (mirrors how TagBuilder receives them). Failure
                         # to attach degrades to no-DefaultData, never crashes.
