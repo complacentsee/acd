@@ -2941,14 +2941,26 @@ class TagBuilder(L5xElementBuilder):
             # removes the dominant 0x68 over-emission while keeping the bulk of
             # correct comments.
             try:
+                # tag_reference!='' selects operand records (own-descriptions
+                # store ''); record_type is NOT filtered because it is an ordinal,
+                # not a type enum (a parent's member comments range over rt 3..36).
+                # The bare comment_id is unique per cip-0x6b comp, so this join
+                # never smears one tag's comments onto another. __REVISION_NOTE__
+                # is AOI UDI metadata, not a tag operand comment.
                 self._cur.execute(
                     "SELECT tag_reference, record_string FROM comments "
-                    "WHERE parent=? AND record_type IN (3,4,5,6,7,9,10,11) "
-                    "AND tag_reference!=''",
+                    "WHERE parent=? AND tag_reference!='' "
+                    "AND tag_reference!='__REVISION_NOTE__'",
                     (r.comment_id,),
                 )
                 for op_ref, op_text in self._cur.fetchall():
-                    if op_ref:
+                    # A valid L5X tag Operand is a qualifier relative to the tag:
+                    # it begins with '.' (member/bit) or '[' (array index). A bare
+                    # member name is a DataType member description (emitted on the
+                    # datatype, not the tag), and a '.!<hex>' operand is a module
+                    # I/O connection point Studio does not surface on the tag.
+                    # Both would be mis-attributed as tag comments, so skip them.
+                    if op_ref and op_ref[0] in ".[" and not op_ref.startswith(".!"):
                         operand_comments.append((op_ref, op_text or ""))
             except Exception:
                 operand_comments = []

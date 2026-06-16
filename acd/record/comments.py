@@ -89,6 +89,15 @@ class CommentsRecord:
         body = raw[14:]
         if len(body) < 14:
             return None
+        # Structural guard: an operand-comment body always begins with six zero
+        # bytes (the leading member-discriminator region) and a zero pad byte at
+        # body[12]. Non-operand records (own descriptions, internal metadata)
+        # that fall into this branch fail the check and return None so the caller
+        # degrades gracefully. This is what lets the caller attempt the operand
+        # parse for EVERY record_type (the type is an ordinal, not an enum)
+        # without misparsing the few non-operand records that share the branch.
+        if body[0:6] != b"\x00\x00\x00\x00\x00\x00" or body[12] != 0:
+            return None
         member_key = struct.unpack_from("<H", body, 6)[0]
         object_id = struct.unpack_from("<I", body, 8)[0]
 
@@ -105,6 +114,16 @@ class CommentsRecord:
         operand, pos = _utf16z(body, 13)
         text, _ = _utf16z(body, pos)
         if not operand:
+            return None
+        # Reject control characters in the operand: a genuine operand path is
+        # printable ("[3]", ".5", ".MEMBER", "MemberName"). This rejects records
+        # whose body coincidentally has the zero prefix but is not text.
+        if any((ord(c) < 0x20 and c != "\t") for c in operand):
+            return None
+        # AOI UDI metadata (UDI_HISTORY RevisionNote) shares this body layout but
+        # is not a tag operand comment; leave it to the UDI parser by bailing out
+        # so the caller falls through to the shared FafaComents path.
+        if operand.startswith("UDI_"):
             return None
         return (
             seq_number,
@@ -196,24 +215,26 @@ class CommentsRecord:
         if short_header and len(raw_full) >= 8:
             try:
                 rt = struct.unpack_from("<H", raw_full, 6)[0]
-                # Operand comment record types observed across V10..V21 projects:
-                #   3/4/5  array/bit/element comments on atomic tags
-                #   6      IO-module .DATA comments
-                #   7      array-of-struct element.bit comments ("[0].10")
-                #   9/10/11 UDT-member comments (".DINT[1]", ".BOOL[19]")
-                # All share the same body layout (operand UTF-16 at body+13).
-                # Types 1/2 (plain own-description) and the long-header UTF-16
-                # record types are deliberately excluded.
-                if rt in (0x03, 0x04, 0x05, 0x06, 0x07, 0x09, 0x0A, 0x0B):
-                    parsed = CommentsRecord._parse_short_operand_body(raw_full)
-                    if parsed is not None:
-                        return parsed
                 # Own-description records (component Description text) in UTF-16LE.
                 # The shared FafaComents AsciiRecord decodes these as UTF-8 (the
                 # V24+ layout), which mangles short-header UTF-16 text, so parse
                 # them here. Falls through to the original parser on any failure.
                 if rt in (0x01, 0x02):
                     parsed = CommentsRecord._parse_short_desc_body(raw_full)
+                    if parsed is not None:
+                        return parsed
+                # Everything else is an operand/member/array-element comment.
+                # record_type here is the comment's ORDINAL within its parent
+                # group (observed 3..36 across V10..V21), NOT a fixed type enum:
+                # a tag/datatype with N member comments emits records numbered up
+                # to ~N+2. They all share one body layout (six zero bytes + a
+                # UTF-16 operand at body+13). _parse_short_operand_body validates
+                # the structure and returns None for the non-operand records that
+                # also land here (UDI metadata, etc.), so attempting it for every
+                # non-1/2 type recovers comments the old fixed {3..11} allowlist
+                # dropped (e.g. rt 8, 12 and 15-36) without misparsing anything.
+                else:
+                    parsed = CommentsRecord._parse_short_operand_body(raw_full)
                     if parsed is not None:
                         return parsed
             except Exception:
