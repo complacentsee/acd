@@ -846,12 +846,54 @@ class Tag(L5xElement):
         # Wrapped so any failure degrades to today's zero-placeholder behaviour
         # below — no regression.
         data_xml = ""
-        if not is_alias and self._value_bytes is not None and dt_base not in _SKIP_DECORATED and dt_base != "STRING":
+        # The Format="String" block is only emitted on long-header (V24+) projects:
+        # there the recovered STRING value image is the verified LEN+DATA shape. The
+        # short-header STRING value image is not reliably decoded yet, so keep the
+        # prior behaviour there (no <Data> for dt_base=="STRING"), avoiding wrong
+        # empty/array output.
+        if not is_alias and self._value_bytes is not None and dt_base not in _SKIP_DECORATED \
+                and not (self._short_header and dt_base == "STRING"):
             try:
+                # A SCALAR STRING tag emits a Format="String" Length=N block in
+                # place of the Decorated <Structure> (Logix renders STRING specially).
+                # Detect by datatype name OR by the resolved TagInfo layout being the
+                # Logix STRING shape (LEN u32 + DATA SINT[]) -- the latter catches
+                # custom string types (String50, PF525FaultDesc, ...). STRING ARRAYS
+                # keep the Decorated path (render_decorated_layout -> <Array>).
+                # Long header only (see above): short-header detection mislabels some
+                # atomics and yields empty text.
+                is_string = False
+                if not self._short_header:
+                    is_string = (dt_base == "STRING") and self.dimensions is None
+                    if not is_string and self.dimensions is None and self._taginfo_layout:
+                        try:
+                            _lay = _tag_value._resolve_layout(
+                                dt_base, self._taginfo_layout, self._data_types_map
+                            )
+                            if _lay is not None and _tag_value._is_string_layout(_lay):
+                                is_string = True
+                        except Exception:
+                            pass
                 # Step 6d: layout-driven decode (full member fidelity) first;
                 # fall back to the simpler render_decorated on None/any failure.
                 decorated_inner = None
-                if self._taginfo_layout:
+                string_block = None
+                if is_string:
+                    try:
+                        length = (int.from_bytes(self._value_bytes[0:4], "little")
+                                  if len(self._value_bytes) >= 4 else 0)
+                    except Exception:
+                        length = 0
+                    if length < 0 or length + 4 > len(self._value_bytes):
+                        raw = self._value_bytes[4:] if len(self._value_bytes) > 4 else b""
+                        text = _tag_value._ascii_string_cdata(raw.split(b"\x00", 1)[0])
+                    else:
+                        text = _tag_value._ascii_string_cdata(self._value_bytes[4:4 + length])
+                    string_block = (
+                        f'<Data Format="String" Length="{length}">\n'
+                        f"<![CDATA['{text}']]>\n</Data>"
+                    )
+                elif self._taginfo_layout:
                     try:
                         decorated_inner = _tag_value.render_decorated_layout(
                             dt_decorated, self.dimensions, self._value_bytes,
@@ -860,7 +902,7 @@ class Tag(L5xElement):
                         )
                     except Exception:
                         decorated_inner = None
-                if decorated_inner is None:
+                if not is_string and decorated_inner is None:
                     decorated_inner = _tag_value.render_decorated(
                         dt_base, self.dimensions, self._value_bytes,
                         self._data_types_map, radix=self.radix
@@ -894,7 +936,11 @@ class Tag(L5xElement):
                         )
                     first = f'<Data Format="L5K">\n<![CDATA[{l5k_text}]]>\n</Data>'
                     ok_first = l5k_text is not None
-                if ok_first and decorated_inner is not None:
+                if string_block is not None:
+                    # Scalar STRING: first block (raw hex / L5K) then the String block.
+                    if ok_first:
+                        data_xml = first + string_block
+                elif ok_first and decorated_inner is not None:
                     data_xml = first + f'<Data Format="Decorated">\n{decorated_inner}\n</Data>'
             except Exception:
                 data_xml = ""
