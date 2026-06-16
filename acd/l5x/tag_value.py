@@ -220,6 +220,26 @@ def _dims_total(dimensions: Optional[str]) -> Tuple[int, List[int]]:
     return (total if parts else 0), parts
 
 
+def _index_str(i: int, dims: List[int]) -> str:
+    """Render a flat element ordinal `i` as an L5X Decorated <Element> Index.
+
+    Logix lays multi-dimensional arrays out row-major over the Dimensions string
+    exactly as written (left-to-right), with the LAST dimension varying fastest:
+    dims [26,11,11] -> [0,0,0],[0,0,1],...,[0,0,10],[0,1,0],...  A 1-D array
+    keeps the simple "[i]" form. Verified against OEM V17/V34 multi-dim arrays.
+    """
+    if len(dims) <= 1:
+        return f"[{i}]"
+    coords = []
+    rem = i
+    for j in range(len(dims)):
+        stride = 1
+        for d in dims[j + 1:]:
+            stride *= d
+        coords.append((rem // stride) % dims[j] if stride else 0)
+    return "[" + ",".join(str(c) for c in coords) + "]"
+
+
 def render_hex(image: bytes) -> str:
     """Uppercase hex of the raw value image, OEM-wrapped at 16 bytes/line.
 
@@ -532,7 +552,8 @@ def render_decorated(dt_base: str, dimensions: Optional[str], image: bytes,
             if off + width > len(image):
                 return None
             elems.append(
-                f'<Element Index="[{i}]" Value="{_atomic_text_decorated(dt_base, image[off:off+width])}"/>'
+                f'<Element Index="{_index_str(i, dim_parts)}" '
+                f'Value="{_atomic_text_decorated(dt_base, image[off:off+width])}"/>'
             )
         dim_str = ",".join(str(d) for d in dim_parts)
         return (f'<Array DataType="{dt_base}" Dimensions="{dim_str}" Radix="{radix}">'
@@ -768,12 +789,12 @@ def _decorated_member(name: str, mdt: str, off: int, bit, dims,
                     if byte >= len(image):
                         return None
                     v = (image[byte] >> (i % 8)) & 1
-                    elems.append(f'<Element Index="[{i}]" Value="{v}"/>')
+                    elems.append(f'<Element Index="{_index_str(i, dims)}" Value="{v}"/>')
                     continue
                 vt = _member_value_text(mdt, image, eoff, radix)
                 if vt is None:
                     return None
-                elems.append(f'<Element Index="[{i}]" Value="{vt}"/>')
+                elems.append(f'<Element Index="{_index_str(i, dims)}" Value="{vt}"/>')
             ra = f' Radix="{radix}"' if radix else ""
             return (f'<ArrayMember Name="{name}" DataType="{mdt}" '
                     f'Dimensions="{dim_str}"{ra}>{"".join(elems)}</ArrayMember>')
@@ -795,7 +816,7 @@ def _decorated_member(name: str, mdt: str, off: int, bit, dims,
                 return None
             # OEM wraps each array-of-struct element's members in <Structure>.
             elems.append(
-                f'<Element Index="[{i}]"><Structure DataType="{mdt}">'
+                f'<Element Index="{_index_str(i, dims)}"><Structure DataType="{mdt}">'
                 f'{inner}</Structure></Element>'
             )
         return (f'<ArrayMember Name="{name}" DataType="{mdt}" '
@@ -922,7 +943,7 @@ def render_decorated_layout(dt_base: str, dimensions: Optional[str], image: byte
             return None
         # OEM wraps each array-of-struct element's members in <Structure>.
         elems.append(
-            f'<Element Index="[{i}]"><Structure DataType="{dt_base}">'
+            f'<Element Index="{_index_str(i, dim_parts)}"><Structure DataType="{dt_base}">'
             f'{inner}</Structure></Element>'
         )
     return (f'<Array DataType="{dt_base}" Dimensions="{dim_str}">'
