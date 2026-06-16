@@ -893,8 +893,14 @@ def _is_string_layout(layout) -> bool:
     return data[1] == "SINT" and bool(data[5])
 
 
-def _render_string_inner(layout, image: bytes) -> Optional[str]:
-    """Render the inner members of a STRING-shaped struct (LEN + CDATA DATA)."""
+def _render_string_inner(layout, image: bytes, dt_name: str = "STRING"
+                         ) -> Optional[str]:
+    """Render the inner members of a STRING-shaped struct (LEN + CDATA DATA).
+
+    ``dt_name`` is the enclosing STRING datatype's declared name; the DATA member
+    carries it verbatim as its DataType (OEM writes the actual string type, e.g.
+    ``String50`` / ``PF525FaultDesc`` / ``STRING28``, not a hardcoded ``STRING``).
+    """
     parts: List[str] = []
     for (name, mdt, off, bit, hidden, dims, def_radix) in layout:
         if hidden:
@@ -925,7 +931,7 @@ def _render_string_inner(layout, image: bytes) -> Optional[str]:
             # an empty string (LEN 0) is emitted as empty CDATA, no quotes.
             cdata = f"'{text}'" if text else ""
             parts.append(
-                f'<DataValueMember Name="{name}" DataType="STRING" '
+                f'<DataValueMember Name="{name}" DataType="{dt_name}" '
                 f'Radix="ASCII">\n<![CDATA[{cdata}]]>\n</DataValueMember>'
             )
         else:
@@ -968,7 +974,7 @@ def _decorated_struct_layout(dt_name: str, image: bytes, layout_map: Dict,
     if layout is None:
         return None
     if _is_string_layout(layout):
-        inner = _render_string_inner(layout, image)
+        inner = _render_string_inner(layout, image, dt_name)
         if inner is None:
             return None
         return f'<Structure DataType="{dt_name}">{inner}</Structure>'
@@ -1079,7 +1085,7 @@ def _decorated_struct_inner(dt_name: str, image: bytes, layout_map: Dict,
     if layout is None:
         return None
     if _is_string_layout(layout):
-        return _render_string_inner(layout, image)
+        return _render_string_inner(layout, image, dt_name)
     parts: List[str] = []
     for (name, mdt, off, bit, hidden, dims, def_radix) in layout:
         if hidden:
