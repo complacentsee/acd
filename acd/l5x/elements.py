@@ -2187,6 +2187,17 @@ class ModuleBuilder(L5xElementBuilder):
         exts: Dict[int, bytes] = {er.attribute_id: bytes(er.value) for er in r.extended_records}
         e1 = exts.get(0x001, b"")
         if len(e1) < 0x30:
+            # Some module records (seen on V10..V20 projects) do not surface the
+            # identity as extended record 0x001; the same identity block sits
+            # inline behind the marker 44 02 00 00 (the u32 length 0x244 of the
+            # identity TLV). The bytes after that length prefix are byte-identical
+            # to the 0x001 attribute, so alias e1 to them and the existing field
+            # offsets below decode unchanged. Only used when 0x001 is absent, so
+            # records that do carry 0x001 (incl. long-header) are untouched.
+            marker = raw_rec.find(b"\x44\x02\x00\x00")
+            if marker >= 0 and len(raw_rec) - (marker + 4) >= 0x30:
+                e1 = raw_rec[marker + 4:]
+        if len(e1) < 0x30:
             major_fault = "true" if name == "Local" else "false"
             return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false", major_fault)
 
