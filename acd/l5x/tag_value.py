@@ -57,7 +57,18 @@ _BUILTIN_STRUCT: Dict[str, List[Tuple[str, str]]] = {
 
 
 def _fmt_real(v: float) -> str:
-    """Format a REAL/LREAL like Logix: 8-significand scientific, 3-digit exp."""
+    """Format a REAL/LREAL like Logix: 8-significand scientific, 3-digit exp.
+
+    Non-finite values use the Logix L5K sentinels: NaN -> 1.#QNAN000e+000,
+    +Inf -> 1.#INF0000e+000, -Inf -> -1.#INF0000e+000 (these crash a plain
+    %e format, so they are handled explicitly).
+    """
+    if v != v:                      # NaN
+        return "1.#QNAN000e+000"
+    if v == float("inf"):
+        return "1.#INF0000e+000"
+    if v == float("-inf"):
+        return "-1.#INF0000e+000"
     s = f"{v:.8e}"               # e.g. '5.00000000e+01'
     mant, _, exp = s.partition("e")
     sign = exp[0]
@@ -76,6 +87,25 @@ def _atomic_text(dt: str, b: bytes) -> str:
     return str(val)
 
 
+def _atomic_text_decorated(dt: str, b: bytes) -> str:
+    """Decode one atomic value to its Decorated <DataValue>/<Element> Value text.
+
+    Identical to ``_atomic_text`` except REAL/LREAL use the shortest-round-trip
+    decimal form Logix writes in the Decorated block (e.g. 28795.67, 0.0,
+    1.#QNAN) rather than the 8-digit scientific form used only in the L5K CDATA
+    block.  Integer/BOOL forms are unchanged.
+    """
+    width, fmt = _ATOMIC[dt]
+    val = struct.unpack(fmt, b[:width])[0]
+    if dt == "LREAL":
+        return _fmt_lreal_decorated(val)
+    if dt == "REAL":
+        return _fmt_real_decorated(val)
+    if dt == "BOOL":
+        return "1" if val else "0"
+    return str(val)
+
+
 def _fmt_real_decorated(v: float) -> str:
     """Format a REAL value the way Logix writes it in a Decorated Value attribute.
 
@@ -87,8 +117,12 @@ def _fmt_real_decorated(v: float) -> str:
     """
     import math
     f = struct.unpack("<f", struct.pack("<f", v))[0]
-    if f != f:                      # NaN
-        return "0.0"
+    if f != f:                      # NaN -> Logix Decorated form
+        return "1.#QNAN"
+    if f == float("inf"):
+        return "1.#INF"
+    if f == float("-inf"):
+        return "-1.#INF"
     if f == 0.0:
         return "0.0"
     if f == struct.unpack("<f", struct.pack("<f", 3.40282347e38))[0]:
@@ -107,6 +141,45 @@ def _fmt_real_decorated(v: float) -> str:
             break
     if best is None:
         best = "%.9g" % f
+    if "e" in best or "E" in best:
+        a = abs(f)
+        exp = math.floor(math.log10(a))
+        if -4 <= exp < 16:
+            sig = len(best.split("e")[0].replace("-", "").replace(".", ""))
+            decimals = max(0, sig - 1 - exp)
+            best = "%.*f" % (decimals, f)
+    if "." not in best and "e" not in best and "E" not in best:
+        best += ".0"
+    if "e" in best:
+        m, _, e = best.partition("e")
+        sign = e[0]
+        ev = int(e[1:])
+        best = "%se%s%03d" % (m, sign, ev)
+    return best
+
+
+def _fmt_lreal_decorated(v: float) -> str:
+    """Decorated form of an LREAL (double): shortest round-trip through IEEE-754
+    double precision.  Mirrors ``_fmt_real_decorated`` but does NOT re-quantize
+    to single precision (which would corrupt high-precision doubles)."""
+    import math
+    f = v
+    if f != f:
+        return "1.#QNAN"
+    if f == float("inf"):
+        return "1.#INF"
+    if f == float("-inf"):
+        return "-1.#INF"
+    if f == 0.0:
+        return "0.0"
+    best = None
+    for p in range(1, 18):
+        s = "%.*g" % (p, f)
+        if float(s) == f:
+            best = s
+            break
+    if best is None:
+        best = "%.17g" % f
     if "e" in best or "E" in best:
         a = abs(f)
         exp = math.floor(math.log10(a))
@@ -450,7 +523,7 @@ def render_decorated(dt_base: str, dimensions: Optional[str], image: bytes,
         if total == 0:
             if len(image) < width:
                 return None
-            return _decorated_scalar(dt_base, _atomic_text(dt_base, image[:width]))
+            return _decorated_scalar(dt_base, _atomic_text_decorated(dt_base, image[:width]))
         # atomic array
         radix = _RADIX.get(dt_base, "Decimal")
         elems = []
@@ -459,7 +532,7 @@ def render_decorated(dt_base: str, dimensions: Optional[str], image: bytes,
             if off + width > len(image):
                 return None
             elems.append(
-                f'<Element Index="[{i}]" Value="{_atomic_text(dt_base, image[off:off+width])}"/>'
+                f'<Element Index="[{i}]" Value="{_atomic_text_decorated(dt_base, image[off:off+width])}"/>'
             )
         dim_str = ",".join(str(d) for d in dim_parts)
         return (f'<Array DataType="{dt_base}" Dimensions="{dim_str}" Radix="{radix}">'
@@ -521,7 +594,9 @@ def _member_value_text(dt: str, image: bytes, offset: int, radix: Optional[str]
     if offset + width > len(image):
         return None
     val = struct.unpack_from(fmt, image, offset)[0]
-    if dt in ("REAL", "LREAL"):
+    if dt == "LREAL":
+        return _fmt_lreal_decorated(val)
+    if dt == "REAL":
         return _fmt_real_decorated(val)
     return _format_int_radix(dt, val, width, radix)
 
