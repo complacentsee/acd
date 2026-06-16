@@ -1553,6 +1553,11 @@ class MemberBuilder(L5xElementBuilder):
     # member-collection index of the host word (1-based effectively, but stored
     # as the host's 0-based ordinal), so Target = _members_by_index[0x68].
     _members_by_index: List[str] = field(default_factory=list)
+    # Owning datatype's comment_id (short-header only). A member description is
+    # stored in the comments table keyed by this comment_id (bare, not shifted)
+    # with the member NAME in tag_reference; short-header members have no per-
+    # member comps record, so the name is the only discriminator. 0 -> skip.
+    _owner_comment_id: int = field(default=0)
 
     def build(self) -> Member:
         if self._short_name is not None:
@@ -1731,8 +1736,25 @@ class MemberBuilder(L5xElementBuilder):
                 # values to 0 so we don't emit a garbage Dimension attribute.
                 if dimension > 0x10000:
                     dimension = 0
+            # Member description: a short-header member has no per-member comps
+            # record, so its description is stored in the comments table keyed by
+            # the owning datatype's bare comment_id with the member NAME in
+            # tag_reference (record_type 3..11 are the member/bit/array operand
+            # kinds). The comment_id is unique per datatype, so the (comment_id,
+            # name) pair identifies one member.
+            description: Union[str, None] = None
+            if self._owner_comment_id:
+                self._cur.execute(
+                    "SELECT record_string FROM comments "
+                    "WHERE parent=? AND record_type IN (3,4,5,6,7,9,10,11) "
+                    "AND tag_reference=? AND record_string!='' LIMIT 1",
+                    (self._owner_comment_id, name),
+                )
+                d_row = self._cur.fetchone()
+                if d_row and d_row[0]:
+                    description = d_row[0]
             return Member(name, name, data_type, dimension, radix, hidden,
-                          target, bit_number, external_access, None)
+                          target, bit_number, external_access, description)
         except Exception:
             return Member(name, name, "", 0, "Decimal", False, None, None, "Read/Write")
 
@@ -1980,6 +2002,7 @@ class DataTypeBuilder(L5xElementBuilder):
                             offset60_to_name,
                             last_hidden_backing,
                             _short_name=mname,
+                            _owner_comment_id=r.comment_id,
                         ).build()
                     )
                 except Exception:
