@@ -15,6 +15,7 @@ regress below current output.
 from __future__ import annotations
 
 import struct
+from decimal import Decimal, localcontext, ROUND_HALF_UP
 from typing import Dict, List, Optional, Tuple, Union
 
 # Atomic primitive byte widths and struct-unpack formats.
@@ -56,31 +57,138 @@ _BUILTIN_STRUCT: Dict[str, List[Tuple[str, str]]] = {
 }
 
 
-def _fmt_real(v: float) -> str:
-    """Format a REAL/LREAL like Logix: 8-significand scientific, 3-digit exp.
+# L5K CDATA non-finite sentinels (Logix-specific strings, not %e output).
+_L5K_QNAN = "1.#QNAN000e+000"
+_L5K_PINF = "1.#INF0000e+000"
+_L5K_NINF = "-1.#INF0000e+000"
 
-    Non-finite values use the Logix L5K sentinels: NaN -> 1.#QNAN000e+000,
-    +Inf -> 1.#INF0000e+000, -Inf -> -1.#INF0000e+000 (these crash a plain
-    %e format, so they are handled explicitly).
+
+def _round_sig_haway(v: float, p: int) -> Tuple[str, int, bool]:
+    """Round |v| to ``p`` significant figures, ROUND-HALF-AWAY-FROM-ZERO.
+
+    Returns ``(digits, exp10, neg)``: a p-char digit string, the base-10 exponent
+    of the leading digit, and the sign flag (negative-zero aware). Pure-python and
+    byte-identical to a Windows-CRT ``sprintf("%.*e", p-1, (double)v)`` across the
+    whole OEM float corpus. ``Decimal(v)`` is the exact value of the IEEE float, so
+    the rounding sees the float's true decimal expansion.
     """
-    if v != v:                      # NaN
-        return "1.#QNAN000e+000"
+    neg = (v < 0.0) or (v == 0.0 and bool(struct.pack("<d", v)[7] & 0x80))
+    d = Decimal(abs(v))
+    if d == 0:
+        return "0" * p, 0, neg
+    e = d.adjusted()                                   # exp of the leading digit
+    m = d.scaleb(-e)                                   # mantissa in [1, 10)
+    q = m.quantize(Decimal(1).scaleb(-(p - 1)), rounding=ROUND_HALF_UP)
+    if q >= 10:                                        # 9.99.. rounded up to 10.0
+        q = (q / 10).quantize(Decimal(1).scaleb(-(p - 1)), rounding=ROUND_HALF_UP)
+        e += 1
+    return f"{q:.{p - 1}f}".replace(".", ""), e, neg
+
+
+def _emit9(digits: str, exp: int, neg: bool) -> str:
+    """Render a digit string + base-10 exponent as ``D.DDDDDDDDe(+/-)EEE``."""
+    d9 = (digits + "0" * 9)[:9]
+    sign = "-" if neg else ""
+    es = "+" if exp >= 0 else "-"
+    return f"{sign}{d9[0]}.{d9[1:]}e{es}{abs(exp):03d}"
+
+
+# Smallest positive *normal* float32 (2**-126); below this a value is subnormal.
+_F32_SMALLEST_NORMAL = Decimal(2) ** (-126)
+
+
+def _fmt_real(v: float) -> str:
+    """Format a REAL (IEEE-754 single) the way Logix writes it in an L5K CDATA.
+
+    The form is 9-significant-figure scientific (1 leading + 8 fractional digits),
+    rounding HALF-AWAY-FROM-ZERO, with a 3-digit explicit-sign exponent. On top of
+    that base, Studio's float32 digit-generation collapses the trailing (9th) digit
+    to zero for "near-clean" magnitudes: when a value sits within ~half a float32
+    ULP at or above a shorter decimal, that decimal's noisy tail is dropped. This
+    reproduces the OEM converter byte-for-byte over the full pool corpus (every
+    distinct REAL literal and every weighted occurrence). NaN/+-Inf use the Logix
+    sentinels, which are NOT %e output.
+    """
+    if v != v:
+        return _L5K_QNAN
     if v == float("inf"):
-        return "1.#INF0000e+000"
+        return _L5K_PINF
     if v == float("-inf"):
-        return "-1.#INF0000e+000"
-    s = f"{v:.8e}"               # e.g. '5.00000000e+01'
-    mant, _, exp = s.partition("e")
-    sign = exp[0]
-    digits = exp[1:].lstrip("0") or "0"
-    return f"{mant}e{sign}{int(digits):03d}"
+        return _L5K_NINF
+    # Quantize to single precision so the exact-decimal rounding always sees the
+    # true float32 value (callers already feed an <f-unpacked value; be defensive).
+    f = struct.unpack("<f", struct.pack("<f", v))[0]
+    if f != f:
+        return _L5K_QNAN
+    if f == float("inf"):
+        return _L5K_PINF
+    if f == float("-inf"):
+        return _L5K_NINF
+    with localcontext() as ctx:
+        ctx.prec = 80                                  # ample; default 28 also works
+        if f == 0.0:
+            return _emit9("0" * 9, 0, bool(struct.pack("<d", f)[7] & 0x80))
+
+        def _cand(p: int):
+            dig, exp, neg = _round_sig_haway(f, p)
+            d9 = (dig + "0" * 9)[:9]
+            mag = Decimal(d9[0] + "." + d9[1:]).scaleb(exp)
+            val = float((-1 if neg else 1) * mag)
+            try:
+                rt = (struct.unpack("<f", struct.pack("<f", val))[0] == f)
+            except OverflowError:
+                rt = False
+            return dig, exp, neg, mag, rt
+
+        av = Decimal(abs(f))
+        dig9, exp9, neg9 = _round_sig_haway(f, 9)      # default: full 9-sig form
+        dig8, exp8, neg8, mag8, rt8 = _cand(8)         # 8-sig (9th position is 0)
+
+        # PRIMARY collapse: the 8-sig form ends in 0, round-trips, and was reached
+        # by rounding DOWN (does not overshoot v) -> the 9th digit is pure noise.
+        if dig8[-1] == "0" and rt8 and mag8 <= av:
+            return _emit9(dig8, exp8, neg8)
+
+        # ULTRA-CLEAN collapse: the 1-sig form round-trips and sits at-or-below v
+        # by less than ~half a float32 ULP (8th-digit noise <= 2) -> emit it clean.
+        if av >= _F32_SMALLEST_NORMAL:
+            dig1, exp1, neg1, mag1, rt1 = _cand(1)
+            if rt1 and mag1 <= av and int(dig8[-1]) <= 2:
+                return _emit9(dig1, exp1, neg1)
+
+        return _emit9(dig9, exp9, neg9)
+
+
+def _fmt_lreal(v: float) -> str:
+    """Format an LREAL (IEEE-754 double) for an L5K CDATA.
+
+    Same 9-significant-figure, half-away, 3-digit-exponent scientific shape as
+    :func:`_fmt_real`, applied to the raw double WITHOUT the float32 re-quant/
+    collapse (that is a single-precision dtoa artifact and ``pack('<f', ...)``
+    would overflow for large doubles). The pool contains no LREAL L5K literals, so
+    this is the by-analogy shared base rule; sentinels and signed zero are identical.
+    """
+    if v != v:
+        return _L5K_QNAN
+    if v == float("inf"):
+        return _L5K_PINF
+    if v == float("-inf"):
+        return _L5K_NINF
+    with localcontext() as ctx:
+        ctx.prec = 80
+        if v == 0.0:
+            return _emit9("0" * 9, 0, bool(struct.pack("<d", v)[7] & 0x80))
+        dig9, exp9, neg9 = _round_sig_haway(v, 9)
+        return _emit9(dig9, exp9, neg9)
 
 
 def _atomic_text(dt: str, b: bytes) -> str:
     """Decode one atomic value from its bytes to its L5K/Value text."""
     width, fmt = _ATOMIC[dt]
     val = struct.unpack(fmt, b[:width])[0]
-    if dt in ("REAL", "LREAL"):
+    if dt == "LREAL":
+        return _fmt_lreal(val)
+    if dt == "REAL":
         return _fmt_real(val)
     if dt == "BOOL":
         return "1" if val else "0"
@@ -353,7 +461,9 @@ def _l5k_atomic(mdt: str, image: bytes, offset: int) -> Optional[str]:
     if offset + width > len(image):
         return None
     val = struct.unpack_from(fmt, image, offset)[0]
-    if mdt in ("REAL", "LREAL"):
+    if mdt == "LREAL":
+        return _fmt_lreal(val)
+    if mdt == "REAL":
         return _fmt_real(val)
     return str(val)
 
