@@ -358,6 +358,38 @@ def _l5k_atomic(mdt: str, image: bytes, offset: int) -> Optional[str]:
     return str(val)
 
 
+def _l5k_string(layout, image: bytes) -> Optional[str]:
+    """Render a STRING-shaped struct in the L5K bracket form ``[LEN,'TEXT...']``.
+
+    Logix serialises a STRING (LEN int + DATA SINT[]) in the L5K CDATA as a
+    two-entry bracket: the LEN integer, then a single-quoted L5K string literal
+    covering the FULL DATA[] capacity (the active LEN characters followed by
+    ``$00`` NUL padding to the declared array dimension), with ``$``-escapes for
+    control / non-printable bytes.  Mirrors the Decorated string path but in the
+    bracket/quoted form.
+    """
+    len_off = None
+    data_off = None
+    data_cap = 0
+    for (name, mdt, off, bit, hidden, dims, def_radix) in layout:
+        up = name.upper()
+        if up == "LEN":
+            len_off = off
+        elif up == "DATA":
+            data_off = off
+            data_cap = 1
+            for d in (dims or []):
+                data_cap *= d
+    if len_off is None or data_off is None or data_cap <= 0:
+        return None
+    if len_off + 4 > len(image) or data_off + data_cap > len(image):
+        return None
+    length = struct.unpack_from("<i", image, len_off)[0]
+    raw = image[data_off:data_off + data_cap]
+    text = _ascii_string_cdata(raw)
+    return "[%d,'%s']" % (length, text)
+
+
 def _l5k_struct(dt_name: str, image: bytes, layout_map: Dict,
                 data_types_map: Dict, depth: int) -> Optional[str]:
     """Render one struct as the L5K bracket tree ``[m0,m1,...]``."""
@@ -366,6 +398,8 @@ def _l5k_struct(dt_name: str, image: bytes, layout_map: Dict,
     layout = _resolve_layout(dt_name, layout_map, data_types_map)
     if layout is None:
         return None
+    if _is_string_layout(layout):
+        return _l5k_string(layout, image)
     # The L5K bracket form serialises the physical STORAGE image: one entry per
     # distinct storage location.  Unlike the Decorated block it DOES include
     # HIDDEN members (e.g. AB:1734_4SLOT:O:0's SlotStatusBits DINTs, or the

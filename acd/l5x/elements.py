@@ -794,14 +794,18 @@ class Tag(L5xElement):
                     first = "<Data>" + _tag_value.render_hex(self._value_bytes) + "</Data>"
                     ok_first = bool(self._value_bytes)
                 else:
-                    # Module I/O struct types need the layout-driven L5K bracket
-                    # tree (mixed-width members); the flat int32-word render_l5k is
-                    # wrong for them. Try the layout form first for IO tags, and
-                    # fall back to the flat form. Wrapped: any failure -> no L5K
-                    # (ok_first stays False -> the <Data> blocks are suppressed,
-                    # which is today's behaviour for the long path).
+                    # Struct/UDT/built-in-struct (and module I/O) types need the
+                    # layout-driven L5K bracket tree (the datatype's MEMBER tree,
+                    # with mixed-width members, nested sub-structs and STRING
+                    # members rendered properly); the flat int32-word render_l5k is
+                    # wrong for them.  Try the layout form first whenever a TagInfo
+                    # layout exists for this datatype, and fall back to the flat
+                    # form only when the layout path returns None (unknown shape).
+                    # Wrapped: any failure -> no L5K (ok_first stays False -> the
+                    # <Data> blocks are suppressed, which is today's behaviour for
+                    # the long path).
                     l5k_text = None
-                    if self._io and self._taginfo_layout:
+                    if self._taginfo_layout:
                         try:
                             l5k_text = _tag_value.render_l5k_layout(
                                 dt_decorated, self.dimensions, self._value_bytes,
