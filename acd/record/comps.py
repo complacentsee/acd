@@ -206,6 +206,77 @@ class CompsRecord:
             type_code = int.from_bytes(attrs[0x65][0:2], "little")
         return attrs[0x66], type_code
 
+    # ------------------------------------------------------------------ #
+    # AOI prototype-default reader (F3) — __DEFVAL_* consolidated image   #
+    # ------------------------------------------------------------------ #
+    # AOI Parameter/LocalTag prototype DEFAULTS are NOT stored on the per-tag
+    # cip-0x6b/0x6c record (its main_record@0x24 data_table_instance is 0/0xffffffff
+    # and its ext-0x66 is a sentinel). Each AOI instead has exactly ONE hidden
+    # controller-scope tag named ``__DEFVAL_<8hex>`` (comps record_type 264) whose:
+    #   main_record@0x1c (u32) = datatype-ref -> the AOI's datatype comp
+    #                            (record_type 256 under RxDataTypeCollection,
+    #                             comp_name == the AOI name)
+    #   main_record@0x24 (u32) = data_table_instance -> a cip-0x6a $hash$ backing
+    # That backing's ext-0x66 is the CONSOLIDATED prototype image of the WHOLE AOI
+    # struct (one instance image laid out per the AOI datatype member layout). Its
+    # length == @size@<AOI> from TagInfo.XML (an integrity invariant). Per-child
+    # value images are slices at the member's TagInfo byte offset/width.
+    #
+    # Proven on MachineA acd.db: AOI_A image size 1328; PacketMax@128 = 82;
+    # ResetSign SignCommandCode@624 = 01 00 00 00 43 00 ('C').
+
+    @staticmethod
+    def read_aoi_defval_image(cur, aoi_name: str, short_header: bool):
+        """Return the AOI's consolidated __DEFVAL prototype image, or None.
+
+        Resolves: aoi_name -> RxDataTypeCollection datatype oid -> the __DEFVAL
+        whose main_record@0x1c == that oid -> its main_record@0x24
+        data_table_instance -> the cip-0x6a backing's ext-0x66. Best-effort: any
+        failure / missing record returns None so callers degrade to today's
+        no-value behaviour (no regression).
+        """
+        try:
+            cur.execute(
+                "SELECT object_id FROM comps WHERE comp_name=? AND parent_id="
+                "(SELECT object_id FROM comps WHERE comp_name='RxDataTypeCollection')",
+                (aoi_name,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            dt_oid = row[0]
+
+            cur.execute(
+                "SELECT record FROM comps WHERE comp_name LIKE '__DEFVAL%'"
+            )
+            dti = None
+            for (rec,) in cur.fetchall():
+                if rec is None:
+                    continue
+                rb = bytes(rec)
+                # comps.record == record_buffer (body after the header). The
+                # 60-byte main_record sits at body[14:74] (14B RxGeneric prelude).
+                if len(rb) < 74:
+                    continue
+                main = rb[14:74]
+                dtref = int.from_bytes(main[0x1c:0x1c + 4], "little")
+                if dtref == dt_oid:
+                    dti = int.from_bytes(main[0x24:0x24 + 4], "little")
+                    break
+            if not dti or dti == 0xFFFFFFFF:
+                return None
+
+            cur.execute(
+                "SELECT record FROM comps_full WHERE object_id=?", (dti,)
+            )
+            brow = cur.fetchone()
+            if not brow or brow[0] is None:
+                return None
+            attrs = CompsRecord.read_value_attrs(bytes(brow[0]), short_header)
+            return attrs.get(0x66)
+        except Exception:
+            return None
+
     @staticmethod
     def _decode_utf16z(buf: bytes) -> str:
         """Decode a NUL-terminated UTF-16LE name (walk u16 units to 0x0000)."""

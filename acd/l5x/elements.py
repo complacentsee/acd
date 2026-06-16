@@ -494,6 +494,11 @@ def _build_default_data(data_type: Union[str, None],
         dt_base = data_type.split("[")[0].upper() if data_type else ""
         if not dt_base or dt_base in _SKIP_DECORATED:
             return ""
+        # Declared-case datatype name for the rendered <Structure DataType=...>
+        # attribute (OEM keeps the author's case, e.g. DateTime not DATETIME).
+        # render_decorated_layout/render_l5k_layout uppercase internally for the
+        # layout lookup, so passing the original case is safe.
+        dt_decorated = data_type.split("[")[0] if data_type else dt_base
 
         # ---- L5K (first) block ----
         # render_l5k/render_decorated reuse, exactly as Tag.to_xml: a real value
@@ -503,28 +508,76 @@ def _build_default_data(data_type: Union[str, None],
         l5k_text = None
 
         if value_bytes is not None:
-            if taginfo_layout:
+            # STRING members render block1 as Format="String" Length=N (single-
+            # quoted CDATA), NOT a Decorated <Structure>. Detect by datatype name
+            # or by the resolved layout being the Logix STRING shape (LEN+DATA).
+            is_string = dt_base == "STRING"
+            if not is_string and dimensions is None and taginfo_layout:
                 try:
-                    decorated_inner = _tag_value.render_decorated_layout(
-                        dt_base, dimensions, value_bytes,
-                        taginfo_layout, data_types_map
+                    lay = _tag_value._resolve_layout(
+                        dt_base, taginfo_layout, data_types_map
                     )
+                    if lay is not None and _tag_value._is_string_layout(lay):
+                        is_string = True
                 except Exception:
-                    decorated_inner = None
-            if decorated_inner is None:
-                decorated_inner = _tag_value.render_decorated(
-                    dt_base, dimensions, value_bytes, data_types_map
+                    pass
+
+            if is_string:
+                # block1 = Format="String" Length="{LEN}" <![CDATA['text']]>
+                try:
+                    length = int.from_bytes(value_bytes[0:4], "little") if len(value_bytes) >= 4 else 0
+                except Exception:
+                    length = 0
+                if length < 0 or length + 4 > len(value_bytes):
+                    # Fall back to NUL-terminated scan for a malformed LEN.
+                    raw = value_bytes[4:] if len(value_bytes) > 4 else b""
+                    text = _tag_value._ascii_string_cdata(raw.split(b"\x00", 1)[0])
+                else:
+                    text = _tag_value._ascii_string_cdata(value_bytes[4:4 + length])
+                decorated_inner = None  # not used for STRING
+                string_block = (
+                    f'<DefaultData Format="String" Length="{length}">\n'
+                    f"<![CDATA['{text}']]>\n</DefaultData>"
                 )
+            else:
+                string_block = None
+                if taginfo_layout:
+                    try:
+                        decorated_inner = _tag_value.render_decorated_layout(
+                            dt_decorated, dimensions, value_bytes,
+                            taginfo_layout, data_types_map
+                        )
+                    except Exception:
+                        decorated_inner = None
+                if decorated_inner is None:
+                    decorated_inner = _tag_value.render_decorated(
+                        dt_base, dimensions, value_bytes, data_types_map
+                    )
+
             if short_header:
                 l5k_text = _tag_value.render_hex(value_bytes)
                 first = "<DefaultData>" + l5k_text + "</DefaultData>"
                 ok_first = bool(value_bytes)
             else:
-                l5k_text = _tag_value.render_l5k(
-                    dt_base, dimensions, value_bytes, data_types_map
-                )
+                l5k_text = None
+                if taginfo_layout:
+                    try:
+                        l5k_text = _tag_value.render_l5k_layout(
+                            dt_decorated, dimensions, value_bytes,
+                            taginfo_layout, data_types_map
+                        )
+                    except Exception:
+                        l5k_text = None
+                if l5k_text is None:
+                    l5k_text = _tag_value.render_l5k(
+                        dt_base, dimensions, value_bytes, data_types_map
+                    )
                 first = f'<DefaultData Format="L5K">\n<![CDATA[{l5k_text}]]>\n</DefaultData>'
                 ok_first = l5k_text is not None
+
+            if string_block is not None:
+                # STRING: emit block0 (hex/L5K) + the String block1, in OEM order.
+                return (first if ok_first else "") + (string_block if ok_first else "")
         else:
             # No value image -> zero default for this data type.
             if dimensions is None and dt_base in _PRIMITIVE_L5K_ZERO:
@@ -3316,6 +3369,80 @@ class AoiBuilder(L5xElementBuilder):
         aoi_record = bytes(results[0][3])
         name = results[0][0]
 
+        # --- F3: AOI Parameter/LocalTag prototype DefaultData value images ---
+        # Resolve the AOI's hidden __DEFVAL backing ONCE: a consolidated image of
+        # the whole AOI struct. Each Parameter/LocalTag default is a slice at the
+        # member's TagInfo byte offset/width. Best-effort: None on any failure ->
+        # builders leave _value_bytes None -> exactly today's behaviour.
+        defval_image: Union[bytes, None] = None
+        defval_members: Dict[str, tuple] = {}
+        try:
+            img = CompsRecord.read_aoi_defval_image(
+                self._cur, name, self._short_header
+            )
+            members = self._taginfo_layout.get(name.upper(), [])
+            aoi_size = self._taginfo_layout.get("@size@" + name.upper())
+            # Integrity gate: image length MUST equal @size@<AOI>, else reject.
+            if (img is not None and members and aoi_size is not None
+                    and len(img) == aoi_size):
+                defval_image = img
+                for m in members:
+                    # m = (mname, mdt, off, bit, hidden, dims)
+                    if m and m[0]:
+                        defval_members[m[0].upper()] = m
+        except Exception:
+            defval_image = None
+            defval_members = {}
+
+        def _member_slice(child_name: str, child_dt: str):
+            """Return the value image (bytes) for one AOI member, or None.
+
+            Resolves the member from the AOI layout by name, then slices the
+            consolidated __DEFVAL image at its byte offset/width. BOOL members
+            return a synthesized 1-byte image (b'\\x01'/b'\\x00') from the bit in
+            the prelude/host word (never slice a sub-byte). All guards return
+            None on any mismatch so a wrong slice is never shipped (degrade to
+            today's no-value behaviour).
+            """
+            try:
+                if defval_image is None:
+                    return None
+                m = defval_members.get(child_name.upper())
+                if m is None:
+                    return None
+                mname, mdt, off, bit, hidden, dims = m
+                if off is None or off < 0 or off > len(defval_image):
+                    return None
+                mdt_base = (mdt or "").split("[")[0].upper()
+                # BOOL: read the bit from the host word; emit a 1-byte image.
+                if mdt_base in ("BOOL", "BIT"):
+                    if bit is not None:
+                        byte_off = off + (bit // 8)
+                        if byte_off >= len(defval_image):
+                            return None
+                        b = (defval_image[byte_off] >> (bit % 8)) & 1
+                    else:
+                        if off >= len(defval_image):
+                            return None
+                        b = 1 if (defval_image[off] & 1) else 0
+                    return b"\x01" if b else b"\x00"
+                # Width: scalar primitives by table; STRING/UDT/array by @size@.
+                total = 1
+                for d in (dims or []):
+                    total *= d
+                if mdt_base in _PRIMITIVE_BYTE_WIDTH:
+                    width = _PRIMITIVE_BYTE_WIDTH[mdt_base] * max(total, 1)
+                else:
+                    msize = self._taginfo_layout.get("@size@" + mdt_base)
+                    if msize is None:
+                        return None
+                    width = msize * max(total, 1)
+                if width <= 0 or off + width > len(defval_image):
+                    return None
+                return defval_image[off:off + width]
+            except Exception:
+                return None
+
         # --- Revision (major.minor) from ext[0x01] ---
         _r_aoi: Union[RxGeneric, None] = None
         try:
@@ -3391,6 +3518,9 @@ class AoiBuilder(L5xElementBuilder):
                             p._data_types_map = self._data_types_map
                             p._taginfo_layout = self._taginfo_layout
                             p._short_header = self._short_header
+                            sl = _member_slice(p.name, p.data_type)
+                            if sl is not None:
+                                p._value_bytes = sl
                         except Exception:
                             pass
                         parameters.append(p)
@@ -3403,6 +3533,9 @@ class AoiBuilder(L5xElementBuilder):
                             lt._data_types_map = self._data_types_map
                             lt._taginfo_layout = self._taginfo_layout
                             lt._short_header = self._short_header
+                            sl = _member_slice(lt.name, lt.data_type)
+                            if sl is not None:
+                                lt._value_bytes = sl
                         except Exception:
                             pass
                         local_tags.append(lt)
