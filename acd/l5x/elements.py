@@ -2139,49 +2139,46 @@ class ModuleBuilder(L5xElementBuilder):
 
         return (None, "")
 
-    def _ports_from_data_collection(self, own_ip: str) -> "Union[str, None]":
+    def _ports_from_data_collection(self, data_link: int) -> "Union[str, None]":
         """Build the <Ports> block from the module's RxDataCollection topology blob.
 
-        Each Ethernet-addressed module has a hash-named RxDataCollection child
-        whose record carries a plaintext ``<in><Port .../>...</in>`` blob with the
-        real port topology (which the static PORT_STRUCTURES catalog does not
-        cover). The module's OWN IP (e1[0x30], the device-network address) appears
-        as the Address of exactly one blob's Ethernet port, so it is a clean 1:1
-        link key. ``own_ip`` must be the module's own address, NOT the
-        _ip_from_data_collection fallback (that resolves a shared upstream-bridge
-        IP and would mislink many modules onto one blob).
+        Every module stores, at e1[0x24] (u32), the comment_id of its backing
+        RxDataCollection child; that child's record carries a plaintext
+        ``<in><Port .../>...</in>`` blob with the real port topology (which the
+        static PORT_STRUCTURES catalog does not cover). comment_id is unique among
+        the blob-bearing children, so this is an exact 1:1 link -- it works for
+        every module type (Ethernet drives, drive peripherals, PointIO adapters,
+        backplane bridges), unlike an IP/slot heuristic which mislinks name-less
+        peripherals that share a bus address across different parents.
 
-        Modules without their own IP -- drive peripherals, PointIO adapters on a
-        bridge, local backplane bridges/cards -- are left to the static-catalog
-        fallback (they stay as today rather than risk a wrong link). Returns the
-        rendered ``<Ports>...</Ports>`` string, or None to fall back.
+        ``data_link`` is e1[0x24]. Modules whose link resolves to a child with no
+        ``<in>`` blob (the controller and local-chassis cards, whose single ICP
+        port is implied by slot and not stored) fall back to the static catalog.
+        Returns the rendered ``<Ports>...</Ports>`` string, or None to fall back.
         """
-        if not own_ip:
+        if not data_link:
             return None
-        self._cur.execute(
-            "SELECT object_id FROM comps WHERE comp_name='RxDataCollection' LIMIT 1"
-        )
-        row = self._cur.fetchone()
-        if not row:
+        # Blob children of every RxDataCollection, keyed by comment_id (u16 @ rec[12]).
+        self._cur.execute("SELECT object_id FROM comps WHERE comp_name='RxDataCollection'")
+        coll_oids = [r[0] for r in self._cur.fetchall()]
+        if not coll_oids:
             return None
-        self._cur.execute("SELECT record FROM comps WHERE parent_id=?", (row[0],))
-        needle = f'Addr="{own_ip}"'
-        blobs = []
-        for (raw,) in self._cur.fetchall():
-            raw = bytes(raw)
-            i = raw.find(b"<in")
-            if i < 0:
-                continue
-            j = raw.find(b"</in>", i)
-            if j < 0:
-                continue
-            blob = raw[i:j + 5].decode("latin-1", errors="replace")
-            if needle in blob:
-                blobs.append(blob)
-        # Require an unambiguous match: exactly one blob (or identical duplicates).
-        if len(set(blobs)) != 1:
-            return None
-        return self._decode_ports_blob(blobs[0])
+        for coll_oid in coll_oids:
+            self._cur.execute("SELECT record FROM comps WHERE parent_id=?", (coll_oid,))
+            for (raw,) in self._cur.fetchall():
+                raw = bytes(raw)
+                if len(raw) < 14:
+                    continue
+                if int.from_bytes(raw[12:14], "little") != (data_link & 0xFFFF):
+                    continue
+                i = raw.find(b"<in")
+                if i < 0:
+                    continue
+                j = raw.find(b"</in>", i)
+                if j < 0:
+                    continue
+                return self._decode_ports_blob(raw[i:j + 5].decode("latin-1", errors="replace"))
+        return None
 
     @staticmethod
     def _decode_ports_blob(blob: str) -> "Union[str, None]":
@@ -2202,6 +2199,12 @@ class ModuleBuilder(L5xElementBuilder):
         for m in _re.finditer(r'<Port\b([^>]*?)(/?)>', blob):
             a = dict(_re.findall(r'(\w+)="([^"]*)"', m.group(1)))
             pid = a.get("Id")
+            # A real port always has an Id. Blobs without one (seen on some V10/V11
+            # controller/CPU records) use a structure this decoder does not model;
+            # bail out so the caller falls back to the static catalog rather than
+            # emit an Id="None" port the reference never has.
+            if pid is None:
+                return None
             ptype = type_map.get(a.get("Type"), a.get("Type"))
             addr = a.get("Addr")
             upstream = "false" if a.get("Ups") == "False" else "true"
@@ -2444,8 +2447,15 @@ class ModuleBuilder(L5xElementBuilder):
             _opc_ua = False
 
         # Real port topology from the RxDataCollection blob (preferred over the
-        # static catalog). None when no unambiguous blob links.
-        ports_override = self._ports_from_data_collection(own_ip)
+        # static catalog). e1[0x24] is the comment_id of the module's backing
+        # RxDataCollection child (a 1:1 link); None when it has no <in> blob.
+        # The root controller is left to the static-catalog path: its blob uses
+        # abbreviated CompactLogix port types (Cpt35E, Cpt32EN, ...) and a chassis
+        # bus this decoder does not model, and PORT_STRUCTURES already covers CPUs.
+        ports_override = None
+        if major_fault != "true":
+            data_link = struct.unpack("<I", e1[0x24:0x28])[0] if len(e1) >= 0x28 else 0
+            ports_override = self._ports_from_data_collection(data_link)
 
         return Module(
             name,           # L5xElement._name (private)
