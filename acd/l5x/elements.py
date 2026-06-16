@@ -1050,6 +1050,10 @@ class Module(L5xElement):
     _backplane_slot: Union[int, None] = field(default=None)
     _chassis_size: Union[int, None] = field(default=None)
     _port_child_counts: Dict[int, int] = field(default_factory=dict)
+    # Pre-rendered <Ports> XML decoded from the module's RxDataCollection topology
+    # blob (see ModuleBuilder._ports_from_data_collection). When set it replaces
+    # the static PORT_STRUCTURES path; None falls back to that path.
+    _ports_override: Union[str, None] = field(default=None)
     # Communications / ExtendedProperties / Description (optional)
     _description: str = field(default="")
     _comm_method: Union[str, None] = field(default=None)
@@ -1142,6 +1146,10 @@ class Module(L5xElement):
         Looks up the port structure from PORT_STRUCTURES by (vendor, product_type,
         product_code). Falls back to <Ports/> if the catalog number is not in the table.
         """
+        # Prefer the real per-module topology decoded from RxDataCollection when
+        # available; the static catalog covers only CPUs/EN bridges.
+        if self._ports_override is not None:
+            return self._ports_override
         key = (self.vendor, self.product_type, self.product_code)
         port_defs = PORT_STRUCTURES.get(key)
         if port_defs is None:
@@ -2131,6 +2139,95 @@ class ModuleBuilder(L5xElementBuilder):
 
         return (None, "")
 
+    def _ports_from_data_collection(self, own_ip: str) -> "Union[str, None]":
+        """Build the <Ports> block from the module's RxDataCollection topology blob.
+
+        Each Ethernet-addressed module has a hash-named RxDataCollection child
+        whose record carries a plaintext ``<in><Port .../>...</in>`` blob with the
+        real port topology (which the static PORT_STRUCTURES catalog does not
+        cover). The module's OWN IP (e1[0x30], the device-network address) appears
+        as the Address of exactly one blob's Ethernet port, so it is a clean 1:1
+        link key. ``own_ip`` must be the module's own address, NOT the
+        _ip_from_data_collection fallback (that resolves a shared upstream-bridge
+        IP and would mislink many modules onto one blob).
+
+        Modules without their own IP -- drive peripherals, PointIO adapters on a
+        bridge, local backplane bridges/cards -- are left to the static-catalog
+        fallback (they stay as today rather than risk a wrong link). Returns the
+        rendered ``<Ports>...</Ports>`` string, or None to fall back.
+        """
+        if not own_ip:
+            return None
+        self._cur.execute(
+            "SELECT object_id FROM comps WHERE comp_name='RxDataCollection' LIMIT 1"
+        )
+        row = self._cur.fetchone()
+        if not row:
+            return None
+        self._cur.execute("SELECT record FROM comps WHERE parent_id=?", (row[0],))
+        needle = f'Addr="{own_ip}"'
+        blobs = []
+        for (raw,) in self._cur.fetchall():
+            raw = bytes(raw)
+            i = raw.find(b"<in")
+            if i < 0:
+                continue
+            j = raw.find(b"</in>", i)
+            if j < 0:
+                continue
+            blob = raw[i:j + 5].decode("latin-1", errors="replace")
+            if needle in blob:
+                blobs.append(blob)
+        # Require an unambiguous match: exactly one blob (or identical duplicates).
+        if len(set(blobs)) != 1:
+            return None
+        return self._decode_ports_blob(blobs[0])
+
+    @staticmethod
+    def _decode_ports_blob(blob: str) -> "Union[str, None]":
+        """Render an ``<in>`` topology blob into an L5X ``<Ports>`` block.
+
+        Rules (validated byte-for-byte against the reference): Type EN->Ethernet,
+        others verbatim (ICP/DSI/SERCOS/5069); Upstream is false only when the
+        blob port carries ``Ups="False"`` (absent => upstream true); Address is the
+        ``Addr`` attribute (omitted when absent, e.g. a SERCOS motion port); a
+        port followed by ``<Bus Size="N"/>`` emits ``<Bus Size="N"/>`` (the Max
+        attribute is dropped); a Bus without a Size, and a downstream Ethernet
+        bridge port with no Bus, emit an empty ``<Bus/>``; the ``<CF>`` element is
+        dropped. Returns None when the blob has no ports.
+        """
+        import re as _re
+        type_map = {"EN": "Ethernet"}
+        ports = []
+        for m in _re.finditer(r'<Port\b([^>]*?)(/?)>', blob):
+            a = dict(_re.findall(r'(\w+)="([^"]*)"', m.group(1)))
+            pid = a.get("Id")
+            ptype = type_map.get(a.get("Type"), a.get("Type"))
+            addr = a.get("Addr")
+            upstream = "false" if a.get("Ups") == "False" else "true"
+            bus = None
+            if m.group(2) != "/":
+                rest = blob[m.end():]
+                nxt = _re.search(r'<Port\b|</in>', rest)
+                seg = rest[:nxt.start()] if nxt else rest
+                bm = _re.search(r'<Bus\b([^>]*)>', seg)
+                if bm:
+                    ba = dict(_re.findall(r'(\w+)="([^"]*)"', bm.group(1)))
+                    bus = ba.get("Size") if ba.get("Size") is not None else ""
+            if bus is None and upstream == "false" and ptype == "Ethernet":
+                bus = ""
+            addr_attr = f' Address="{addr}"' if addr is not None else ""
+            head = f'<Port Id="{pid}"{addr_attr} Type="{ptype}" Upstream="{upstream}"'
+            if bus is None:
+                ports.append(f"{head}/>\n")
+            elif bus == "":
+                ports.append(f"{head}>\n<Bus/>\n</Port>\n")
+            else:
+                ports.append(f'{head}>\n<Bus Size="{bus}"/>\n</Port>\n')
+        if not ports:
+            return None
+        return f'<Ports>\n{"".join(ports)}</Ports>\n'
+
     def _chassis_size_from_data_collection(self) -> "Union[int, None]":
         """Read the local backplane Bus Size from the RxDataCollection record for the CPU.
 
@@ -2237,11 +2334,12 @@ class ModuleBuilder(L5xElementBuilder):
         # that connect via Ethernet upstream (parent_port == 2). Local backplane bridge
         # modules (parent_port == 1, e.g. local EN2T) leave e1[0x32] zero — their IP is
         # stored as XML in a child of RxDataCollection, keyed by ICP slot number.
-        ip_address = ""
+        own_ip = ""
         if len(e1) > 0x32:
             ip_len = struct.unpack("<H", e1[0x30:0x32])[0]
             if ip_len:
-                ip_address = e1[0x32:0x32 + ip_len].rstrip(b"\x00").decode("ascii", errors="replace")
+                own_ip = e1[0x32:0x32 + ip_len].rstrip(b"\x00").decode("ascii", errors="replace")
+        ip_address = own_ip
         if not ip_address and slot:
             ip_address = self._ip_from_data_collection(slot)
 
@@ -2345,6 +2443,10 @@ class ModuleBuilder(L5xElementBuilder):
         except Exception:
             _opc_ua = False
 
+        # Real port topology from the RxDataCollection blob (preferred over the
+        # static catalog). None when no unambiguous blob links.
+        ports_override = self._ports_from_data_collection(own_ip)
+
         return Module(
             name,           # L5xElement._name (private)
             name,           # Module.name
@@ -2363,6 +2465,7 @@ class ModuleBuilder(L5xElementBuilder):
             _ip_address=ip_address,
             _backplane_slot=backplane_slot,
             _chassis_size=chassis_size,
+            _ports_override=ports_override,
             _description=description,
             _comm_method=comm_method,
             _connections=connections,
