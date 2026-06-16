@@ -695,11 +695,13 @@ def _struct_member_layout(dt_name: str, data_types_map: Dict
     return out
 
 
-def _decorated_scalar(dt_base: str, value_text: str) -> str:
-    radix = _RADIX.get(dt_base, "Decimal")
+def _decorated_scalar(dt_base: str, value_text: str,
+                      radix: Optional[str] = None) -> str:
+    eff = radix if (radix and radix not in ("NullType", "General")) \
+        else _RADIX.get(dt_base, "Decimal")
     if dt_base == "BOOL":
         return f'<DataValue DataType="BOOL" Radix="Decimal" Value="{value_text}"/>'
-    return f'<DataValue DataType="{dt_base}" Radix="{radix}" Value="{value_text}"/>'
+    return f'<DataValue DataType="{dt_base}" Radix="{eff}" Value="{value_text}"/>'
 
 
 def _decorated_struct(dt_name: str, image: bytes, data_types_map: Dict) -> Optional[str]:
@@ -741,29 +743,48 @@ def _decorated_struct(dt_name: str, image: bytes, data_types_map: Dict) -> Optio
 
 
 def render_decorated(dt_base: str, dimensions: Optional[str], image: bytes,
-                     data_types_map: Dict) -> Optional[str]:
-    """Return the inner XML for <Data Format="Decorated">, or None if unsupported."""
+                     data_types_map: Dict, radix: Optional[str] = None
+                     ) -> Optional[str]:
+    """Return the inner XML for <Data Format="Decorated">, or None if unsupported.
+
+    ``radix`` is the tag's declared Radix (best-effort; default None keeps today's
+    per-type default). Integer atomics honour it (Binary/Hex/Octal/ASCII) via
+    _format_int_radix; REAL/LREAL stay on the float formatter; BOOL stays Decimal.
+    When radix is absent/Decimal the output is byte-identical to the prior code.
+    """
     total, dim_parts = _dims_total(dimensions)
 
     if dt_base in _ATOMIC:
-        width, _ = _ATOMIC[dt_base]
+        width, fmt = _ATOMIC[dt_base]
+        if dt_base in ("BOOL", "BIT"):
+            eff = "Decimal"
+        else:
+            eff = radix if (radix and radix not in ("NullType", "General")) \
+                else _RADIX.get(dt_base, "Decimal")
+
+        def _val(off: int) -> str:
+            if dt_base in ("REAL", "LREAL"):
+                return _atomic_text_decorated(dt_base, image[off:off + width])
+            v = struct.unpack_from(fmt, image, off)[0]
+            if dt_base in ("BOOL", "BIT"):
+                return "1" if v else "0"
+            return _format_int_radix(dt_base, v, width, eff)
+
         if total == 0:
             if len(image) < width:
                 return None
-            return _decorated_scalar(dt_base, _atomic_text_decorated(dt_base, image[:width]))
+            return _decorated_scalar(dt_base, _val(0), eff)
         # atomic array
-        radix = _RADIX.get(dt_base, "Decimal")
         elems = []
         for i in range(total):
             off = i * width
             if off + width > len(image):
                 return None
             elems.append(
-                f'<Element Index="{_index_str(i, dim_parts)}" '
-                f'Value="{_atomic_text_decorated(dt_base, image[off:off+width])}"/>'
+                f'<Element Index="{_index_str(i, dim_parts)}" Value="{_val(off)}"/>'
             )
         dim_str = ",".join(str(d) for d in dim_parts)
-        return (f'<Array DataType="{dt_base}" Dimensions="{dim_str}" Radix="{radix}">'
+        return (f'<Array DataType="{dt_base}" Dimensions="{dim_str}" Radix="{eff}">'
                 f'{"".join(elems)}</Array>')
 
     # Scalar struct (built-in only for now)
@@ -794,6 +815,30 @@ def render_decorated(dt_base: str, dimensions: Optional[str], image: bytes,
 _DEFAULT_RADIX: Dict[str, str] = dict(_RADIX)
 
 
+def _sint_char_escape(ch: int) -> str:
+    """L5K single-byte char escape for one SINT ASCII array/scalar element.
+
+    Mirrors :func:`_ascii_string_cdata` but for a single byte: printable ASCII
+    passes through, the named control mnemonics use ``$t/$l/$p/$r`` and ``$$``/
+    ``$'``, everything else is ``$XX`` (uppercase hex).
+    """
+    if ch == 0x24:           # '$'
+        return "$$"
+    if ch == 0x27:           # "'"
+        return "$'"
+    if ch == 0x09:
+        return "$t"
+    if ch == 0x0A:
+        return "$l"
+    if ch == 0x0C:
+        return "$p"
+    if ch == 0x0D:
+        return "$r"
+    if 0x20 <= ch < 0x7F:
+        return chr(ch)
+    return "$%02X" % ch
+
+
 def _format_int_radix(dt: str, val: int, width: int, radix: Optional[str]) -> str:
     """Format an integer value honoring its Logix Radix string."""
     if radix == "Binary":
@@ -811,7 +856,10 @@ def _format_int_radix(dt: str, val: int, width: int, radix: Optional[str]) -> st
     if radix == "Octal":
         u = val & ((1 << (width * 8)) - 1)
         return "8#" + format(u, "o")
-    # Decimal / ASCII / anything else -> signed decimal
+    if radix == "ASCII":
+        # One char literal per element: OEM writes Value="&apos;$00&apos;".
+        return "&apos;" + _sint_char_escape(val & 0xFF) + "&apos;"
+    # Decimal / anything else -> signed decimal
     return str(val)
 
 
@@ -1133,12 +1181,15 @@ def _struct_stride(dt_name: str, layout_map: Dict, data_types_map: Dict
 
 
 def render_decorated_layout(dt_base: str, dimensions: Optional[str], image: bytes,
-                            layout_map: Dict, data_types_map: Dict) -> Optional[str]:
+                            layout_map: Dict, data_types_map: Dict,
+                            radix: Optional[str] = None) -> Optional[str]:
     """Layout-driven Decorated rendering (Step 6d). Returns inner XML or None.
 
     Falls back (returns None) for anything it cannot decode so the caller keeps
     today's behaviour. Handles: atomic scalar/array (delegated), and struct /
     array-of-struct using the TagInfo byte-offset map for full member fidelity.
+    ``radix`` is the tag's declared Radix, threaded to the atomic delegation so a
+    top-level Binary/Hex/ASCII array honours it (struct members carry their own).
     """
     if not layout_map:
         return None
@@ -1146,7 +1197,8 @@ def render_decorated_layout(dt_base: str, dimensions: Optional[str], image: byte
 
     # Atomic scalar/array: the existing path is already correct & byte-faithful.
     if dt_base in _ATOMIC:
-        return render_decorated(dt_base, dimensions, image, data_types_map)
+        return render_decorated(dt_base, dimensions, image, data_types_map,
+                                radix=radix)
 
     # Struct datatype must be present in the layout map.
     if dt_base.upper() not in layout_map:

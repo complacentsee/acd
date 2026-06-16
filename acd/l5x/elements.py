@@ -785,13 +785,15 @@ class Tag(L5xElement):
                     try:
                         decorated_inner = _tag_value.render_decorated_layout(
                             dt_decorated, self.dimensions, self._value_bytes,
-                            self._taginfo_layout, self._data_types_map
+                            self._taginfo_layout, self._data_types_map,
+                            radix=self.radix
                         )
                     except Exception:
                         decorated_inner = None
                 if decorated_inner is None:
                     decorated_inner = _tag_value.render_decorated(
-                        dt_base, self.dimensions, self._value_bytes, self._data_types_map
+                        dt_base, self.dimensions, self._value_bytes,
+                        self._data_types_map, radix=self.radix
                     )
                 if self._short_header:
                     first = "<Data>" + _tag_value.render_hex(self._value_bytes) + "</Data>"
