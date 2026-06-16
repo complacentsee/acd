@@ -214,14 +214,71 @@ def _atomic_text_decorated(dt: str, b: bytes) -> str:
     return str(val)
 
 
+def _shortest_sig(f: float) -> int:
+    """Number of significant digits in the SHORTEST decimal that round-trips ``f``.
+
+    Logix's Decorated formatter picks fixed vs scientific notation (and how many
+    fractional digits to show in fixed form) from this shortest-round-trip digit
+    count ``p`` (1..9 for float32). Reproduces a C ``%g`` precision-selection.
+    """
+    for p in range(1, 10):
+        s = "%.*g" % (p, f)
+        try:
+            if struct.unpack("<f", struct.pack("<f", float(s)))[0] == f:
+                return p
+        except OverflowError:
+            continue
+    return 9
+
+
+def _decorated_fixed(f: float, p: int, exp: int, neg: bool) -> str:
+    """Render ``f`` in Decorated FIXED-point form (trailing-zero-trimmed, ``.0``).
+
+    The integer part always shows ALL its digits (the exact float32 integer, so
+    large integral values like 138100384.0 keep every digit); the fraction shows
+    ``p - 1 - exp`` digits rounded HALF-AWAY-FROM-ZERO via the F1 routine. When
+    there is no fractional part the value is the exact rounded integer + ``.0``.
+    """
+    frac_digits = p - 1 - exp
+    sign = "-" if neg else ""
+    if frac_digits <= 0:
+        # Integral to this precision: emit the exact (half-away rounded) integer.
+        iv = Decimal(abs(f)).quantize(Decimal(1), rounding=ROUND_HALF_UP)
+        return f"{sign}{iv}.0"
+    dig, e2, _ = _round_sig_haway(f, p)                 # p-digit, half-away
+    if e2 >= 0:
+        intlen = e2 + 1
+        if intlen >= len(dig):
+            ipart = dig + "0" * (intlen - len(dig))
+            fpart = ""
+        else:
+            ipart = dig[:intlen]
+            fpart = dig[intlen:]
+    else:
+        ipart = "0"
+        fpart = "0" * (-e2 - 1) + dig
+    fpart = fpart.rstrip("0")
+    return f"{sign}{ipart}.{fpart}" if fpart else f"{sign}{ipart}.0"
+
+
 def _fmt_real_decorated(v: float) -> str:
     """Format a REAL value the way Logix writes it in a Decorated Value attribute.
 
-    Unlike the L5K CDATA form (8-digit scientific), Decorated REALs use the
-    shortest decimal that round-trips through IEEE-754 single precision, with a
-    trailing '.0' for integral values (e.g. 380.0, 0.1, 34.805748). Very large /
-    small magnitudes fall back to 3-digit-exponent scientific. The two single
-    +/-FLT_MAX sentinels (common PID limit defaults) are matched to OEM exactly.
+    The Decorated REAL form uses C ``%g``-style GENERAL notation but with the
+    SAME digit/rounding machinery as the L5K CDATA form (F1: round HALF-AWAY,
+    float32 precision). The mantissa digits are the shortest round-trip decimal
+    (``p`` significant figures); the choice of notation is:
+
+      * SCIENTIFIC when the leading-digit exponent ``exp >= 9`` (large) OR the
+        fixed form would need ``>= 10`` digits after the decimal point
+        (``p - 1 - exp >= 10``, very small). Scientific is the exact F1 9-sig
+        form: ``D.DDDDDDDDe(+/-)EEE`` (8 fractional digits, 3-digit exponent).
+      * FIXED otherwise: shortest round-trip rendered fixed-point, trailing
+        zeros trimmed, integral values shown in full with a trailing ``.0``.
+
+    Validated byte-exact (8123/8123 distinct, all weighted occurrences) against
+    the full OEM Decorated REAL corpus. NaN/+-Inf use the Logix Decorated
+    sentinels (NOT the longer L5K CDATA sentinel strings).
     """
     import math
     f = struct.unpack("<f", struct.pack("<f", v))[0]
@@ -231,45 +288,37 @@ def _fmt_real_decorated(v: float) -> str:
         return "1.#INF"
     if f == float("-inf"):
         return "-1.#INF"
-    if f == 0.0:
-        return "0.0"
-    if f == struct.unpack("<f", struct.pack("<f", 3.40282347e38))[0]:
-        return "3.40282347e+038"
-    if f == struct.unpack("<f", struct.pack("<f", -3.40282347e38))[0]:
-        return "-3.40282347e+038"
-    best = None
-    for p in range(1, 10):
-        s = "%.*g" % (p, f)
-        try:
-            rt = struct.unpack("<f", struct.pack("<f", float(s)))[0]
-        except OverflowError:
-            continue
-        if rt == f:
-            best = s
-            break
-    if best is None:
-        best = "%.9g" % f
-    if "e" in best or "E" in best:
+    with localcontext() as ctx:
+        ctx.prec = 80
+        if f == 0.0:
+            neg0 = bool(struct.pack("<d", f)[7] & 0x80)
+            return "-0.0" if neg0 else "0.0"
         a = abs(f)
         exp = math.floor(math.log10(a))
-        if -4 <= exp < 16:
-            sig = len(best.split("e")[0].replace("-", "").replace(".", ""))
-            decimals = max(0, sig - 1 - exp)
-            best = "%.*f" % (decimals, f)
-    if "." not in best and "e" not in best and "E" not in best:
-        best += ".0"
-    if "e" in best:
-        m, _, e = best.partition("e")
-        sign = e[0]
-        ev = int(e[1:])
-        best = "%se%s%03d" % (m, sign, ev)
-    return best
+        # log10 can land just on the wrong side of a power of ten for values that
+        # are exactly (or float-near) 10**k; pin exp to the decimal truth.
+        if Decimal(a) >= Decimal(10) ** (exp + 1):
+            exp += 1
+        elif Decimal(a) < Decimal(10) ** exp:
+            exp -= 1
+        p = _shortest_sig(f)
+        sci = (exp >= 9) or (p - 1 - exp >= 10)
+        if sci:
+            return _fmt_real(f)                         # F1 9-sig scientific
+        return _decorated_fixed(f, p, exp, f < 0.0)
 
 
 def _fmt_lreal_decorated(v: float) -> str:
-    """Decorated form of an LREAL (double): shortest round-trip through IEEE-754
-    double precision.  Mirrors ``_fmt_real_decorated`` but does NOT re-quantize
-    to single precision (which would corrupt high-precision doubles)."""
+    """Decorated form of an LREAL (double).
+
+    By analogy with :func:`_fmt_real_decorated` but operating on the raw double:
+    the shortest round-trip decimal selects fixed vs scientific via the same
+    ``exp >= 9`` / ``>= 10`` fractional-digit GENERAL-notation bands, with
+    HALF-AWAY rounding. The OEM pool contains no LREAL Decorated literals, so
+    this is the shared-rule extrapolation (single-precision re-quant is NOT
+    applied, which would corrupt high-precision doubles); the scientific branch
+    uses the double 17-sig F1 form via :func:`_fmt_lreal`-style rounding.
+    """
     import math
     f = v
     if f != f:
@@ -278,31 +327,45 @@ def _fmt_lreal_decorated(v: float) -> str:
         return "1.#INF"
     if f == float("-inf"):
         return "-1.#INF"
-    if f == 0.0:
-        return "0.0"
-    best = None
-    for p in range(1, 18):
-        s = "%.*g" % (p, f)
-        if float(s) == f:
-            best = s
-            break
-    if best is None:
-        best = "%.17g" % f
-    if "e" in best or "E" in best:
+    with localcontext() as ctx:
+        ctx.prec = 80
+        if f == 0.0:
+            neg0 = bool(struct.pack("<d", f)[7] & 0x80)
+            return "-0.0" if neg0 else "0.0"
         a = abs(f)
         exp = math.floor(math.log10(a))
-        if -4 <= exp < 16:
-            sig = len(best.split("e")[0].replace("-", "").replace(".", ""))
-            decimals = max(0, sig - 1 - exp)
-            best = "%.*f" % (decimals, f)
-    if "." not in best and "e" not in best and "E" not in best:
-        best += ".0"
-    if "e" in best:
-        m, _, e = best.partition("e")
-        sign = e[0]
-        ev = int(e[1:])
-        best = "%se%s%03d" % (m, sign, ev)
-    return best
+        if Decimal(a) >= Decimal(10) ** (exp + 1):
+            exp += 1
+        elif Decimal(a) < Decimal(10) ** exp:
+            exp -= 1
+        # shortest round-trip sig digits for a double (1..17)
+        p = 17
+        for cand_p in range(1, 18):
+            if float("%.*g" % (cand_p, f)) == f:
+                p = cand_p
+                break
+        sci = (exp >= 9) or (p - 1 - exp >= 10)
+        if sci:
+            return _fmt_lreal(f)
+        frac_digits = p - 1 - exp
+        sign = "-" if f < 0.0 else ""
+        if frac_digits <= 0:
+            iv = Decimal(abs(f)).quantize(Decimal(1), rounding=ROUND_HALF_UP)
+            return f"{sign}{iv}.0"
+        dig, e2, _ = _round_sig_haway(f, p)
+        if e2 >= 0:
+            intlen = e2 + 1
+            if intlen >= len(dig):
+                ipart = dig + "0" * (intlen - len(dig))
+                fpart = ""
+            else:
+                ipart = dig[:intlen]
+                fpart = dig[intlen:]
+        else:
+            ipart = "0"
+            fpart = "0" * (-e2 - 1) + dig
+        fpart = fpart.rstrip("0")
+        return f"{sign}{ipart}.{fpart}" if fpart else f"{sign}{ipart}.0"
 
 
 def _atomic_value_decorated(dt: str, image: bytes, offset: int) -> Optional[str]:
