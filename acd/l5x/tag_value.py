@@ -783,9 +783,17 @@ def _radix_for(member_dt: str, def_radix: Optional[str]) -> Optional[str]:
 def _resolve_layout(dt_name: str, layout_map: Dict, data_types_map: Dict):
     """Return the ordered member layout for a struct datatype, or None.
 
-    Each entry: (name, member_dt_upper, byte_offset, bit_or_None, hidden_bool,
+    Each entry: (name, member_dt, byte_offset, bit_or_None, hidden_bool,
     dims_list_or_None, def_radix_or_None). def_radix comes from data_types_map
     when available (TagInfo.XML carries no Radix attribute).
+
+    ``member_dt`` keeps the datatype's DECLARED case (e.g. ``UDT_MixedCase``)
+    because it is written verbatim into the rendered ``DataType`` attribute, and
+    Logix preserves project case there. Every consumer that uses it as a lookup
+    KEY or atomic-classification test upper-cases at the boundary (layout_map /
+    data_types_map / @size@ keys all key on the upper form; the _ATOMIC/BOOL
+    membership tests are satisfied because atomic type names are canonically
+    all-caps), so resolution is unchanged — only the emitted string keeps case.
     """
     members = layout_map.get(dt_name.upper())
     if not members:
@@ -798,7 +806,7 @@ def _resolve_layout(dt_name: str, layout_map: Dict, data_types_map: Dict):
             radix_by_name[m.name] = getattr(m, "radix", None)
     out = []
     for (name, mdt, off, bit, hidden, dims) in members:
-        out.append((name, mdt.upper(), off, bit, hidden, dims,
+        out.append((name, mdt, off, bit, hidden, dims,
                     radix_by_name.get(name)))
     return out
 

@@ -756,12 +756,15 @@ class Tag(L5xElement):
         # target). Suppress all data emission when this is an alias.
         is_alias = self.tag_type == "Alias" or self.alias_for is not None
         dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
-        # Module I/O types keep their ORIGINAL case in the <Structure DataType=...>
-        # attribute (OEM writes AB:Embedded_IQ16F:C:0, not the uppercased form the
-        # generic-tag path uses). render_decorated_layout uppercases internally for
-        # the layout lookup, so passing the original-case name is safe and keeps
-        # the Structure attribute byte-faithful. Non-IO tags are unchanged.
-        dt_decorated = (self.data_type.split("[")[0] if (self._io and self.data_type) else dt_base)
+        # The rendered <Structure DataType=...> attribute keeps the datatype's
+        # DECLARED case (OEM writes UDT_MixedCase / AB:Embedded_IQ16F:C:0, not the
+        # uppercased form). render_decorated_layout/render_l5k_layout uppercase
+        # internally for the layout lookup, so passing the original-case name is
+        # safe and keeps the Structure attribute byte-faithful for ALL struct tags
+        # (predefined/built-in types are declared all-caps, so they are unchanged).
+        # dt_base (uppercased) is still the lookup key for the _SKIP_DECORATED /
+        # STRING tests and the non-layout fallback paths below.
+        dt_decorated = self.data_type.split("[")[0] if self.data_type else dt_base
 
         # --- Step 6c: real value <Data> from the design-value image (0x66) ---
         # When the value reader returned an image, emit BOTH the OEM blocks Logix
