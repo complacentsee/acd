@@ -8,10 +8,135 @@ from kaitaistruct import KaitaiStream
 
 from acd.generated.comps.fafa_comps import FafaComps
 from acd.generated.comps.fdfd_comps import FdfdComps
+from acd.record._aes import AES
 
 # Comps record identifiers (little-endian u16).
 _FAFA_IDENTIFIER = 64250  # 0xFAFA primary records
 _FDFD_IDENTIFIER = 65021  # 0xFDFD secondary / sub records
+
+# --- Source-protection-at-rest (V24 "source-protected" projects) -------------
+# A source-protected project keeps each comps record's main_record PLAINTEXT but
+# AES-256-CBC encrypts the extended-attribute tail (which carries the value
+# backing's 0x66 design value). The encrypted tail replaces the plaintext
+# len_record/count_record at body+78 with a fixed marker + 14-byte framing; the
+# ciphertext starts at marker+18 and is a whole number of 16-byte blocks. The
+# decrypted plaintext is the ordinary ext-attr table: u32 attr-count then
+# (u32 attribute_id, u32 len_value, len_value bytes) records.
+#
+# IV = 16 zero bytes; KEY = SHA256(keymatl_N) for the public Rockwell source-
+# protection key material (configs from skdatmonster/DecryptSourceProtection).
+# The config is project-wide, so the first key that validates is cached and tried
+# first thereafter. Tried in the order configs are seen in practice.
+_SP_MARKER = b"\xaa\x96\xaa\x0a"
+_SP_CT_OFFSET = 18  # ciphertext starts marker_index + 18
+# (config_number, AES-256 key = SHA256(keymatl_config)).
+_SP_KEYS = [
+    (7, bytes.fromhex("1bac9fc4fe56e90b3467ade286dc75e35e1bd7520887ebd68ca6861c4dde8966")),
+    (5, bytes.fromhex("42b572526846f3ed853c8428dad960c7c9c6827d4818f8ff8ea9d24af0ed2b58")),
+    (3, bytes.fromhex("a082ef440f1659d637bce1e0181a86e05b9bf7561bdc0d0f726c48b4e75c5ddc")),
+    (6, bytes.fromhex("08de99aef6d12ed4b92be37f042a237add19d8d7e15ce2eae88d645288e97cb2")),
+    (8, bytes.fromhex("19927a3e5b1eff2c11dd6e7cee9b0c889e3258a339a2c63c5e0b2835402588c7")),
+]
+_SP_AES_CACHE: dict = {}          # config -> AES instance (lazy key expansion)
+_SP_KEY_HINT: list = [None]       # winning config for this process, tried first
+
+
+def _sp_aes(config: int, key: bytes) -> AES:
+    aes = _SP_AES_CACHE.get(config)
+    if aes is None:
+        aes = AES(key)
+        _SP_AES_CACHE[config] = aes
+    return aes
+
+
+def _sp_cbc(ciphertext: bytes, aes: AES, nblocks: int) -> bytes:
+    """Decrypt the first ``nblocks`` CBC blocks (IV=0) of ``ciphertext``."""
+    out = bytearray()
+    prev = b"\x00" * 16
+    for i in range(nblocks):
+        blk = ciphertext[i * 16:i * 16 + 16]
+        out += bytes(x ^ y for x, y in zip(aes.decrypt_block(blk), prev))
+        prev = blk
+    return bytes(out)
+
+
+def _sp_walk(pt: bytes) -> Optional[dict]:
+    """Parse a decrypted ext-attr table ``[u32 count][(u32 id,u32 len,bytes)...]``.
+
+    Returns the {attribute_id: bytes} dict, or None if the layout is structurally
+    invalid (used to reject a wrong decryption key).
+    """
+    if len(pt) < 4:
+        return None
+    count = int.from_bytes(pt[0:4], "little")
+    if not (0 < count < 256):
+        return None
+    out: dict = {}
+    pos = 4
+    for _ in range(count):
+        if pos + 8 > len(pt):
+            break  # truncated (we only decrypted up to the wanted attr)
+        aid = int.from_bytes(pt[pos:pos + 4], "little")
+        ln = int.from_bytes(pt[pos + 4:pos + 8], "little")
+        pos += 8
+        if ln > len(pt) or pos + ln > len(pt):
+            break
+        out[aid] = pt[pos:pos + ln]
+        pos += ln
+    return out
+
+
+def _decrypt_value_attrs(ciphertext: bytes, full: bool = False) -> dict:
+    """Decrypt a source-protected ext-attr tail to {attribute_id: bytes}.
+
+    Picks the project's source-protection key by a cheap one-block validation
+    (the table always begins ``count, attr 0x01, ...``), caching the winning
+    config. By default decrypts only as far as the design value (0x66) so a large
+    array backing does not pay for full decryption; pass ``full=True`` to decrypt
+    the WHOLE table (needed for datatype records, whose member descriptors live in
+    attrs 0x6E.. after 0x66). Returns {} when no key validates (e.g. a coincidental
+    marker in a non-protected record).
+    """
+    nblocks_total = len(ciphertext) // 16
+    if nblocks_total == 0:
+        return {}
+    order = list(_SP_KEYS)
+    hint = _SP_KEY_HINT[0]
+    if hint is not None:
+        order.sort(key=lambda kv: 0 if kv[0] == hint else 1)
+    for config, key in order:
+        aes = _sp_aes(config, key)
+        head = _sp_cbc(ciphertext, aes, 1)
+        # Validate: a real ext-attr table starts with a sane count and attr 0x01.
+        if len(head) < 8:
+            continue
+        count = int.from_bytes(head[0:4], "little")
+        first_id = int.from_bytes(head[4:8], "little")
+        if not (0 < count < 256) or first_id != 0x01:
+            continue
+        _SP_KEY_HINT[0] = config
+        if full:
+            # Whole-table mode: decrypt every block once, then walk once. (The
+            # incremental grow-and-rewalk below is O(blocks^2) and a large datatype
+            # blob has hundreds of blocks, so it must not be used here.)
+            plain = _sp_cbc(ciphertext, aes, nblocks_total)
+            return _sp_walk(plain) or {}
+        # Value mode: grow the decrypted prefix only until 0x66 is complete (a big
+        # array backing then never pays for full decryption). One expanding pass.
+        plain = bytearray(head)
+        nblocks = 1
+        prev = ciphertext[0:16]
+        while True:
+            attrs = _sp_walk(bytes(plain))
+            if attrs is not None and 0x66 in attrs:
+                return attrs
+            if nblocks >= nblocks_total:
+                return attrs or {}
+            blk = ciphertext[nblocks * 16:nblocks * 16 + 16]
+            plain += bytes(x ^ y for x, y in zip(aes.decrypt_block(blk), prev))
+            prev = blk
+            nblocks += 1
+    return {}
 
 # --- SHORT (V10..V21) comps header layout ------------------------------------
 # RSLogix5000 V21-and-earlier store comps with a FAFA/FDFD header that is 4 bytes
@@ -158,7 +283,7 @@ class CompsRecord:
         return _SH_BODY_OFF if short_header else CompsRecord._LONG_BODY_OFF
 
     @staticmethod
-    def read_value_attrs(full_payload: bytes, short_header: bool) -> dict:
+    def read_value_attrs(full_payload: bytes, short_header: bool, full: bool = False) -> dict:
         """Walk a cip-0x6a backing's body and return {attribute_id: bytes}.
 
         ``full_payload`` MUST be the untruncated stream payload
@@ -170,11 +295,28 @@ class CompsRecord:
         then at body+74: u32 len_record, u32 count_record, then a sequence of
         (u32 attribute_id, u32 len_value, len_value bytes) attribute records.
         We walk to buffer exhaustion (NOT count_record) so 0x66 is captured.
+
+        ``full`` forces decryption of the WHOLE source-protected table (not just
+        up to 0x66); datatype records keep their member descriptors in attrs
+        0x6E.. which come after 0x66.
         """
         out: dict = {}
         try:
             off = CompsRecord.body_offset(short_header)
             body = full_payload[off:]
+            # Source-protection-at-rest: the ext-attr tail is AES-encrypted, with
+            # a fixed marker replacing the plaintext count at body+78. Decrypt it
+            # to the ordinary attr table. (Plaintext records have no marker and
+            # take the walk below, byte-for-byte unchanged.)
+            midx = body.find(_SP_MARKER, 74)
+            if midx >= 0:
+                ct = body[midx + _SP_CT_OFFSET:]
+                ct = ct[:(len(ct) // 16) * 16]
+                dec = _decrypt_value_attrs(ct, full=full)
+                if dec:
+                    return dec
+                # Fall through to the plaintext walk on a failed decrypt so a
+                # coincidental marker never blanks an otherwise-readable record.
             # prelude(14) + main_record(60) = 74, then len_record/count_record.
             pos = 74 + 8  # skip len_record(4)+count_record(4)
             n = len(body)

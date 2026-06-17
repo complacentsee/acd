@@ -15,7 +15,7 @@ from acd.generated.comps.rx_generic import RxGeneric
 from acd.l5x.catalog_numbers import CATALOG_NUMBERS, CATALOG_NUMBERS_BY_MAJOR
 from acd.l5x.port_structures import PORT_STRUCTURES
 from acd.l5x import tag_value as _tag_value
-from acd.record.comps import CompsRecord
+from acd.record.comps import CompsRecord, _SP_MARKER
 
 
 # XML 1.0 forbids the C0 control characters except TAB (0x09), LF (0x0A) and
@@ -122,7 +122,7 @@ class Member(L5xElement):
         base = super().to_xml()
         if not self._description:
             return base
-        desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
+        desc_xml = f'<Description>\n<![CDATA[{_xml_sane(self._description)}]]>\n</Description>'
         idx = base.index(">")
         return base[:idx + 1] + desc_xml + base[idx + 1:]
 
@@ -163,7 +163,7 @@ class DataType(L5xElement):
             base = base.replace("<Members></Members>", "").replace("<Members/>", "")
         if not self._description:
             return base
-        desc_xml = f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
+        desc_xml = f'<Description>\n<![CDATA[{_xml_sane(self._description)}]]>\n</Description>'
         idx = base.index(">")
         return base[:idx + 1] + desc_xml + base[idx + 1:]
 
@@ -286,6 +286,16 @@ _BUILTIN_STRUCT_MEMBERS: Dict[str, List[Tuple[str, str]]] = {
 
 # Types for which we emit no Decorated element at all (they use other formats).
 _SKIP_DECORATED: set = {"ALARM_DIGITAL", "MESSAGE", "AXIS_SERVO", "PID_ENHANCED"}
+
+# A valid L5X tag-comment Operand is a member/bit/index path relative to the tag:
+# it starts with '.' or '[' and contains only identifier/index characters. Module
+# connection-point comments instead carry a raw binary key that decodes to junk
+# (e.g. CJK from a UTF-16 misread); those must not leak in as tag operand comments.
+_OPERAND_RE = re.compile(r"^[.\[][A-Za-z0-9_.\[\]]*$")
+
+
+def _is_valid_operand(op: str) -> bool:
+    return bool(op) and ".!" not in op and bool(_OPERAND_RE.match(op))
 
 
 def _member_decorated_xml(member_name: str, member_dt: str, member_dim: int,
@@ -674,6 +684,11 @@ class Tag(L5xElement):
     # block (the older Studio style: <Data>1D 00 00 00</Data>) instead of the
     # V24+ L5K CDATA block. Defaults False so the long (V24+) path is unchanged.
     _short_header: bool = False
+    # True when the FIRST <Data> block is the raw-hex image (<Data>XX XX..</Data>)
+    # rather than <Data Format="L5K">. This is a Studio-VERSION distinction, not a
+    # header-family one: V10-V24 write raw hex, V28+ write L5K. Set by TagBuilder
+    # from the detected major version (short-header V10-V21 always implies it).
+    _raw_hex_data: bool = False
     # Step 6d: TagInfo.XML byte-layout map {DATATYPE_UPPER: [members...]} used to
     # decode the value image into a full Decorated tree. Empty -> the existing
     # render_decorated/zero path is used (no behaviour change).
@@ -689,6 +704,10 @@ class Tag(L5xElement):
     # Class="Standard"/"Safety" for controller-scope Base tags in a safety
     # project; None omits the attribute. Default None.
     _class_attr: Union[str, None] = None
+    # Suppress ALL <Data> emission (value image AND the zero-placeholder fallback).
+    # Set for a recognised alias whose AliasFor target we cannot yet build, so it
+    # is emitted as Base but carries no <Data> (OEM emits none on an alias).
+    _no_data: bool = False
 
     def _inject_tag_attrs(self, base: str) -> str:
         """Insert OpcUaAccess / Class attributes into the opening <Tag ...> of base.
@@ -907,7 +926,7 @@ class Tag(L5xElement):
                         dt_base, self.dimensions, self._value_bytes,
                         self._data_types_map, radix=self.radix
                     )
-                if self._short_header:
+                if self._raw_hex_data:
                     first = "<Data>" + _tag_value.render_hex(self._value_bytes) + "</Data>"
                     ok_first = bool(self._value_bytes)
                 else:
@@ -945,8 +964,11 @@ class Tag(L5xElement):
             except Exception:
                 data_xml = ""
 
-        if not data_xml:
-            # Fallback: today's exact zero-placeholder behaviour.
+        if not data_xml and not self._no_data:
+            # Fallback: today's exact zero-placeholder behaviour. Skipped entirely
+            # when _no_data is set (a recognised alias we emit as Base because its
+            # AliasFor target is uncracked -- OEM emits no <Data> on an alias, so a
+            # zero placeholder here would be element_extra:Data).
             l5k_zero = (
                 _PRIMITIVE_L5K_ZERO.get(dt_base)
                 if (not is_alias and not self.dimensions)
@@ -1624,14 +1646,25 @@ class MemberBuilder(L5xElementBuilder):
         results = self._cur.fetchall()
 
         name = results[0][0]
-        r = RxGeneric.from_bytes(results[0][3])
+        sp_member = False
         try:
             r = RxGeneric.from_bytes(results[0][3])
         except Exception as e:
-            return Member(name, name, "", 0, "Decimal", False, None, None, "Read/Write")
+            # Source-protected member record: its own ext-attr tail is encrypted,
+            # but every field this builder needs comes from ``self.record`` (the
+            # member descriptor blob, passed in already-decrypted by the datatype
+            # builder). Recover comment_id/cip_type from the plaintext main_record.
+            # The member-description comment key does NOT resolve for source-
+            # protected members (it matches stray 1-byte rows), so descriptions are
+            # left off here (member descriptions are rare anyway). Fall back to a
+            # plain member only when even the main_record is unreadable.
+            r = _rxgeneric_plaintext_main(results[0][3])
+            if r is None:
+                return Member(name, name, "", 0, "Decimal", False, None, None, "Read/Write")
+            sp_member = True
 
         extended_records: Dict[int, List[int]] = {}
-        for extended_record in r.extended_records:
+        for extended_record in getattr(r, "extended_records", []):
             extended_records[extended_record.attribute_id] = extended_record.value
 
         cip_data_typoe = struct.unpack_from("<I", self.record, 0x78)[0]
@@ -1718,7 +1751,7 @@ class MemberBuilder(L5xElementBuilder):
         # owning object's own description.
         description: Union[str, None] = None
         raw_comps = bytes(results[0][3])
-        if len(raw_comps) >= 18:
+        if not sp_member and len(raw_comps) >= 18:
             member_ref = struct.unpack_from("<I", raw_comps, 14)[0]
             if member_ref:
                 self._cur.execute(
@@ -1831,18 +1864,40 @@ class DataTypeBuilder(L5xElementBuilder):
 
         name = results[0][0]
 
+        extended_records: Dict[int, bytes] = {}
         try:
             r = RxGeneric.from_bytes(results[0][3])
+            for extended_record in r.extended_records:
+                extended_records[extended_record.attribute_id] = bytes(
+                    extended_record.value
+                )
         except Exception as e:
-            dt = DataType(name, name, "NoFamily", "User", [])
-            dt._emit_predefined = self._short_header
-            return dt
-
-        extended_records: Dict[int, bytes] = {}
-        for extended_record in r.extended_records:
-            extended_records[extended_record.attribute_id] = bytes(
-                extended_record.value
-            )
+            # Source-protected datatype: the ext-attr tail (member descriptors at
+            # 0x6E.., the member_count at 0x64, class flags at 0x67/0x69/0x6C) is
+            # AES-encrypted, so the kaitai parser throws. Recover the WHOLE attr
+            # table by decrypting the untruncated payload, and take comment_id /
+            # cip_type from the plaintext main_record, so members (and their radix /
+            # data type / dimensions) are still built. Returns the no-members stub
+            # only when the record is too short or no key validates.
+            r = _rxgeneric_plaintext_main(results[0][3])
+            full_payload = None
+            try:
+                self._cur.execute(
+                    "SELECT record FROM comps_full WHERE object_id=" + str(self._object_id)
+                )
+                _row = self._cur.fetchone()
+                if _row and _row[0] is not None:
+                    full_payload = bytes(_row[0])
+            except Exception:
+                full_payload = None
+            if r is not None and full_payload is not None:
+                extended_records = CompsRecord.read_value_attrs(
+                    full_payload, self._short_header, full=True
+                )
+            if r is None or not extended_records:
+                dt = DataType(name, name, "NoFamily", "User", [])
+                dt._emit_predefined = self._short_header
+                return dt
 
         def _ext_u32(key, default=0):
             v = extended_records.get(key)
@@ -2530,9 +2585,67 @@ class ModuleBuilder(L5xElementBuilder):
         )
 
 
+class _PlaintextMain:
+    """Lightweight stand-in for ``RxGeneric.RxTag`` read from fixed offsets.
+
+    Used when ``RxGeneric.from_bytes`` cannot parse a record because its extended-
+    attribute tail is source-protected (AES-encrypted) — the kaitai parser reads
+    the encryption marker as ``count_record`` and runs off the end. The
+    main_record itself stays PLAINTEXT, so the tag's data_type / radix /
+    dimensions / data_table_instance are all recoverable at their fixed offsets.
+    """
+
+    __slots__ = ("data_type", "radix", "external_access", "dimension_1",
+                 "dimension_2", "dimension_3", "data_table_instance",
+                 "cip_data_type")
+
+    def __init__(self, main: bytes):
+        u4 = lambda o: int.from_bytes(main[o:o + 4], "little")
+        u2 = lambda o: int.from_bytes(main[o:o + 2], "little")
+        self.dimension_1 = u4(12)
+        self.dimension_2 = u4(16)
+        self.dimension_3 = u4(20)
+        self.data_type = u4(28)
+        self.radix = u2(32)
+        self.external_access = u2(34)
+        self.data_table_instance = u4(36)
+        self.cip_data_type = u2(52)
+
+
+class _PlaintextRxGeneric:
+    """Minimal RxGeneric view for a source-protected tag record (plaintext main).
+
+    Exposes only the fields TagBuilder.build reads downstream: ``cip_type``,
+    ``comment_id``, ``main_record`` and an empty ``extended_records`` (the real
+    ext-attrs, including the name 0x01, are encrypted; the tag name is taken from
+    comp_name instead, exactly as the no-0x01 branch already does).
+    """
+
+    def __init__(self, raw_rec: bytes):
+        self.cip_type = int.from_bytes(raw_rec[10:12], "little")
+        self.comment_id = int.from_bytes(raw_rec[12:14], "little")
+        self.main_record = _PlaintextMain(raw_rec[14:74])
+        self.extended_records = []
+
+
+def _rxgeneric_plaintext_main(raw_rec: bytes):
+    """Build a tolerant RxGeneric view from a source-protected tag record, or None.
+
+    Returns None when the record is too short to hold the 14-byte prelude plus the
+    60-byte main_record, so the caller keeps today's stub-Tag fallback.
+    """
+    if len(raw_rec) < 74:
+        return None
+    return _PlaintextRxGeneric(raw_rec)
+
+
 @dataclass
 class TagBuilder(L5xElementBuilder):
     _short_header: bool = field(default=False)
+    # Studio major version (e.g. 24, 36); 0 when unknown. Selects the first
+    # <Data> block style: V<=24 (and short-header V10-V21) write a raw-hex
+    # <Data>XX XX..</Data> image, V28+ write <Data Format="L5K">.
+    _acd_major: int = field(default=0)
 
     def _short_header_alias_for(self, raw_rec: bytes) -> Union[str, None]:
         """Decode a V10..V21 short-header alias target, or None if not an alias.
@@ -2574,6 +2687,19 @@ class TagBuilder(L5xElementBuilder):
         except Exception:
             return None
 
+    def _raw_hex_first_block(self) -> bool:
+        """True when the tag's first <Data> block is the raw-hex image, not L5K.
+
+        Studio's reference exporter writes the value's flat first <Data> block as
+        raw hex through V24 and as Format="L5K" from V28 -- but the exact choice is
+        a per-export ExportOptions setting (some V24/V15 references emit L5K, others
+        raw hex; it is NOT inferable from the ACD). The two are equivalent flat
+        serialisations of the same value, which the comparator normalises and the
+        Decorated block validates regardless; here we emit raw hex through V24
+        (short header V10-V21 always), matching the dominant reference profile.
+        """
+        return self._short_header or (1 <= self._acd_major <= 24)
+
     def _read_tag_value(self, data_table_instance: int):
         """Return (value_bytes, type_code) for a tag's design value, or (None, 0).
 
@@ -2600,6 +2726,50 @@ class TagBuilder(L5xElementBuilder):
         except Exception:
             return None, 0
 
+    @staticmethod
+    def _parse_rec_tolerant(raw_rec: bytes):
+        """Parse a tag comps record, tolerating a source-protected (encrypted) tail.
+
+        Returns the kaitai RxGeneric when it parses, else a plaintext-main view
+        (cip_type/comment_id/main_record from fixed offsets), else None. Used by the
+        alias detectors so source-protected aliases are still recognised (the
+        kaitai parser throws on their encrypted ext-attr tail).
+        """
+        try:
+            return RxGeneric.from_bytes(raw_rec)
+        except Exception:
+            return _rxgeneric_plaintext_main(raw_rec)
+
+    def _long_header_alias_like(self, raw_rec: bytes) -> bool:
+        """True if the tag is an alias of any kind (module-I/O OR internal-tag).
+
+        A genuine Base tag's ``data_table_instance`` points at its own ``$<hex>$``
+        RxData value backing; an alias instead points at the thing it aliases (a
+        module element ``&<hex>:slot:type`` or another ordinary tag whose name is a
+        plain identifier). So "dti target name exists and is not ``$``-prefixed"
+        recognises BOTH alias sub-cases, including ones whose AliasFor target we
+        cannot yet build byte-exactly (so the tag stays Base, but its <Data>/
+        Constant must still be suppressed -- OEM emits neither on an alias).
+
+        Tolerant of source-protected records (the kaitai parser throws on their
+        encrypted ext-attr tail). Returns False on any failure (treat as Base).
+        """
+        try:
+            r = self._parse_rec_tolerant(raw_rec)
+            if r is None or r.cip_type not in (0x6B, 0x68):
+                return False
+            dti = r.main_record.data_table_instance
+            if not dti:
+                return False
+            row = self._cur.execute(
+                "SELECT comp_name FROM comps WHERE object_id=" + str(dti)
+            ).fetchone()
+            if not row or not row[0]:
+                return False
+            return not row[0].startswith("$")
+        except Exception:
+            return False
+
     def _long_header_is_alias(self, raw_rec: bytes) -> bool:
         """Detect a V24+ long-header alias tag, best-effort.
 
@@ -2616,8 +2786,8 @@ class TagBuilder(L5xElementBuilder):
         behaviour (no regression).
         """
         try:
-            r = RxGeneric.from_bytes(raw_rec)
-            if r.cip_type not in (0x6B, 0x68):
+            r = self._parse_rec_tolerant(raw_rec)
+            if r is None or r.cip_type not in (0x6B, 0x68):
                 return False
             dti = r.main_record.data_table_instance
             if not dti:
@@ -2655,8 +2825,8 @@ class TagBuilder(L5xElementBuilder):
         None on any failure / uncracked sub-case (no regression).
         """
         try:
-            r = RxGeneric.from_bytes(raw_rec)
-            if r.cip_type not in (0x6B, 0x68):
+            r = self._parse_rec_tolerant(raw_rec)
+            if r is None or r.cip_type not in (0x6B, 0x68):
                 return None
             dti = r.main_record.data_table_instance
             if not dti:
@@ -2715,8 +2885,8 @@ class TagBuilder(L5xElementBuilder):
         the caller keeps the tag as Base rather than emit a wrong Alias.
         """
         try:
-            r = RxGeneric.from_bytes(raw_rec)
-            if r.cip_type not in (0x6B, 0x68):
+            r = self._parse_rec_tolerant(raw_rec)
+            if r is None or r.cip_type not in (0x6B, 0x68):
                 return None
             dti = r.main_record.data_table_instance
             if not dti or len(raw_rec) < 0x2A:
@@ -2843,7 +3013,16 @@ class TagBuilder(L5xElementBuilder):
         #   raw[0x278]: ExternalAccess enum (0=Read/Write, 2=Read Only, 3=None)
         #   raw[0x279]: Constant flag (0=false, 1=true)
         raw_rec = bytes(results[0][3])
-        if len(raw_rec) > 0x279:
+        # Source-protected-at-rest record: the extended-attribute tail (which spans
+        # offsets 0x278/0x279) is AES-encrypted, so ExternalAccess/Constant cannot
+        # be read there -- the ciphertext bytes decode to random enum values. The
+        # main_record stays plaintext, so take ExternalAccess from main+34 and let
+        # the Base Constant="false" invariant (below) supply Constant.
+        is_sp = _SP_MARKER in raw_rec
+        if is_sp:
+            external_access = external_access_enum(raw_rec[48])  # main+34, low byte
+            constant = None
+        elif len(raw_rec) > 0x279:
             external_access = external_access_enum(raw_rec[0x278])
             constant = "true" if raw_rec[0x279] else None
         else:
@@ -2890,8 +3069,10 @@ class TagBuilder(L5xElementBuilder):
         # tags, so gate on the long-header alias detector (dti -> &hex: module
         # ref; validated 48/48 aliases, 0 false positives on PROJ_A+PROJ_C).
         # Wrapped/best-effort: a detector failure leaves `constant` as today.
+        _lh_is_alias = False
         if not self._short_header and not is_io and constant is None:
-            if not self._long_header_is_alias(raw_rec):
+            _lh_is_alias = self._long_header_alias_like(raw_rec)
+            if not _lh_is_alias:
                 constant = "false"
 
         # --- V24+ long-header @AliasFor / TagType="Alias" ---
@@ -2931,6 +3112,12 @@ class TagBuilder(L5xElementBuilder):
         tag_type = "Alias" if alias_for else "Base"
         if alias_for:
             constant = None
+
+        # A tag the alias detector recognised but whose AliasFor target we could
+        # not build (uncracked sub-case: a remote-rack module alias) stays a Base
+        # tag, but OEM emits NO <Data> on an alias. Suppress its value image so we
+        # do not introduce element_extra:Data for it.
+        suppress_value = _lh_is_alias and not alias_for
 
         # Project-level OpcUaAccess / Class flags (see ExportL5x.project_flags).
         try:
@@ -2972,13 +3159,18 @@ class TagBuilder(L5xElementBuilder):
         try:
             r = RxGeneric.from_bytes(raw_rec)
         except Exception as e:
-            _nm = io_name or results[0][0]
-            return Tag(
-                _nm, _nm, tag_type, None if alias_for else "",
-                None, external_access, constant, None, 0, [],
-                alias_for=alias_for, _io=is_io,
-                _opc_ua=_opc_ua, _class_attr=_cls_attr(),
-            )
+            # A source-protected record's encrypted ext-attr tail defeats the
+            # kaitai parser; recover the (plaintext) main_record at fixed offsets
+            # so the tag still emits its data_type / dimensions / design value.
+            r = _rxgeneric_plaintext_main(raw_rec)
+            if r is None or r.cip_type not in (0x6B, 0x68):
+                _nm = io_name or results[0][0]
+                return Tag(
+                    _nm, _nm, tag_type, None if alias_for else "",
+                    None, external_access, constant, None, 0, [],
+                    alias_for=alias_for, _io=is_io,
+                    _opc_ua=_opc_ua, _class_attr=_cls_attr(),
+                )
 
         if r.cip_type != 0x6B and r.cip_type != 0x68:
             _nm = io_name or results[0][0]
@@ -3154,7 +3346,7 @@ class TagBuilder(L5xElementBuilder):
                     (parent_key,),
                 )
                 for op_ref, op_text in self._cur.fetchall():
-                    if op_ref and op_text and ".!" not in op_ref:
+                    if op_text and _is_valid_operand(op_ref):
                         operand_comments.append((op_ref, op_text))
             except Exception:
                 operand_comments = []
@@ -3178,7 +3370,7 @@ class TagBuilder(L5xElementBuilder):
                 dim_parts.append(str(r.main_record.dimension_3))
             dimensions = ",".join(dim_parts) if dim_parts else None
             value_bytes, value_type_code = (
-                (None, 0) if alias_for
+                (None, 0) if (alias_for or suppress_value)
                 else self._read_tag_value(r.main_record.data_table_instance)
             )
             _nm = io_name or results[0][0]
@@ -3192,6 +3384,8 @@ class TagBuilder(L5xElementBuilder):
                 _value_bytes=value_bytes,
                 _value_type_code=value_type_code,
                 _short_header=self._short_header,
+                _raw_hex_data=self._raw_hex_first_block(),
+                _no_data=suppress_value,
                 _io=is_io,
                 _opc_ua=_opc_ua, _class_attr=_cls_attr(),
             )
@@ -3211,7 +3405,7 @@ class TagBuilder(L5xElementBuilder):
             dim_parts.append(str(r.main_record.dimension_3))
         dimensions = ",".join(dim_parts) if dim_parts else None
         value_bytes, value_type_code = (
-            (None, 0) if alias_for
+            (None, 0) if (alias_for or suppress_value)
             else self._read_tag_value(r.main_record.data_table_instance)
         )
         _nm = io_name or name
@@ -3231,6 +3425,8 @@ class TagBuilder(L5xElementBuilder):
             _value_bytes=value_bytes,
             _value_type_code=value_type_code,
             _short_header=self._short_header,
+            _raw_hex_data=self._raw_hex_first_block(),
+            _no_data=suppress_value,
             _io=is_io,
             _opc_ua=_opc_ua, _class_attr=_cls_attr(),
         )
@@ -4011,7 +4207,8 @@ class ProgramBuilder(L5xElementBuilder):
                 + str(results[0][1])
             )
             for result in self._cur.fetchall():
-                tag = TagBuilder(self._cur, result[1], _short_header=self._short_header).build()
+                tag = TagBuilder(self._cur, result[1], _short_header=self._short_header,
+                                 _acd_major=self._acd_major).build()
                 tag._data_types_map = self._data_types_map
                 tag._taginfo_layout = self._taginfo_layout
                 tags.append(tag)
@@ -4318,7 +4515,8 @@ class ControllerBuilder(L5xElementBuilder):
         tags: List[Tag] = []
         for result in results:
             _tag_object_id = result[1]
-            tag = TagBuilder(self._cur, _tag_object_id, _short_header=self._short_header).build()
+            tag = TagBuilder(self._cur, _tag_object_id, _short_header=self._short_header,
+                             _acd_major=self._acd_major).build()
             tag._data_types_map = data_types_map
             tag._taginfo_layout = self._taginfo_layout
             # Module I/O tags carry a ':' (Local:1:C) and are kept; the ':' filter
