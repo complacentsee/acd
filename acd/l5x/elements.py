@@ -732,7 +732,11 @@ class Tag(L5xElement):
 
     @property
     def _l5x_exclude(self) -> bool:
-        """Exclude tags with empty or non-identifier names (hex-address placeholders, etc.)."""
+        """Exclude tags with empty or non-identifier names plus ACD-internal scratch
+        tags the reference never exports: SFC/ST step-temporaries (``__SL<n>``),
+        hex-address placeholders (``__l<hex>``) and import scratch (``__CLONE``).
+        All carry a double underscore, so genuine single-underscore user tags
+        (``_Foo``) are untouched."""
         # Module I/O tags carry a ':' in their name (Local:1:C) but are valid and
         # MUST be emitted; only their ':' would otherwise trip the filter below.
         if self._io:
@@ -741,7 +745,8 @@ class Tag(L5xElement):
             not self.name
             or not (self.name[0].isalpha() or self.name[0] == "_")
             or ":" in self.name
-            or self.name.startswith("__l0")
+            or self.name.startswith("__SL")
+            or self.name.startswith("__l")
             or self.name.startswith("__CLONE")
         )
 
