@@ -1826,14 +1826,19 @@ class MemberBuilder(L5xElementBuilder):
             # Member description: a short-header member has no per-member comps
             # record, so its description is stored in the comments table keyed by
             # the owning datatype's bare comment_id with the member NAME in
-            # tag_reference (record_type 3..11 are the member/bit/array operand
-            # kinds). The comment_id is unique per datatype, so the (comment_id,
-            # name) pair identifies one member.
+            # tag_reference. The comment_id is unique per datatype, so (comment_id,
+            # name) identifies one member. record_type is NOT filtered: it is an
+            # ordinal (3..36), so the member descriptions live across the whole
+            # range (verified V16: 179/179 found by (cid,name), but only 82 fall in
+            # the old 3..11 window -- 97 at record_type 8/12..22 were dropped). A
+            # bare member name in tag_reference never matches an operand comment
+            # (those carry a '.'/'['-prefixed operand) or an own-description (empty
+            # tag_reference), so dropping the record_type window adds no false hits.
             description: Union[str, None] = None
             if self._owner_comment_id:
                 self._cur.execute(
                     "SELECT record_string FROM comments "
-                    "WHERE parent=? AND record_type IN (3,4,5,6,7,9,10,11) "
+                    "WHERE parent=? "
                     "AND tag_reference=? AND record_string!='' LIMIT 1",
                     (self._owner_comment_id, name),
                 )
@@ -3504,6 +3509,8 @@ class ParameterBuilder(L5xElementBuilder):
     """Build a Parameter from an AOI RxTagCollection child record."""
 
     _short_header: bool = field(default=False)
+    # Owning AOI's bare comment_id; the short-header description key.
+    _owner_comment_id: int = field(default=0)
 
     def build(self) -> Parameter:
         self._cur.execute(
@@ -3564,10 +3571,24 @@ class ParameterBuilder(L5xElementBuilder):
             radix = radix_enum(radix_idx) if radix_idx != 0 else None
 
         # --- Description ---
-        # Use bytes [14:18] of the comps record as member_ref to identify the
-        # specific parameter description in the comments table.
         description: Union[str, None] = None
-        if len(raw_rec) >= 18:
+        if self._short_header:
+            # V10-V21: the parameter description is in the comments table keyed by
+            # the owning AOI's bare comment_id with the parameter NAME in
+            # tag_reference (same scheme as short-header datatype members; verified
+            # V16). record_type is an ordinal, so it is not filtered.
+            if self._owner_comment_id:
+                self._cur.execute(
+                    "SELECT record_string FROM comments "
+                    "WHERE parent=? AND tag_reference=? AND record_string!='' LIMIT 1",
+                    (self._owner_comment_id, name),
+                )
+                desc_row = self._cur.fetchone()
+                if desc_row and desc_row[0]:
+                    description = desc_row[0]
+        elif len(raw_rec) >= 18:
+            # V24+ long header: bytes [14:18] are the member_ref into the comments
+            # table, keyed by comment_id*0x10000 + cip.
             member_ref = struct.unpack_from("<I", raw_rec, 14)[0]
             if member_ref:
                 self._cur.execute(
@@ -3597,6 +3618,10 @@ class ParameterBuilder(L5xElementBuilder):
 @dataclass
 class LocalTagBuilder(L5xElementBuilder):
     """Build a LocalTag from an AOI RxTagCollection child record."""
+
+    _short_header: bool = field(default=False)
+    # Owning AOI's bare comment_id; the short-header description key.
+    _owner_comment_id: int = field(default=0)
 
     def build(self) -> LocalTag:
         self._cur.execute(
@@ -3637,10 +3662,22 @@ class LocalTagBuilder(L5xElementBuilder):
             radix = None
 
         # --- Description ---
-        # Use bytes [14:18] of the comps record as member_ref to identify the
-        # specific local tag description in the comments table.
         description: Union[str, None] = None
-        if len(raw_rec) >= 18:
+        if self._short_header:
+            # V10-V21: keyed by the owning AOI's bare comment_id + the local-tag
+            # NAME in tag_reference (same scheme as short-header members/params).
+            if self._owner_comment_id:
+                self._cur.execute(
+                    "SELECT record_string FROM comments "
+                    "WHERE parent=? AND tag_reference=? AND record_string!='' LIMIT 1",
+                    (self._owner_comment_id, name),
+                )
+                desc_row = self._cur.fetchone()
+                if desc_row and desc_row[0]:
+                    description = desc_row[0]
+        elif len(raw_rec) >= 18:
+            # V24+ long header: bytes [14:18] are the member_ref into the comments
+            # table, keyed by comment_id*0x10000 + cip.
             member_ref = struct.unpack_from("<I", raw_rec, 14)[0]
             if member_ref:
                 self._cur.execute(
@@ -3889,6 +3926,24 @@ class AoiBuilder(L5xElementBuilder):
         aoi_record = bytes(results[0][3])
         name = results[0][0]
 
+        # The AOI's parameter/local-tag descriptions are keyed (short header) by
+        # the comment_id of the AOI's DATATYPE comp -- the cip-0x6c struct under
+        # RxDataTypeCollection that shares the AOI name -- NOT the AOI definition
+        # comp (cip 0x338) this builder is invoked on. (An AOI's parameters are its
+        # datatype members, so they share the datatype's comment_id, as plain UDT
+        # members do.) Verified V16: descriptions resolve off this comment_id.
+        aoi_comment_id = 0
+        try:
+            _dtrow = self._cur.execute(
+                "SELECT record FROM comps WHERE comp_name=? AND parent_id="
+                "(SELECT object_id FROM comps WHERE comp_name='RxDataTypeCollection')",
+                (name,),
+            ).fetchone()
+            if _dtrow and _dtrow[0] is not None:
+                aoi_comment_id = RxGeneric.from_bytes(bytes(_dtrow[0])).comment_id
+        except Exception:
+            aoi_comment_id = 0
+
         # --- AOI Parameter/LocalTag prototype DefaultData value images ---
         # Resolve the AOI's hidden __DEFVAL backing ONCE: a consolidated image of
         # the whole AOI struct. Each Parameter/LocalTag default is a slice at the
@@ -4042,7 +4097,7 @@ class AoiBuilder(L5xElementBuilder):
 
                 if is_param:
                     try:
-                        p = ParameterBuilder(self._cur, child_oid, _short_header=self._short_header).build()
+                        p = ParameterBuilder(self._cur, child_oid, _short_header=self._short_header, _owner_comment_id=aoi_comment_id).build()
                         # Wire the value-emission maps so <DefaultData> can be
                         # built (mirrors how TagBuilder receives them). Failure
                         # to attach degrades to no-DefaultData, never crashes.
@@ -4060,7 +4115,7 @@ class AoiBuilder(L5xElementBuilder):
                         pass
                 else:
                     try:
-                        lt = LocalTagBuilder(self._cur, child_oid).build()
+                        lt = LocalTagBuilder(self._cur, child_oid, _short_header=self._short_header, _owner_comment_id=aoi_comment_id).build()
                         try:
                             lt._data_types_map = self._data_types_map
                             lt._taginfo_layout = self._taginfo_layout
