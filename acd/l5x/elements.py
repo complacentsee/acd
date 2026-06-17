@@ -4605,7 +4605,12 @@ class ControllerBuilder(L5xElementBuilder):
                 # V10..V21 OEM L5X emits the full lean set (User + ProductDefined
                 # + IO); _l5x_exclude is disabled via _emit_predefined so the
                 # serializer keeps all of them. (The long path keeps User-only.)
-                data_types.append(dt)
+                # AOI definitions own a backing datatype comp too, but the
+                # reference emits them only as AddOnInstructionDefinitions, never
+                # as a <DataType> -- so skip AOI-named comps here as the long path
+                # already does at the elif below.
+                if dt.name not in aoi_names:
+                    data_types.append(dt)
             elif dt.name not in aoi_names:
                 # V24+/V36: emit every datatype that is not an AOI definition
                 # (User + ProductDefined + IO), matching the OEM emit-set.
