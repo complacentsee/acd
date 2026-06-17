@@ -3595,10 +3595,15 @@ class ParameterBuilder(L5xElementBuilder):
         visible = "true" if visible_b else "false"
 
         # ExternalAccess (u16 at ext01[0x21E])
-        # MESSAGE-type InOut parameters don't carry Constant in L5X; all others do.
+        # Built-in reference-type InOut parameters (MESSAGE and the motion
+        # references MOTION_GROUP / AXIS_CIP_DRIVE) don't carry Constant in the
+        # reference L5X; every other InOut parameter (atomic, string, and user
+        # UDTs including axis-named ones like tstAxisUDT) still carries it. Match
+        # by exact DataType, never a name substring.
+        _no_constant_inout = ("MESSAGE", "MOTION_GROUP", "AXIS_CIP_DRIVE")
         if usage == "InOut":
             external_access = None
-            constant: Union[str, None] = None if data_type == "MESSAGE" else "false"
+            constant: Union[str, None] = None if data_type in _no_constant_inout else "false"
         elif len(ext01) > 0x21F:
             ea_val = struct.unpack_from("<H", ext01, 0x21E)[0]
             external_access = external_access_enum(ea_val)
