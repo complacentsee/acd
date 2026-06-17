@@ -3256,9 +3256,21 @@ class TagBuilder(L5xElementBuilder):
                 # searching would surface another tag's description and
                 # mis-attribute it. So this can only drop an operand leak, never
                 # add a description.
+                #
+                # COLLISION-SAFE: cip-0x68 tags SHARE a comment_id with the rung
+                # comments of their routine, and (parent_key, member_ref) there can
+                # collide with a RUNG comment -> a fabricated tag description (e.g.
+                # an axis tag stamped with a "Homing Sequence" rung comment). A rung
+                # comment carries a nonzero rung_content (the rung id); a genuine
+                # tag/own description has rung_content 0. Excluding nonzero
+                # rung_content drops the rung-comment collisions while keeping the
+                # real cip-0x68 descriptions (validated: PROJ_E keeps 11, drops 26
+                # rung collisions; layout AX* over-emit gone).
                 self._cur.execute(
                     "SELECT record_string, tag_reference FROM comments "
-                    "WHERE parent=? AND member_ref=? LIMIT 1",
+                    "WHERE parent=? AND member_ref=? "
+                    "AND (rung_content IS NULL OR rung_content=0) "
+                    "LIMIT 1",
                     (parent_key, member_ref),
                 )
                 desc_row = self._cur.fetchone()
@@ -3266,12 +3278,14 @@ class TagBuilder(L5xElementBuilder):
                     comment_results = [("", desc_row[0])]
             except Exception:
                 comment_results = []
-        else:
+        elif r.cip_type == 0x6B:
             # V10..V21 short-header own-description lookup. These type-1/2 records
             # are keyed by parent == comment_id (the same scheme as the short
             # operand comments) and carry the tag's own Description when
-            # member_ref == 0. Wrapped so any failure degrades to today's
-            # no-description behaviour (no regression).
+            # member_ref == 0. Restricted to cip-0x6b (as the short operand path
+            # is): cip-0x68 tags share a constant comment_id, so the bare-cid
+            # lookup there matches another comp's description and fabricates one.
+            # Wrapped so any failure degrades to today's no-description behaviour.
             try:
                 self._cur.execute(
                     "SELECT record_string FROM comments "
