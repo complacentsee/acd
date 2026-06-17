@@ -1112,6 +1112,10 @@ class Module(L5xElement):
     inhibited: str
     major_fault: str
     # Private fields (not serialised as XML attributes)
+    # True for the root controller module (parent resolves to itself). Used to
+    # special-case the root in port/slot logic; decoupled from major_fault, which
+    # is now a real per-module flag and no longer a root proxy.
+    _is_root: bool = field(default=False)
     _ekey_state: str = field(default="CompatibleModule")
     _slot: int = field(default=0)
     _ip_address: str = field(default="")
@@ -1223,7 +1227,7 @@ class Module(L5xElement):
         if port_defs is None:
             return '<Ports/>'
 
-        is_root = (self.major_fault == "true")
+        is_root = self._is_root
         port_parts: List[str] = []
 
         for pd in port_defs:
@@ -2405,7 +2409,8 @@ class ModuleBuilder(L5xElementBuilder):
                 e1 = raw_rec[marker + 4:]
         if len(e1) < 0x30:
             major_fault = "true" if name == "Local" else "false"
-            return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false", major_fault)
+            return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false", major_fault,
+                          _is_root=(name == "Local"))
 
         vendor        = struct.unpack("<H", e1[0x02:0x04])[0]
         product_type  = struct.unpack("<H", e1[0x04:0x06])[0]
@@ -2434,8 +2439,14 @@ class ModuleBuilder(L5xElementBuilder):
         # Resolve parent module name from the modid→name map built by ControllerBuilder.
         parent_name = self._modid_to_name.get(parent_modid, "Local")
 
-        # MajorFault=true for the root controller module: its parent resolves to itself.
-        major_fault = "true" if parent_name == name else "false"
+        # MajorFault (ConfiguredAsMajorFault): bit 0 of e1[0x14]. Set on the root
+        # CPU and on any module the user configured so a connection fault halts the
+        # controller -- NOT root-only. (The prior parent==self rule only ever
+        # flagged the root; validated e1[0x14]&1 on V20/V28/V32/V33/V35 vs OEM,
+        # 164/164.) Root detection for ProcessorType/MajorRev now uses
+        # parent_module==name directly (see ControllerBuilder), so it no longer
+        # piggy-backs on this attribute.
+        major_fault = "true" if (len(e1) > 0x14 and (e1[0x14] & 0x01)) else "false"
         # EKey state from the keying mask at e1[0x0a]: 0 = no keying (Disabled),
         # nonzero (0x1f = all identity fields keyed) = a keyed module. Both
         # ExactMatch and CompatibleModule carry the full 0x1f mask, so the mask
@@ -2564,8 +2575,9 @@ class ModuleBuilder(L5xElementBuilder):
         # The root controller is left to the static-catalog path: its blob uses
         # abbreviated CompactLogix port types (Cpt35E, Cpt32EN, ...) and a chassis
         # bus this decoder does not model, and PORT_STRUCTURES already covers CPUs.
+        is_root = (parent_name == name)
         ports_override = None
-        if major_fault != "true":
+        if not is_root:
             data_link = struct.unpack("<I", e1[0x24:0x28])[0] if len(e1) >= 0x28 else 0
             ports_override = self._ports_from_data_collection(data_link)
 
@@ -2582,6 +2594,7 @@ class ModuleBuilder(L5xElementBuilder):
             parent_port,
             "false",        # Inhibited: always false in practice; no known bit
             major_fault,
+            _is_root=is_root,
             _ekey_state=ekey_state,
             _slot=slot,
             _ip_address=ip_address,
@@ -4741,9 +4754,10 @@ class ControllerBuilder(L5xElementBuilder):
                 }
 
         # ProcessorType is the CatalogNumber of the root controller module (the one
-        # whose parent is itself, i.e. MajorFault="true").
+        # whose parent resolves to itself). (MajorFault is no longer root-only, so
+        # the root is identified by parent_module==name instead.)
         processor_type = next(
-            (m.catalog_number for m in modules if m.major_fault == "true" and m.catalog_number),
+            (m.catalog_number for m in modules if m.parent_module == m.name and m.catalog_number),
             None,
         )
 
@@ -4751,7 +4765,7 @@ class ControllerBuilder(L5xElementBuilder):
         # controller) module, stored in its ext[0x01] bytes [0x08] and [0x09].
         local_module = next(
             (m for m in modules if m.name == "Local"),
-            next((m for m in modules if m.major_fault == "true"), None),
+            next((m for m in modules if m.parent_module == m.name), None),
         )
         if local_module is not None:
             major_rev = str(local_module.major)
@@ -4765,7 +4779,7 @@ class ControllerBuilder(L5xElementBuilder):
         comm_path: Union[str, None] = None
         if _comm_path_prefix is not None:
             _ctrl_slot = next(
-                (m._slot for m in modules if m.major_fault == "true"), None
+                (m._slot for m in modules if m._is_root), None
             )
             if _ctrl_slot is not None:
                 comm_path = _comm_path_prefix + str(_ctrl_slot)
