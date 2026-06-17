@@ -4803,6 +4803,36 @@ class ControllerBuilder(L5xElementBuilder):
             if _ctrl_slot is not None:
                 comm_path = _comm_path_prefix + str(_ctrl_slot)
 
+        # Controller project settings that Studio only writes for certain
+        # controller generations / save versions. Emitting them unconditionally
+        # fabricates attributes the reference omits on older saves and on
+        # controllers that never carried the feature.
+        #  - AutoDiags/WebServer are written ONLY for the 5x80 generation
+        #    (5069-/5094- CompactLogix 5380/5480, 1756-L8x ControlLogix 5580);
+        #    every 1756-L6/L7 and 1769/1768 controller omits them regardless of
+        #    firmware.
+        #  - PassThrough/DownloadDocs and DownloadCustomProperties/
+        #    ReportMinorOverflow are written from save-version 24 onward. The
+        #    5x80 clause also covers projects whose header mis-reports an older
+        #    save version than the controller they target.
+        is_5x80 = bool(processor_type) and processor_type.startswith(
+            ("5069-", "5094-", "1756-L8")
+        )
+        _v24_plus = is_5x80 or self._acd_major >= 24
+        pass_through = "EnabledWithAppend" if _v24_plus else None
+        download_docs = "true" if _v24_plus else None
+        download_custom = "true" if _v24_plus else None
+        report_minor_overflow = "false" if _v24_plus else None
+        # AutoDiags/WebServer hinge on the 5x80 generation, which we read from
+        # the catalog number. When the root catalog can't be resolved
+        # (processor_type is None) we can't tell the generation, so fall back to
+        # the save version: these features never appear below v32, so a modern
+        # save with an unknown catalog is treated as 5x80 rather than dropping a
+        # value the reference keeps.
+        _modern_unknown_cpu = processor_type is None and self._acd_major >= 32
+        auto_diags = "false" if (is_5x80 or _modern_unknown_cpu) else None
+        web_server = "false" if (is_5x80 or _modern_unknown_cpu) else None
+
         return Controller(
             controller_name,
             "Target",
@@ -4821,12 +4851,12 @@ class ControllerBuilder(L5xElementBuilder):
             "false",        # MatchProjectToController
             "false",        # CanUseRPIFromProducer
             "0",            # InhibitAutomaticFirmwareUpdate
-            "EnabledWithAppend",  # PassThroughConfiguration
-            "true",         # DownloadProjectDocumentationAndExtendedProperties
-            "true",         # DownloadProjectCustomProperties
-            "false",        # ReportMinorOverflow
-            "false",        # AutoDiagsEnabled
-            "false",        # WebServerEnabled
+            pass_through,   # PassThroughConfiguration
+            download_docs,  # DownloadProjectDocumentationAndExtendedProperties
+            download_custom,  # DownloadProjectCustomProperties
+            report_minor_overflow,  # ReportMinorOverflow
+            auto_diags,     # AutoDiagsEnabled
+            web_server,     # WebServerEnabled
             data_types,
             modules,
             tags,
