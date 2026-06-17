@@ -1815,7 +1815,20 @@ class MemberBuilder(L5xElementBuilder):
                     bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
                     target_key = struct.unpack_from("<I", self.record, 0x6C)[0]
                     if target_key != 0xFFFFFFFF:
+                        # Pattern 1: explicit backing-field byte offset.
                         target = self._offset60_to_name.get(target_key)
+                    elif self._owner_cls in ("ProductDefined", "IO"):
+                        # Predefined / IO type: 0x68 is the member-collection
+                        # ordinal of the host word the bit overlays (e.g. ALARM
+                        # EnableIn -> ulBoolInput1 @ index 0, the alarm bits ->
+                        # ulBoolOutput1 @ index 11). Mirrors the long-header path;
+                        # the prior short path fell through to the offset-60 map and
+                        # mis-resolved these to an unrelated member (verified V11
+                        # ALARM/PID: members_by_index[0x68] == OEM Target).
+                        if 0 <= val_68 < len(self._members_by_index):
+                            target = self._members_by_index[val_68]
+                        if target is None:
+                            target = self._offset60_to_name.get(0)
                     else:
                         val_60 = struct.unpack_from("<I", self.record, 0x60)[0]
                         target = self._offset60_to_name.get(val_60)
@@ -2105,6 +2118,10 @@ class DataTypeBuilder(L5xElementBuilder):
                 for b_off in range(val_60, val_60 + sz):
                     offset60_to_name.setdefault(b_off, mname)
 
+            # Member-ordinal -> name list (seq order), so ProductDefined/IO BIT
+            # members can resolve their host word by 0x68 index (mirrors the long
+            # path's members_by_index).
+            members_by_index_s: List[str] = [n for n, _ in short_recs]
             last_hidden_backing = None
             for mname, blob in short_recs:
                 if not mname:
@@ -2120,6 +2137,8 @@ class DataTypeBuilder(L5xElementBuilder):
                             offset60_to_name,
                             last_hidden_backing,
                             _short_name=mname,
+                            _owner_cls=class_type,
+                            _members_by_index=members_by_index_s,
                             _owner_comment_id=r.comment_id,
                         ).build()
                     )
