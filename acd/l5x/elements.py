@@ -285,7 +285,16 @@ _BUILTIN_STRUCT_MEMBERS: Dict[str, List[Tuple[str, str]]] = {
 }
 
 # Types for which we emit no Decorated element at all (they use other formats).
-_SKIP_DECORATED: set = {"ALARM_DIGITAL", "MESSAGE", "AXIS_SERVO", "PID_ENHANCED"}
+# Motion axes and motion groups are written by the reference as a dedicated
+# <Data Format="Axis">/<Data Format="MotionGroup"> block (<AxisParameters>/
+# <MotionGroupParameters>), never as a Decorated <Structure>, so the generic
+# Decorated tree is a fabrication for them. (MOTION_INSTRUCTION is NOT a motion
+# axis -- it keeps its Decorated <Structure> like any UDT.)
+_SKIP_DECORATED: set = {
+    "ALARM_DIGITAL", "MESSAGE", "PID_ENHANCED",
+    "AXIS_SERVO", "AXIS_SERVO_DRIVE", "AXIS_CIP_DRIVE", "AXIS_VIRTUAL",
+    "AXIS_GENERIC", "AXIS_CONSUMED", "MOTION_GROUP",
+}
 
 # A valid L5X tag-comment Operand is a member/bit/index path relative to the tag:
 # it starts with '.' or '[' and contains only identifier/index characters. Module
