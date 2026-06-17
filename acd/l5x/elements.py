@@ -1178,11 +1178,11 @@ class Module(L5xElement):
             # all stubs share one rule.
             def _stub(tag: str, ext_access: str) -> str:
                 opc = ' OpcUaAccess="None"' if self._opc_ua else ''
-                return (
-                    f'<{tag} ExternalAccess="{ext_access}"{opc}>'
-                    f'<Comments/>'
-                    f'</{tag}>'
-                )
+                # The reference writes <Comments> on a module InputTag/OutputTag
+                # only when there is at least one operand <Comment> (always beside
+                # <Data>); it never emits a bare empty <Comments/>. We carry no
+                # per-operand module-IO comments, so emit a self-closing stub.
+                return f'<{tag} ExternalAccess="{ext_access}"{opc}/>'
 
             conn_parts: List[str] = []
             for (conn_name, rpi_str, conn_type) in self._connections:
