@@ -1460,6 +1460,10 @@ class Controller(L5xElement):
     # _redundancy_enabled is NOT serialised as a regular XML attribute (underscore prefix
     # skips it in the base to_xml()); it is used only to build the <RedundancyInfo> element.
     _redundancy_enabled: bool = field(default=False)
+    # The reference emits a <DataLogs> element only for v24+ / 5x80 controllers
+    # (the DataLog feature ships in v24); older controllers omit it entirely.
+    # Set by the builder; default True keeps any other caller's prior output.
+    _emit_data_logs: bool = field(default=True)
 
     def __post_init__(self):
         super().__post_init__()
@@ -1492,7 +1496,7 @@ class Controller(L5xElement):
             + '<CST MasterID="0"/>'
             + '<WallClockTime LocalTimeAdjustment="0" TimeZone="0"/>'
             + '<Trends/>'
-            + '<DataLogs/>'
+            + ('<DataLogs/>' if self._emit_data_logs else '')
             + '<TimeSynchronize Priority1="128" Priority2="128" PTPEnable="true"/>'
             + '</Controller>'
         )
@@ -4869,6 +4873,9 @@ class ControllerBuilder(L5xElementBuilder):
             tasks,
             aois,
             redundancy_enabled,
+            # <DataLogs> ships with the DataLog feature in v24; gate it on the
+            # same v24+/5x80 signal as the project-download settings above.
+            _emit_data_logs=_v24_plus,
         )
 
 
