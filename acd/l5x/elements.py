@@ -2436,8 +2436,14 @@ class ModuleBuilder(L5xElementBuilder):
 
         # MajorFault=true for the root controller module: its parent resolves to itself.
         major_fault = "true" if parent_name == name else "false"
-        # bit 2 (0x04) of e1[0] → EKey Disabled (Local=0x06→Disabled, EN2T=0x11→CompatibleModule).
-        ekey_state  = "Disabled" if (e1[0] & 0x04) else "CompatibleModule"
+        # EKey state from the keying mask at e1[0x0a]: 0 = no keying (Disabled),
+        # nonzero (0x1f = all identity fields keyed) = a keyed module. Both
+        # ExactMatch and CompatibleModule carry the full 0x1f mask, so the mask
+        # alone classifies Disabled vs keyed; we emit CompatibleModule for keyed
+        # modules (ExactMatch -- almost exclusively the root CPU -- needs a further
+        # discriminator and is left as a follow-on). Validated on V20/V36 vs OEM;
+        # the prior e1[0]&0x04 rule mis-keyed Disabled modules as CompatibleModule.
+        ekey_state  = "Disabled" if (len(e1) > 0x0a and e1[0x0a] == 0) else "CompatibleModule"
 
         # IP address: stored at e1[0x30] as a u16 length-prefixed ASCII string for modules
         # that connect via Ethernet upstream (parent_port == 2). Local backplane bridge
