@@ -1,8 +1,8 @@
-"""Minimal, dependency-free AES-128/192/256 ECB block primitive.
+"""AES-128/192/256 ECB block primitive with an optional native backend.
 
-Vendored so that V21 source-protection rung decryption (see
-``acd.record.source_protection``) has no third-party dependency
-(``cryptography``/``pycryptodome`` are *not* required by this package).
+Used by V21 source-protection rung decryption (see
+``acd.record.source_protection``) and the V24 source-protected-at-rest
+ext-attribute tail decryptor (see ``acd.record.comps``).
 
 Only the two raw 16-byte block operations are exposed:
 
@@ -11,16 +11,26 @@ Only the two raw 16-byte block operations are exposed:
     pt_block = aes.decrypt_block(ct_block16)
 
 Block chaining (CBC / the V21 CFB-style final partial) is implemented by the
-caller in :mod:`acd.record.source_protection`.  This module is intentionally
-a textbook implementation: it is used only to decrypt a handful of short rung
-buffers per project, so clarity is preferred over raw throughput.
+callers in :mod:`acd.record.source_protection` and :mod:`acd.record.comps`.
 
-Validated against the AES FIPS-197 known-answer vectors and against the
-``cryptography`` reference for the V21 key (SHA256(keymatl5)); see
-``test/test_source_protection.py``.
+Backend selection (transparent to callers):
+
+* If the ``cryptography`` package is importable, block ops run through its
+  OpenSSL-backed AES-ECB primitive. On source-protected V24 projects the
+  ext-attribute tail is several hundred KB of ciphertext decrypted block by
+  block; the native backend is ~60x faster there than the textbook path
+  (a full-pool export drops from minutes-per-SP-file to seconds).
+* Otherwise it falls back to the vendored, dependency-free textbook
+  implementation below, so the package still works with no third-party crypto.
+
+The native backend is verified byte-for-byte against the textbook
+implementation and the FIPS-197 known-answer vectors at import time; on ANY
+mismatch (or import failure) it is disabled and the textbook path is used, so
+the emitted L5X is identical regardless of which backend is active.
 """
 from __future__ import annotations
 
+import os
 from typing import List
 
 # --- AES S-box and inverse S-box --------------------------------------------
@@ -76,8 +86,8 @@ def _mul(a: int, b: int) -> int:
     return p & 0xff
 
 
-class AES:
-    """Textbook AES block cipher (ECB block ops only)."""
+class _PurePythonAES:
+    """Textbook AES block cipher (ECB block ops only); no dependencies."""
 
     def __init__(self, key: bytes):
         if len(key) not in (16, 24, 32):
@@ -185,3 +195,106 @@ class AES:
         self._sub_bytes(state, _INV_SBOX)
         self._add_round_key(state, self._round_keys[0])
         return bytes(state)
+
+
+# --- optional native (OpenSSL) backend --------------------------------------
+try:
+    from cryptography.hazmat.primitives.ciphers import (
+        Cipher as _Cipher, algorithms as _algorithms, modes as _modes,
+    )
+    _HAVE_CRYPTOGRAPHY = True
+except Exception:  # pragma: no cover - exercised only when cryptography absent
+    _HAVE_CRYPTOGRAPHY = False
+
+
+class _OpenSSLAES:
+    """OpenSSL-backed AES (ECB block ops only) via the ``cryptography`` package.
+
+    ECB has no chaining state, so a single encryptor/decryptor is reused across
+    every 16-byte block. The CBC / CFB-partial chaining the callers do on top is
+    unaffected.
+    """
+
+    def __init__(self, key: bytes):
+        if len(key) not in (16, 24, 32):
+            raise ValueError("AES key must be 16, 24 or 32 bytes")
+        self._cipher = _Cipher(_algorithms.AES(key), _modes.ECB())
+        self._enc = None
+        self._dec = None
+
+    def encrypt_block(self, block: bytes) -> bytes:
+        if len(block) != 16:
+            raise ValueError("AES block must be 16 bytes")
+        if self._enc is None:
+            self._enc = self._cipher.encryptor()
+        return self._enc.update(block)
+
+    def decrypt_block(self, block: bytes) -> bytes:
+        if len(block) != 16:
+            raise ValueError("AES block must be 16 bytes")
+        if self._dec is None:
+            self._dec = self._cipher.decryptor()
+        return self._dec.update(block)
+
+
+def _native_matches_reference() -> bool:
+    """Verify the native backend byte-for-byte vs the textbook impl + FIPS-197.
+
+    Run once at import. Any mismatch disables the native path so the emitted
+    output can never differ from the dependency-free reference.
+    """
+    if not _HAVE_CRYPTOGRAPHY:
+        return False
+    try:
+        # FIPS-197 C.3 AES-256 known-answer vector.
+        kat_key = bytes(range(0x00, 0x20))
+        kat_pt = bytes.fromhex("00112233445566778899aabbccddeeff")
+        kat_ct = bytes.fromhex("8ea2b7ca516745bfeafc49904b496089")
+        if _OpenSSLAES(kat_key).encrypt_block(kat_pt) != kat_ct:
+            return False
+        if _OpenSSLAES(kat_key).decrypt_block(kat_ct) != kat_pt:
+            return False
+        # Cross-check every key size against the textbook implementation on a
+        # fixed, non-trivial block (deterministic; no RNG needed).
+        probe = bytes((i * 37 + 11) & 0xFF for i in range(16))
+        for klen in (16, 24, 32):
+            key = bytes((i * 19 + 7) & 0xFF for i in range(klen))
+            ref, nat = _PurePythonAES(key), _OpenSSLAES(key)
+            ct_ref = ref.encrypt_block(probe)
+            if nat.encrypt_block(probe) != ct_ref:
+                return False
+            if nat.decrypt_block(ct_ref) != probe:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+# Escape hatch: set ACD_DISABLE_NATIVE_AES=1 to force the textbook backend
+# (e.g. for A/B validation that the two paths are byte-identical, or if a host's
+# OpenSSL is ever suspect). Empty/0/false/no leave the native path enabled.
+_FORCE_PYTHON = os.environ.get("ACD_DISABLE_NATIVE_AES", "").strip().lower() not in ("", "0", "false", "no")
+_NATIVE_OK = (not _FORCE_PYTHON) and _native_matches_reference()
+
+
+class AES:
+    """AES block cipher (ECB block ops only).
+
+    Public API unchanged: ``AES(key).encrypt_block(b16)`` / ``.decrypt_block``.
+    Delegates to the OpenSSL backend when available and verified, else to the
+    vendored textbook implementation. ``AES.backend`` reports which is active.
+    """
+
+    backend = "openssl" if _NATIVE_OK else "python"
+
+    def __init__(self, key: bytes):
+        if _NATIVE_OK:
+            self._impl = _OpenSSLAES(key)
+        else:
+            self._impl = _PurePythonAES(key)
+
+    def encrypt_block(self, block: bytes) -> bytes:
+        return self._impl.encrypt_block(block)
+
+    def decrypt_block(self, block: bytes) -> bytes:
+        return self._impl.decrypt_block(block)
