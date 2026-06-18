@@ -2164,9 +2164,14 @@ class DataTypeBuilder(L5xElementBuilder):
                     pass
 
         # --- Description ---
+        # The datatype's own description carries object_id == 1; operand/scratch
+        # rows that share the (parent, member_ref=0) key carry a nonzero object_id
+        # and their record_string is a name-fragment, so requiring object_id == 1
+        # drops those fabricated Descriptions while keeping the real one.
         description: Union[str, None] = None
         self._cur.execute(
-            "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 LIMIT 1",
+            "SELECT record_string FROM comments "
+            "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
             ((r.comment_id * 0x10000) + r.cip_type,),
         )
         desc_row = self._cur.fetchone()
@@ -2533,10 +2538,14 @@ class ModuleBuilder(L5xElementBuilder):
 
         # --- Description ---
         # Module descriptions are stored in the comments table keyed by
-        # (comment_id * 0x10000 + cip_type), same as for tags.
+        # (comment_id * 0x10000 + cip_type), same as for tags. The module's own
+        # description carries object_id == 1; rows sharing the key with a nonzero
+        # object_id are scratch values (e.g. export timestamps) whose record_string
+        # would otherwise leak in as a fabricated Description, so require object_id == 1.
         description = ""
         self._cur.execute(
-            "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 LIMIT 1",
+            "SELECT record_string FROM comments "
+            "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
             ((r.comment_id * 0x10000) + r.cip_type,),
         )
         desc_row = self._cur.fetchone()
@@ -3327,10 +3336,17 @@ class TagBuilder(L5xElementBuilder):
                 # rung_content drops the rung-comment collisions while keeping the
                 # real cip-0x68 descriptions (validated: PROJ_E keeps 11, drops 26
                 # rung collisions; layout AX* over-emit gone).
+                # A long-header own description also carries object_id == 1; the
+                # scratch/operand rows that share (parent_key, member_ref) under a
+                # sentinel key instead carry a nonzero object_id (e.g. 33) with an
+                # empty tag_reference, so the tag_reference guard alone lets them
+                # through as a fabricated name-fragment Description. Requiring
+                # object_id == 1 keeps the real own description and drops those.
                 self._cur.execute(
                     "SELECT record_string, tag_reference FROM comments "
                     "WHERE parent=? AND member_ref=? "
                     "AND (rung_content IS NULL OR rung_content=0) "
+                    "AND object_id=1 "
                     "LIMIT 1",
                     (parent_key, member_ref),
                 )
@@ -4213,8 +4229,13 @@ class AoiBuilder(L5xElementBuilder):
         revision_note = ""
         if _r_aoi is not None:
             aoi_comment_parent = (_r_aoi.comment_id * 0x10000) + _r_aoi.cip_type
+            # The AOI's own description carries object_id == 1; the extended-help
+            # text rows under the same key carry a nonzero object_id (with a
+            # non-empty tag_reference such as UDI_EXT_HELP) and are not emitted by
+            # OEM as a Description, so require object_id == 1 to exclude them.
             self._cur.execute(
-                "SELECT record_string FROM comments WHERE parent=? AND member_ref=0 LIMIT 1",
+                "SELECT record_string FROM comments "
+                "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
                 (aoi_comment_parent,),
             )
             desc_row = self._cur.fetchone()
