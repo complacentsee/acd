@@ -3601,16 +3601,26 @@ class ParameterBuilder(L5xElementBuilder):
             if dim_val:
                 dimensions = str(dim_val)
 
+        # Source-protected AOI parameters encrypt the ext-attr tail, so
+        # RxGeneric.from_bytes throws. Decrypt the tail to recover ext[0x01] and
+        # read cip/comment_id from the plaintext main_record so the description
+        # lookup below still resolves. The decrypted ext blob always uses the
+        # LONG-header usage layout regardless of the file's header family.
+        sp = False
         try:
             r = RxGeneric.from_bytes(raw_rec)
             exts: Dict[int, bytes] = {
                 er.attribute_id: bytes(er.value) for er in r.extended_records
             }
         except Exception:
-            return Parameter(name, name, "Base", data_type, "Input", None, "false", "false", "Read/Write", None, dimensions)
+            exts = CompsRecord.read_ext_attrs_from_record(raw_rec)
+            r = _rxgeneric_plaintext_main(raw_rec)
+            if not exts or r is None:
+                return Parameter(name, name, "Base", data_type, "Input", None, "false", "false", "Read/Write", None, dimensions)
+            sp = True
 
         ext01 = exts.get(0x01, b"")
-        usage, required_b, visible_b = _aoi_tag_usage(ext01, self._short_header)
+        usage, required_b, visible_b = _aoi_tag_usage(ext01, short_header=False if sp else self._short_header)
         # AoiBuilder only routes Input/Output/InOut here; guard the Local/None
         # edge to the prior InOut default so behaviour can't regress.
         if usage not in ("Input", "Output", "InOut"):
@@ -3648,8 +3658,15 @@ class ParameterBuilder(L5xElementBuilder):
             radix = radix_enum(radix_idx) if radix_idx != 0 else None
 
         # --- Description ---
+        # Source-protected projects also encrypt the comment text, so for an
+        # SP-recovered parameter the comments table holds undecryptable garbage
+        # (e.g. a lone 0x1d control byte, which would additionally produce invalid
+        # XML). Skip the lookup on the SP path rather than emit a bogus Description;
+        # the real text needs a separate comment-decryption that is not yet cracked.
         description: Union[str, None] = None
-        if self._short_header:
+        if sp:
+            pass
+        elif self._short_header:
             # V10-V21: the parameter description is in the comments table keyed by
             # the owning AOI's bare comment_id with the parameter NAME in
             # tag_reference (same scheme as short-header datatype members; verified
@@ -3717,13 +3734,23 @@ class LocalTagBuilder(L5xElementBuilder):
             if dim_val:
                 dimensions = str(dim_val)
 
+        # Source-protected AOI local tags encrypt the ext-attr tail, so
+        # RxGeneric.from_bytes throws. Decrypt it to recover ext[0x01] for the
+        # correct ExternalAccess/Radix (read at fixed ext01 offsets, layout-
+        # independent). The comment text is also encrypted on SP projects, so the
+        # description lookup is skipped on this path (see below).
+        sp = False
         try:
             r = RxGeneric.from_bytes(raw_rec)
             exts: Dict[int, bytes] = {
                 er.attribute_id: bytes(er.value) for er in r.extended_records
             }
         except Exception:
-            return LocalTag(name, name, data_type, dimensions, None, "Read/Write")
+            exts = CompsRecord.read_ext_attrs_from_record(raw_rec)
+            r = _rxgeneric_plaintext_main(raw_rec)
+            if not exts or r is None:
+                return LocalTag(name, name, data_type, dimensions, None, "Read/Write")
+            sp = True
 
         ext01 = exts.get(0x01, b"")
         if len(ext01) > 0x21F:
@@ -3739,8 +3766,12 @@ class LocalTagBuilder(L5xElementBuilder):
             radix = None
 
         # --- Description ---
+        # SP projects encrypt the comment text, so skip the lookup on the SP path
+        # (the stored comment is undecryptable garbage that would also break XML).
         description: Union[str, None] = None
-        if self._short_header:
+        if sp:
+            pass
+        elif self._short_header:
             # V10-V21: keyed by the owning AOI's bare comment_id + the local-tag
             # NAME in tag_reference (same scheme as short-header members/params).
             if self._owner_comment_id:
@@ -4170,7 +4201,20 @@ class AoiBuilder(L5xElementBuilder):
                     usage, _, _ = _aoi_tag_usage(ext01, self._short_header)
                     is_param = usage in ("Input", "Output", "InOut")
                 except Exception:
-                    pass
+                    # Source-protected AOI: the ext-attr tail is AES-encrypted, so
+                    # RxGeneric.from_bytes throws. Decrypt it to recover ext[0x01]
+                    # and classify on the usage byte. The decrypted blob always uses
+                    # the LONG-header usage layout regardless of the file's native
+                    # header family (a short-header source-protected project would
+                    # otherwise misread every parameter as a local tag), so classify
+                    # with short_header=False. Degrades to today's local-tag routing
+                    # if no key validates.
+                    try:
+                        ext01 = CompsRecord.read_ext_attrs_from_record(child_rec).get(0x01, b"")
+                        usage, _, _ = _aoi_tag_usage(ext01, short_header=False)
+                        is_param = usage in ("Input", "Output", "InOut")
+                    except Exception:
+                        pass
 
                 if is_param:
                     try:

@@ -283,6 +283,29 @@ class CompsRecord:
         return _SH_BODY_OFF if short_header else CompsRecord._LONG_BODY_OFF
 
     @staticmethod
+    def read_ext_attrs_from_record(record: bytes, full: bool = False) -> dict:
+        """Recover {attribute_id: bytes} from a source-protected component record.
+
+        ``record`` is the RxGeneric body (the same bytes passed to
+        RxGeneric.from_bytes: 14B prelude + 60B main_record + ext-attr tail). When
+        the tail is source-protected its plaintext count at body+78 is replaced by
+        the marker and the rest is AES-encrypted; decrypt it to the ordinary attr
+        table. Returns {} when there is no marker (a plaintext record) or no key
+        validates, so callers fall back to their existing behaviour. The search
+        starts past the 74-byte prelude+main so a marker-like byte sequence inside
+        the plaintext main_record is never matched.
+        """
+        try:
+            midx = record.find(_SP_MARKER, 74)
+            if midx < 0:
+                return {}
+            ct = record[midx + _SP_CT_OFFSET:]
+            ct = ct[:(len(ct) // 16) * 16]
+            return _decrypt_value_attrs(ct, full=full) or {}
+        except Exception:
+            return {}
+
+    @staticmethod
     def read_value_attrs(full_payload: bytes, short_header: bool, full: bool = False) -> dict:
         """Walk a cip-0x6a backing's body and return {attribute_id: bytes}.
 
