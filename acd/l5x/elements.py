@@ -2881,15 +2881,17 @@ class TagBuilder(L5xElementBuilder):
         module's friendly name yields the module element (e.g. ``Local:1:I``).
         The aliased bit is in the tag record at byte ``0x26 & 0x1F``.
 
-        Only the EMBEDDED-IO sub-case (module friendly name ``Local``) has a
-        cracked, byte-exact suffix: ``<module>:<slot>:<type>.Data.<bit>`` (the
-        ``.Data.`` member is implicit for embedded I/O).  Validated 13/13 on
-        PROJ_A and 24/24 on PROJ_C.  The alias-into-alias sub-case (a
-        non-``Local`` parent module, e.g. ``<Module>``) uses a DIFFERENT
-        byte-0x26 encoding and a ``.<bit>`` (no ``.Data``) suffix that is not yet
-        cracked; for those we return None so the caller keeps the tag as Base
-        rather than emit a wrong (and invalid) ``TagType="Alias"`` without a
-        correct AliasFor.
+        Two module sub-cases are cracked byte-exact:
+          * EMBEDDED-IO (module friendly name ``Local``): suffix
+            ``<module>:<slot>:<type>.Data.<bit>`` with ``bit = raw_rec[0x26] & 0x1F``
+            (the ``.Data.`` member is implicit). Validated 13/13 PROJ_A, 24/24 PROJ_C.
+          * NETWORKED module I/O (a real module, name != ``Local``): suffix
+            ``<module>:<slot>:<type>.<bit>`` (no ``.Data``) with
+            ``bit = u32@raw_rec[0x26] - (64 + slot*8)``, accepted only for a slotted
+            target with ``bit`` in 0..7. Validated byte-exact on the long-header pool.
+        Any other target (slotless, config ``:C``, multi-byte channel-structured
+        analog point, or whole-element) returns None so the caller keeps the tag as
+        Base rather than emit a wrong (and schema-invalid) ``TagType="Alias"``.
 
         Returns the full AliasFor string when it can be built byte-exactly, or
         None on any failure / uncracked sub-case (no regression).
@@ -2918,9 +2920,31 @@ class TagBuilder(L5xElementBuilder):
             if not prow or not prow[0]:
                 return None
             module_name = prow[0]
-            # Only the embedded-IO (module "Local") suffix is cracked byte-exact.
             if module_name != "Local":
-                return None
+                # Networked module I/O alias (a remote-rack point on a real module,
+                # not the embedded Local chassis). The target is &<hex>:<slot>:<I|O>
+                # and the aliased bit is a u32 at raw_rec[0x26] measured from a
+                # per-slot base of 64 + slot*8 bits; the suffix is a bare ".<bit>"
+                # (NOT the Local branch's ".Data.<bit>"). Only a slotted target whose
+                # offset lands in a single byte (bit 0..7) is a byte-exact bit alias;
+                # a slotless/config target, a multi-byte channel-structured point
+                # (analog .ChNData/.ChNFault), or a whole-element reference is left as
+                # Base rather than emit a wrong AliasFor. Validated byte-exact vs OEM
+                # on the long-header pool (PROJ_F 38, PROJ_G 34, PROJ_B 12,
+                # PROJ_A 11). This branch runs only on the long-header path (build()
+                # gates on `not short_header`); short-header networked aliases are
+                # resolved separately by _short_header_alias_for. Extending it to the
+                # short-header families would additionally need an alias-is-BOOL /
+                # flat-primitive-target gate to exclude whole-element and named-member
+                # points whose offset also lands in 0..7.
+                ms = re.match(r"^:(\d+):([IO])$", m.group(2))
+                if not ms or len(raw_rec) < 0x2A:
+                    return None
+                slot = int(ms.group(1))
+                bit = struct.unpack_from("<I", raw_rec, 0x26)[0] - (64 + slot * 8)
+                if not (0 <= bit <= 7):
+                    return None
+                return module_name + m.group(2) + ".%d" % bit
             if len(raw_rec) <= 0x26:
                 return None
             bit = raw_rec[0x26] & 0x1F
