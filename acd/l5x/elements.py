@@ -5490,6 +5490,36 @@ class ControllerBuilder(L5xElementBuilder):
             keep_alias = bool(tag.alias_for)
             if (keep_typed or keep_alias) and not tag.name.startswith("$") and (tag._io or ":" not in tag.name) and not tag.name.startswith("__"):
                 tags.append(tag)
+                # Installed forces apply to EVERY tag type (I/O, Produced, Consumed,
+                # Base, status :S), so read the force pointer for every kept tag with a
+                # value image. A forced tag's backing points at its force-image holder
+                # via the 4-byte ext-attr 0x6b, present only when forces are installed.
+                # A genuine force image is exactly 3x the tag's data image
+                # (mask/value/state) -- that invariant gates out the other small blobs
+                # 0x6b resolves to on the occasional unforced tag. Set before to_xml so
+                # the rendered <Data> (and the captured InputTag/OutputTag below) carry
+                # the <ForceData>.
+                if tag._value_bytes:
+                    self._cur.execute(
+                        "SELECT record FROM comps_full WHERE object_id=?",
+                        (_tag_object_id,),
+                    )
+                    _fr = self._cur.fetchone()
+                    if _fr:
+                        _frb = bytes(_fr[0])
+                        try:
+                            # The short read exposes 0x6b only when forces are
+                            # actually installed; the full decryption also surfaces the
+                            # idle force allocation every tag carries, which would
+                            # over-emit on unforced tags, so deliberately do NOT use it.
+                            _fv = CompsRecord.read_value_attrs(
+                                _frb, self._short_header).get(0x6B)
+                        except Exception:
+                            _fv = None
+                        if _fv and len(_fv) == 4:
+                            _fimg = force_pool.get(struct.unpack("<I", _fv)[0])
+                            if _fimg and len(_fimg) == 3 * len(tag._value_bytes):
+                                tag._force_data = _tag_value.render_hex(_fimg)
                 # Capture this module's <Communications> tag content from its config
                 # (:C), input (:I) and output (:O) controller tags. The stored name is
                 # &<hex>:<slot>:X (slotted card) or &<hex>:X (Ethernet device); the hex
@@ -5502,32 +5532,6 @@ class ControllerBuilder(L5xElementBuilder):
                         ref_oid = int(cm.group(1), 16)
                         ref_slot = int(cm.group(2)) if cm.group(2) is not None else None
                         io_type = cm.group(3)
-                        # Installed forces: a forced input/output tag's backing points
-                        # at its force-image holder via ext-attr 0x6b. Set _force_data
-                        # before to_xml so the rendered <Data> carries the <ForceData>.
-                        if io_type in ("I", "O") and force_pool:
-                            self._cur.execute(
-                                "SELECT record FROM comps_full WHERE object_id=?",
-                                (_tag_object_id,),
-                            )
-                            _fr = self._cur.fetchone()
-                            if _fr:
-                                try:
-                                    _fa = CompsRecord.read_value_attrs(
-                                        bytes(_fr[0]), self._short_header)
-                                    _fv = _fa.get(0x6B)
-                                except Exception:
-                                    _fv = None
-                                if _fv and len(_fv) == 4:
-                                    _fimg = force_pool.get(
-                                        struct.unpack("<I", _fv)[0])
-                                    # A genuine force image is exactly 3x the tag's
-                                    # data image (force mask/value/state). The 0x6b
-                                    # attr resolves to other small blobs on unforced
-                                    # tags, so this invariant gates out the false
-                                    # positives that would otherwise be over-emitted.
-                                    if _fimg and len(_fimg) == 3 * len(tag._value_bytes):
-                                        tag._force_data = _tag_value.render_hex(_fimg)
                         rendered = tag.to_xml()
                         gt = rendered.find(">")
                         inner = rendered[gt + 1:]
