@@ -1158,6 +1158,11 @@ class Tag(L5xElement):
     # tag_type is "Produced" and a <ProduceInfo/> child is emitted as the first
     # child (before Comments/Data). None for ordinary tags.
     _produce_info: Union[dict, None] = None
+    # Force image hex for an I/O tag that has installed forces: emitted as a
+    # <ForceData> block between the value <Data> blocks (after the binary/L5K image,
+    # before the Decorated tree). None for tags with no force holder. Set by
+    # ControllerBuilder from the tag's force-holder ext-attr (0x6b).
+    _force_data: Union[str, None] = None
 
     def _inject_tag_attrs(self, base: str) -> str:
         """Insert OpcUaAccess / Class attributes into the opening <Tag ...> of base.
@@ -1410,12 +1415,17 @@ class Tag(L5xElement):
                         )
                     first = f'<Data Format="L5K">\n<![CDATA[{l5k_text}]]>\n</Data>'
                     ok_first = l5k_text is not None
+                # <ForceData> for an I/O tag with installed forces sits between the
+                # binary/L5K value block and the Decorated tree (the order Logix uses).
+                force_block = (f'<ForceData>{self._force_data}</ForceData>'
+                               if self._force_data else '')
                 if string_block is not None:
                     # Scalar STRING: first block (raw hex / L5K) then the String block.
                     if ok_first:
                         data_xml = first + string_block
                 elif ok_first and decorated_inner is not None:
-                    data_xml = first + f'<Data Format="Decorated">\n{decorated_inner}\n</Data>'
+                    data_xml = (first + force_block
+                                + f'<Data Format="Decorated">\n{decorated_inner}\n</Data>')
             except Exception:
                 data_xml = ""
 
@@ -5433,6 +5443,24 @@ class ControllerBuilder(L5xElementBuilder):
         # reference parsed from the tag's stored name so the owning module can look it
         # up; see ModuleBuilder for the key shape and per-IO-type value.
         io_data_map: Dict[tuple, dict] = {}
+        # Force-image holders: RxDataCollection children carry an I/O tag's installed
+        # force image as a length-prefixed blob at record offset 410 (u32 length at
+        # 406), keyed by object id. A forced I/O tag points at its holder via the
+        # 4-byte ext-attr 0x6b on the tag's backing. Built once and looked up below.
+        force_pool: Dict[int, bytes] = {}
+        try:
+            self._cur.execute(
+                "SELECT c.object_id, c.record FROM comps c JOIN comps p "
+                "ON c.parent_id = p.object_id WHERE p.comp_name = 'RxDataCollection'"
+            )
+            for _foid, _frec in self._cur.fetchall():
+                _frec = bytes(_frec)
+                if len(_frec) >= 410:
+                    _flen = struct.unpack_from("<I", _frec, 406)[0]
+                    if 0 < _flen <= len(_frec) - 410:
+                        force_pool[_foid] = _frec[410:410 + _flen]
+        except Exception:
+            force_pool = {}
         for result in results:
             _tag_object_id = result[1]
             tag = TagBuilder(self._cur, _tag_object_id, _short_header=self._short_header,
@@ -5474,6 +5502,32 @@ class ControllerBuilder(L5xElementBuilder):
                         ref_oid = int(cm.group(1), 16)
                         ref_slot = int(cm.group(2)) if cm.group(2) is not None else None
                         io_type = cm.group(3)
+                        # Installed forces: a forced input/output tag's backing points
+                        # at its force-image holder via ext-attr 0x6b. Set _force_data
+                        # before to_xml so the rendered <Data> carries the <ForceData>.
+                        if io_type in ("I", "O") and force_pool:
+                            self._cur.execute(
+                                "SELECT record FROM comps_full WHERE object_id=?",
+                                (_tag_object_id,),
+                            )
+                            _fr = self._cur.fetchone()
+                            if _fr:
+                                try:
+                                    _fa = CompsRecord.read_value_attrs(
+                                        bytes(_fr[0]), self._short_header)
+                                    _fv = _fa.get(0x6B)
+                                except Exception:
+                                    _fv = None
+                                if _fv and len(_fv) == 4:
+                                    _fimg = force_pool.get(
+                                        struct.unpack("<I", _fv)[0])
+                                    # A genuine force image is exactly 3x the tag's
+                                    # data image (force mask/value/state). The 0x6b
+                                    # attr resolves to other small blobs on unforced
+                                    # tags, so this invariant gates out the false
+                                    # positives that would otherwise be over-emitted.
+                                    if _fimg and len(_fimg) == 3 * len(tag._value_bytes):
+                                        tag._force_data = _tag_value.render_hex(_fimg)
                         rendered = tag.to_xml()
                         gt = rendered.find(">")
                         inner = rendered[gt + 1:]
@@ -5487,12 +5541,15 @@ class ControllerBuilder(L5xElementBuilder):
                         elif io_type == "O" and inner:
                             slot_entry["O"] = inner
                         elif io_type == "I":
-                            # InputTag is the Decorated block only (no binary image).
+                            # InputTag is the Decorated block only (no binary image),
+                            # preceded by <ForceData> when the tag carries forces.
                             di = inner.find('<Data Format="Decorated">')
                             if di >= 0:
                                 end = inner.find("</Data>", di)
                                 if end >= 0:
-                                    slot_entry["I"] = inner[di:end + len("</Data>")]
+                                    fblock = (f'<ForceData>{tag._force_data}</ForceData>'
+                                              if tag._force_data else '')
+                                    slot_entry["I"] = fblock + inner[di:end + len("</Data>")]
 
         # Get the Program Collection and get the programs
         self._cur.execute(
