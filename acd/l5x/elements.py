@@ -1552,6 +1552,12 @@ class Module(L5xElement):
     # True when the project's OPC UA server is enabled; module IO tag stubs then
     # carry OpcUaAccess="None" (see ExportL5x.project_flags).
     _opc_ua: bool = field(default=False)
+    # ConfigTag content for this module: the rendered inner XML (binary + Decorated
+    # <Data> blocks, captured byte-for-byte from the module's controller :C tag) and
+    # the ConfigSize. Both None -> no <ConfigTag> is emitted. Set by ModuleBuilder
+    # only for a module that owns a :C controller tag (the proven discriminator).
+    _config_inner: Union[str, None] = field(default=None)
+    _config_size: Union[int, None] = field(default=None)
 
     def __post_init__(self):
         super().__post_init__()
@@ -1625,9 +1631,22 @@ class Module(L5xElement):
                 )
             joined = "".join(conn_parts)
             connections_xml = f'<Connections>{joined}</Connections>' if joined else '<Connections/>'
+            # <ConfigTag> — the module's config assembly image, emitted as the first
+            # child of <Communications> (before <Connections>). The content is the
+            # module's controller :C tag <Data> blocks (captured verbatim); a module
+            # gets a ConfigTag iff it owns such a tag. ExternalAccess is always
+            # Read/Write; OpcUaAccess="None" mirrors the IO-tag-stub rule.
+            config_xml = ""
+            if self._config_inner is not None and self._config_size is not None:
+                opc = ' OpcUaAccess="None"' if self._opc_ua else ''
+                config_xml = (
+                    f'<ConfigTag ConfigSize="{self._config_size}"'
+                    f' ExternalAccess="Read/Write"{opc}>'
+                    f'{self._config_inner}</ConfigTag>'
+                )
             comm_xml = (
                 f'<Communications CommMethod="{self._comm_method}">'
-                f'{connections_xml}'
+                f'{config_xml}{connections_xml}'
                 f'</Communications>'
             )
 
@@ -2603,6 +2622,16 @@ class ModuleBuilder(L5xElementBuilder):
     # by ControllerBuilder (see _build_connection_map). Empty -> connection values
     # fall back to the import defaults.
     _conn_decode: Dict[int, dict] = field(default_factory=dict)
+    # Module ConfigTag content, built by ControllerBuilder. Keyed by the &hex
+    # object-id reference of the module's controller :C tag: (parent_object_id,
+    # slot) for a slotted card and (self_object_id, None) for an Ethernet device.
+    # Each value is (config_inner_xml, config_size). Empty -> no ConfigTag.
+    _config_map: Dict[tuple, tuple] = field(default_factory=dict)
+    # Map module modid (u32) → comps object_id, built with the short-header marker
+    # fallback so it is complete on V10..V20 too. Lets a module resolve its parent's
+    # object_id for the _config_map key without depending on friendly-name
+    # resolution (which can mis-parent motion axes on short-header projects).
+    _modid_to_oid: Dict[int, int] = field(default_factory=dict)
 
     def _ip_from_data_collection(self, icp_slot: int) -> str:
         """Look up the Ethernet IP for a local backplane module via RxDataCollection.
@@ -3050,6 +3079,23 @@ class ModuleBuilder(L5xElementBuilder):
             except Exception:
                 pass
 
+        # ConfigTag: a module emits <ConfigTag> iff it owns a controller :C tag
+        # (verified: the reference's ConfigTag set equals its set of Local:N:C config
+        # tags). The :C tag is stored as &<parentOid>:<slot>:C (slotted card) or &<selfOid>:C
+        # (Ethernet device); resolving the owner by object_id rather than the
+        # friendly parent name avoids the slot collision a mis-parented motion axis
+        # would otherwise cause. Try the Ethernet (self) key first, then the slotted
+        # (parent, slot) key.
+        config_inner = None
+        config_size = None
+        cfg = self._config_map.get((self._object_id, None))
+        if cfg is None:
+            parent_oid = self._modid_to_oid.get(parent_modid)
+            if parent_oid is not None:
+                cfg = self._config_map.get((parent_oid, slot))
+        if cfg is not None:
+            config_inner, config_size = cfg
+
         # Project-level OPC UA flag (see ExportL5x.project_flags); same pattern as
         # TagBuilder. When the project's OPC UA server is on, module IO tag stubs
         # carry OpcUaAccess="None".
@@ -3097,6 +3143,8 @@ class ModuleBuilder(L5xElementBuilder):
             _connections=connections,
             _extended_properties=extended_properties,
             _opc_ua=_opc_ua,
+            _config_inner=config_inner,
+            _config_size=config_size,
         )
 
 
@@ -5193,6 +5241,12 @@ class ControllerBuilder(L5xElementBuilder):
         # child; unlike Consumed it keeps its Constant attribute (OEM emits it).
         produce_map = _build_produce_map(self._cur, self._short_header)
         tags: List[Tag] = []
+        # Module ConfigTag content, captured from the controller :C tags as they are
+        # built (the :C tag's rendered <Data> blocks ARE the module's ConfigTag
+        # content, validated byte-identical to the reference). Keyed by the &hex
+        # object-id reference parsed from the tag's stored name so the owning module
+        # can look it up; see ModuleBuilder for the key shape.
+        config_data_map: Dict[tuple, tuple] = {}
         for result in results:
             _tag_object_id = result[1]
             tag = TagBuilder(self._cur, _tag_object_id, _short_header=self._short_header,
@@ -5222,6 +5276,25 @@ class ControllerBuilder(L5xElementBuilder):
             keep_alias = bool(tag.alias_for)
             if (keep_typed or keep_alias) and not tag.name.startswith("$") and (tag._io or ":" not in tag.name) and not tag.name.startswith("__"):
                 tags.append(tag)
+                # Capture this module's ConfigTag content if it is a config (:C)
+                # I/O tag. The stored name is &<hex>:<slot>:C (slotted card) or
+                # &<hex>:C (Ethernet device); the hex is the comps object_id the
+                # owning module resolves against. ConfigSize = first u32 of the
+                # config image minus 4 (validated against the reference).
+                if (tag._io and tag.name.endswith(":C")
+                        and tag._value_bytes and len(tag._value_bytes) >= 4):
+                    cm = re.match(r"^&([0-9a-fA-F]+)(?::(\d+))?:C$", result[0])
+                    if cm:
+                        ref_oid = int(cm.group(1), 16)
+                        ref_slot = int(cm.group(2)) if cm.group(2) is not None else None
+                        rendered = tag.to_xml()
+                        gt = rendered.find(">")
+                        inner = rendered[gt + 1:]
+                        if inner.endswith("</Tag>"):
+                            inner = inner[:-len("</Tag>")]
+                        if inner:
+                            size = int.from_bytes(tag._value_bytes[0:4], "little") - 4
+                            config_data_map[(ref_oid, ref_slot)] = (inner, size)
 
         # Get the Program Collection and get the programs
         self._cur.execute(
@@ -5321,6 +5394,10 @@ class ControllerBuilder(L5xElementBuilder):
             # First pass: build modid→name map so child modules can resolve their parent name.
             from acd.generated.comps.rx_generic import RxGeneric as _RxG
             modid_to_name: Dict[int, str] = {}
+            # modid→object_id map for ConfigTag keying. Unlike modid_to_name (left
+            # as-is to avoid changing the emitted ParentModule), this applies the
+            # short-header 44 02 00 00 marker fallback so it is complete on V10..V20.
+            modid_to_oid: Dict[int, int] = {}
             for db_name, mod_oid, mod_rec in mod_rows:
                 display_name = "?" if (db_name.startswith("$") and db_name.endswith("$")) else db_name
                 try:
@@ -5331,6 +5408,14 @@ class ControllerBuilder(L5xElementBuilder):
                         if len(e1) >= 0x30:
                             modid = struct.unpack("<I", e1[0x2C:0x30])[0]
                             modid_to_name[modid] = display_name
+                        e1o = e1
+                        if len(e1o) < 0x30:
+                            raw_mr = bytes(mod_rec)
+                            mk = raw_mr.find(b"\x44\x02\x00\x00")
+                            if mk >= 0 and len(raw_mr) - (mk + 4) >= 0x30:
+                                e1o = raw_mr[mk + 4:]
+                        if len(e1o) >= 0x30:
+                            modid_to_oid[struct.unpack("<I", e1o[0x2C:0x30])[0]] = mod_oid
                 except Exception:
                     pass
 
@@ -5341,7 +5426,9 @@ class ControllerBuilder(L5xElementBuilder):
             for _, mod_oid, _ in mod_rows:
                 modules.append(
                     ModuleBuilder(self._cur, mod_oid, modid_to_name,
-                                  _conn_decode=conn_decode).build()
+                                  _conn_decode=conn_decode,
+                                  _config_map=config_data_map,
+                                  _modid_to_oid=modid_to_oid).build()
                 )
 
             # Third pass: compute (parent_name, parent_port_id) → child count,
