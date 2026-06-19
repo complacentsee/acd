@@ -1013,6 +1013,86 @@ def _build_connection_map(cur, short_header: bool) -> Dict[int, dict]:
     return out
 
 
+# Module config images that have no controller :C tag are emitted as <ConfigData>
+# (raw image, no Decorated tree) and an optional <ConfigScript>. The image lives in
+# a hash-named child of RxDataCollection; the module points at it by object id.
+_CONFIG_IMG_MAX = 65536          # sanity bound on a derived ConfigSize/Size
+_CONFIG_MARK = b"\x44\x02\x00\x00"
+_CONFIG_IMG_VALUE = 0x66          # ext-attr holding the config/script image
+
+
+def _build_config_holders(cur):
+    """Index RxDataCollection holder records for ConfigData/ConfigScript lookup.
+
+    Returns (by_mr28, by_cid, pool_oids):
+      * by_mr28 {u32 -> object_id}: the holder's main_record@0x28 (record[54:58]),
+        unique only -- used by the long-header ConfigData link (module e1[0x20:0x24]).
+      * by_cid  {u16 -> object_id}: the holder's comment_id (record[12:14]), unique
+        only -- used by the ConfigScript link (module e1[556:558]).
+      * pool_oids: the set of holder object_ids (used by the short-header ConfigData
+        trailer pointer).
+    Only unique keys are kept so an ambiguous (byte-identical-sibling) link is simply
+    skipped rather than mislinked. Returns empty maps on any failure.
+    """
+    by_mr28: Dict[int, object] = {}
+    by_cid: Dict[int, object] = {}
+    pool_oids = set()
+    seen28: Dict[int, int] = {}
+    seencid: Dict[int, int] = {}
+    try:
+        cur.execute(
+            "SELECT c.object_id, c.record FROM comps c JOIN comps p "
+            "ON c.parent_id = p.object_id WHERE p.comp_name = 'RxDataCollection'"
+        )
+        for oid, rec in cur.fetchall():
+            rec = bytes(rec)
+            pool_oids.add(oid)
+            if len(rec) >= 58:
+                mr28 = struct.unpack_from("<I", rec, 54)[0]
+                seen28[mr28] = seen28.get(mr28, 0) + 1
+                by_mr28[mr28] = oid
+            if len(rec) >= 14:
+                cid = struct.unpack_from("<H", rec, 12)[0]
+                seencid[cid] = seencid.get(cid, 0) + 1
+                by_cid[cid] = oid
+        by_mr28 = {k: v for k, v in by_mr28.items() if seen28[k] == 1}
+        by_cid = {k: v for k, v in by_cid.items() if seencid[k] == 1}
+    except Exception:
+        return {}, {}, set()
+    return by_mr28, by_cid, pool_oids
+
+
+def _config_holder_image(cur, oid, short_header):
+    """Return the raw config image bytes stored in holder record ``oid``, or None.
+
+    The image is the ext-attribute 0x66 value (read from comps_full), falling back to
+    the length-prefixed blob at record offset 410 (record[406:410] = byte length).
+    """
+    try:
+        cur.execute("SELECT record FROM comps_full WHERE object_id=?", (oid,))
+        row = cur.fetchone()
+        if row:
+            full = bytes(row[0])
+            try:
+                attrs = CompsRecord.read_value_attrs(full, short_header)
+                img = attrs.get(_CONFIG_IMG_VALUE)
+                if img and len(img) >= 4:
+                    return bytes(img)
+            except Exception:
+                pass
+        cur.execute("SELECT record FROM comps WHERE object_id=?", (oid,))
+        row = cur.fetchone()
+        if row:
+            rec = bytes(row[0])
+            if len(rec) >= 414:
+                length = struct.unpack_from("<I", rec, 406)[0]
+                if 4 <= length <= len(rec) - 410:
+                    return rec[410:410 + length]
+    except Exception:
+        return None
+    return None
+
+
 @dataclass
 class Tag(L5xElement):
     name: str
@@ -1565,6 +1645,12 @@ class Module(L5xElement):
     # that tag type (an unambiguous mapping; see to_xml).
     _input_inner: Union[str, None] = field(default=None)
     _output_inner: Union[str, None] = field(default=None)
+    # <ConfigData>/<ConfigScript> for a module with a config image but no controller
+    # :C tag (mutually exclusive with the ConfigTag above). Each is (hex_data, size)
+    # or None. The raw <Data> is masked by the comparator; the size attribute is the
+    # scored value. Emitted before <Connections> (ConfigData first, then ConfigScript).
+    _config_data: "Union[Tuple[str, int], None]" = field(default=None)
+    _config_script: "Union[Tuple[str, int], None]" = field(default=None)
 
     def __post_init__(self):
         super().__post_init__()
@@ -1664,9 +1750,28 @@ class Module(L5xElement):
                     f' ExternalAccess="Read/Write"{opc}>'
                     f'{self._config_inner}</ConfigTag>'
                 )
+            elif self._config_data is not None:
+                # <ConfigData> — the raw config image for a module with no :C tag
+                # (mutually exclusive with <ConfigTag>). Single raw <Data> block; the
+                # comparator masks the bytes, the ConfigSize is the scored value.
+                cd_hex, cd_size = self._config_data
+                config_xml = (
+                    f'<ConfigData ConfigSize="{cd_size}">'
+                    f'<Data>{cd_hex}</Data></ConfigData>'
+                )
+            # <ConfigScript> — an optional raw script blob, after ConfigData/ConfigTag
+            # and before <Connections>. Size is the blob byte length (scored); the
+            # <Data> bytes are masked.
+            script_xml = ""
+            if self._config_script is not None:
+                cs_hex, cs_size = self._config_script
+                script_xml = (
+                    f'<ConfigScript Size="{cs_size}">'
+                    f'<Data>{cs_hex}</Data></ConfigScript>'
+                )
             comm_xml = (
                 f'<Communications CommMethod="{self._comm_method}">'
-                f'{config_xml}{connections_xml}'
+                f'{config_xml}{script_xml}{connections_xml}'
                 f'</Communications>'
             )
 
@@ -2654,6 +2759,12 @@ class ModuleBuilder(L5xElementBuilder):
     # object_id for the _io_map key without depending on friendly-name resolution
     # (which can mis-parent motion axes on short-header projects).
     _modid_to_oid: Dict[int, int] = field(default_factory=dict)
+    # RxDataCollection holder indexes for <ConfigData>/<ConfigScript> (modules with a
+    # config image but no controller :C tag). Built by _build_config_holders.
+    _cfg_by_mr28: Dict[int, int] = field(default_factory=dict)
+    _cfg_by_cid: Dict[int, int] = field(default_factory=dict)
+    _cfg_pool: set = field(default_factory=set)
+    _short_header: bool = field(default=False)
 
     def _ip_from_data_collection(self, icp_slot: int) -> str:
         """Look up the Ethernet IP for a local backplane module via RxDataCollection.
@@ -3125,6 +3236,47 @@ class ModuleBuilder(L5xElementBuilder):
             input_inner = entry.get("I")
             output_inner = entry.get("O")
 
+        # <ConfigData>/<ConfigScript>: a module with a config image but NO controller
+        # :C tag (mutually exclusive with ConfigTag) carries the image as a raw
+        # <ConfigData> plus an optional <ConfigScript>. The image lives in a hash-named
+        # RxDataCollection holder the module points at by object id. Resolve the holder,
+        # read its image, derive ConfigSize/Size, and guard with a sanity bound so a
+        # stray short-header pointer never emits a garbage size. Only attempted when no
+        # ConfigTag was found for this module (config_inner is None).
+        configdata = None   # (hex_data, ConfigSize)
+        configscript = None  # (hex_data, Size)
+        if config_inner is None and (self._cfg_by_mr28 or self._cfg_pool):
+            # ConfigData holder: long-header via e1[0x20:0x24] -> holder main_record@0x28;
+            # short-header via the 16-byte trailer before the identity marker (object id
+            # at marker-12 .. marker-8), falling back to e1[624:628].
+            cd_oid = None
+            if self._short_header:
+                mk = raw_rec.find(_CONFIG_MARK)
+                if mk >= 12:
+                    cand = struct.unpack_from("<I", raw_rec, mk - 8)[0]
+                    if cand in self._cfg_pool:
+                        cd_oid = cand
+                if cd_oid is None and len(e1) >= 628:
+                    cand = struct.unpack_from("<I", e1, 624)[0]
+                    if cand in self._cfg_pool:
+                        cd_oid = cand
+            elif len(e1) >= 0x24:
+                cd_oid = self._cfg_by_mr28.get(struct.unpack_from("<I", e1, 0x20)[0])
+            if cd_oid is not None:
+                img = _config_holder_image(self._cur, cd_oid, self._short_header)
+                if img is not None and len(img) >= 4:
+                    csize = struct.unpack_from("<I", img, 0)[0] - 4
+                    if 0 <= csize <= _CONFIG_IMG_MAX:
+                        configdata = (_tag_value.render_hex(img), csize)
+            # ConfigScript holder: comment_id at e1[556:558] -> holder; Size = image len.
+            if len(e1) >= 558:
+                cs_cid = struct.unpack_from("<H", e1, 556)[0]
+                cs_oid = self._cfg_by_cid.get(cs_cid) if cs_cid else None
+                if cs_oid is not None:
+                    img = _config_holder_image(self._cur, cs_oid, self._short_header)
+                    if img is not None and 0 < len(img) <= _CONFIG_IMG_MAX:
+                        configscript = (_tag_value.render_hex(img), len(img))
+
         # Project-level OPC UA flag (see ExportL5x.project_flags); same pattern as
         # TagBuilder. When the project's OPC UA server is on, module IO tag stubs
         # carry OpcUaAccess="None".
@@ -3176,6 +3328,8 @@ class ModuleBuilder(L5xElementBuilder):
             _config_size=config_size,
             _input_inner=input_inner,
             _output_inner=output_inner,
+            _config_data=configdata,
+            _config_script=configscript,
         )
 
 
@@ -5464,15 +5618,21 @@ class ControllerBuilder(L5xElementBuilder):
                     pass
 
             # Second pass: build Module objects. The connection decode map (RPI/
-            # Unicast/EventID per connection record) is built once and shared.
+            # Unicast/EventID per connection record) and the ConfigData/ConfigScript
+            # holder indexes are built once and shared.
             conn_decode = _build_connection_map(self._cur, self._short_header)
+            cfg_mr28, cfg_cid, cfg_pool = _build_config_holders(self._cur)
             modules = []
             for _, mod_oid, _ in mod_rows:
                 modules.append(
                     ModuleBuilder(self._cur, mod_oid, modid_to_name,
                                   _conn_decode=conn_decode,
                                   _io_map=io_data_map,
-                                  _modid_to_oid=modid_to_oid).build()
+                                  _modid_to_oid=modid_to_oid,
+                                  _cfg_by_mr28=cfg_mr28,
+                                  _cfg_by_cid=cfg_cid,
+                                  _cfg_pool=cfg_pool,
+                                  _short_header=self._short_header).build()
                 )
 
             # Third pass: compute (parent_name, parent_port_id) → child count,
