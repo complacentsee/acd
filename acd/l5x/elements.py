@@ -943,20 +943,38 @@ _CONN_TYPE_BY_FMT = {
 }
 _CONN_FMT_OFF = 0           # u16 connection-format word (-> _CONN_TYPE_BY_FMT)
 _CONN_RPI_OFF = 2           # u32 requested packet interval (microseconds)
+_CONN_ICXN_OFF = 6          # u16 InputCxnPoint
+_CONN_ISIZE_OFF = 12        # u16 InputSize
+_CONN_OCXN_OFF = 20         # u16 OutputCxnPoint
+_CONN_OSIZE_OFF = 26        # u16 OutputSize
 _CONN_EVENT_OFF = 298       # u8 EventID
 _CONN_TRANSPORT_OFF = 323   # u8 transport type (2 == unicast, else multicast)
+# Data-driven connection formats always carry the connection size; the plain
+# Output format carries size AND connection points, but only for generic/drive
+# modules (see ModuleBuilder).
+_CONN_FMT_OUTPUT = 6
+_CONN_DATADRIVEN_FMTS = {48, 49, 50}
+# Modules whose I/O assembly is user-configured rather than fixed by a catalog
+# Module Definition state their connection points and sizes explicitly. These are
+# the drive families (CIP ProductType below) and the generic profiles (ProductType
+# 0 with the Rockwell vendor id); a catalog I/O card omits them because its
+# Module Definition already fixes the assembly. See ModuleBuilder.
+_CONN_DIRECT_PRODUCT_TYPES = {123, 127, 142, 143, 150, 151}
+_CONN_GENERIC_VENDOR = 1
 
 
 def _build_connection_map(cur, short_header: bool) -> Dict[int, dict]:
     """Map a module connection record's object_id -> decoded connection values.
 
-    Decodes the RPI, transport (Unicast) and EventID for every cip-0x69 record
-    under a RxMapConnectionCollection whose parameter blob (ext-attr 0x01) leads
-    with a recognised module connection-format word. ModuleBuilder looks the
-    decoded values up by the connection record's object_id; records that are not
-    module connections (e.g. produced/consumed tag connections, or other format
-    words) are simply absent from the map and keep the caller's defaults. Returns
-    {} on any failure.
+    Decodes, for every cip-0x69 record under a RxMapConnectionCollection whose
+    parameter blob (ext-attr 0x01) leads with a recognised module connection
+    format word: the format word, Type, RPI, transport (Unicast), EventID, and the
+    raw InputSize/OutputSize/InputCxnPoint/OutputCxnPoint. ModuleBuilder looks the
+    values up by the connection record's object_id and decides which of the
+    size/connection-point attributes to emit. Records that are not module
+    connections (e.g. produced/consumed tag connections, or other format words)
+    are simply absent from the map and keep the caller's defaults. Returns {} on
+    any failure.
     """
     out: Dict[int, dict] = {}
     try:
@@ -980,9 +998,15 @@ def _build_connection_map(cur, short_header: bool) -> Dict[int, dict]:
             if fmt not in _CONN_TYPE_BY_FMT:
                 continue
             out[oid] = {
+                "fmt": fmt,
+                "Type": _CONN_TYPE_BY_FMT[fmt],
                 "RPI": str(struct.unpack_from("<I", blob, _CONN_RPI_OFF)[0]),
                 "Unicast": "true" if blob[_CONN_TRANSPORT_OFF] == 2 else "false",
                 "EventID": str(blob[_CONN_EVENT_OFF]),
+                "InputCxnPoint": struct.unpack_from("<H", blob, _CONN_ICXN_OFF)[0],
+                "InputSize": struct.unpack_from("<H", blob, _CONN_ISIZE_OFF)[0],
+                "OutputCxnPoint": struct.unpack_from("<H", blob, _CONN_OCXN_OFF)[0],
+                "OutputSize": struct.unpack_from("<H", blob, _CONN_OSIZE_OFF)[0],
             }
     except Exception:
         return out
@@ -1518,10 +1542,12 @@ class Module(L5xElement):
     _description: str = field(default="")
     _comm_method: Union[str, None] = field(default=None)
     # Each entry: (name, rpi_str, conn_type_str)
-    # Each connection: (Name, RPI, Type, Unicast, EventID). RPI/Unicast/EventID
-    # are decoded from the connection record when available, else carry the
-    # defaults the import accepts.
-    _connections: List[Tuple[str, str, str, str, str]] = field(default_factory=list)
+    # Each connection is a dict with keys: name, type, rpi, unicast, event_id,
+    # stub_output (bool, drives the InputTag/OutputTag stubs), and the optional
+    # InputCxnPoint/OutputCxnPoint/InputSize/OutputSize (present only when OEM
+    # emits them, set by ModuleBuilder). Values are decoded from the connection
+    # record when available, else carry the defaults the import accepts.
+    _connections: List[dict] = field(default_factory=list)
     _extended_properties: str = field(default="")
     # True when the project's OPC UA server is enabled; module IO tag stubs then
     # carry OpcUaAccess="None" (see ExportL5x.project_flags).
@@ -1571,10 +1597,11 @@ class Module(L5xElement):
                 return f'<{tag} ExternalAccess="{ext_access}"{opc}/>'
 
             conn_parts: List[str] = []
-            for (conn_name, rpi_str, conn_type, unicast, event_id) in self._connections:
-                safe_name = html.escape(conn_name, quote=True)
-                # Derive InputTag / OutputTag stubs based on connection type.
-                if conn_type == "Output":
+            for c in self._connections:
+                safe_name = html.escape(c["name"], quote=True)
+                # Derive InputTag / OutputTag stubs from the (unchanged) name
+                # heuristic, decoupled from the decoded connection Type.
+                if c["stub_output"]:
                     tag_stubs = _stub("OutputTag", "Read/Write")
                 else:
                     # Input or InputOutput: include both stubs.
@@ -1582,10 +1609,18 @@ class Module(L5xElement):
                         _stub("InputTag", "Read Only")
                         + _stub("OutputTag", "Read/Write")
                     )
+                # Connection point / size attributes, present only when OEM emits
+                # them (a generic/drive Output connection, or a data-driven one).
+                extra = "".join(
+                    f' {a}="{c[a]}"'
+                    for a in ("InputCxnPoint", "OutputCxnPoint", "OutputSize", "InputSize")
+                    if a in c
+                )
                 conn_parts.append(
-                    f'<Connection Name="{safe_name}" RPI="{rpi_str}" Type="{conn_type}"'
-                    f' EventID="{event_id}" ProgrammaticallySendEventTrigger="false"'
-                    f' Unicast="{unicast}">'
+                    f'<Connection Name="{safe_name}" RPI="{c["rpi"]}" Type="{c["type"]}"'
+                    f'{extra}'
+                    f' EventID="{c["event_id"]}" ProgrammaticallySendEventTrigger="false"'
+                    f' Unicast="{c["unicast"]}">'
                     f'{tag_stubs}'
                     f'</Connection>'
                 )
@@ -2939,7 +2974,7 @@ class ModuleBuilder(L5xElementBuilder):
         # corresponds to this module's ICP backplane slot (primary) or its IP
         # address (secondary, for EN-connected modules).
         comm_method: Union[str, None] = None
-        connections: List[Tuple[str, str, str, str, str]] = []
+        connections: List[dict] = []
         extended_properties = ""
         if slot or ip_address:
             comm_method, extended_properties = self._comms_from_data_collection(
@@ -2962,20 +2997,39 @@ class ModuleBuilder(L5xElementBuilder):
             "ORDER BY c2.seq_number",
             (self._object_id,),
         )
+        # A generic-profile or drive module states its connection points and sizes
+        # explicitly (the assembly is user-configured); a catalog I/O card omits
+        # them (its Module Definition fixes the assembly).
+        generic_drive = (
+            product_type in _CONN_DIRECT_PRODUCT_TYPES
+            or (product_type == 0 and vendor == _CONN_GENERIC_VENDOR)
+        )
         for (conn_name, conn_oid) in self._cur.fetchall():
             name_lower = conn_name.lower()
-            if "output" in name_lower or name_lower == "config":
-                conn_type = "Output"
-            else:
-                conn_type = "Input"
-            dec = self._conn_decode.get(conn_oid) or {}
-            connections.append((
-                conn_name,
-                dec.get("RPI", "0.0"),
-                conn_type,
-                dec.get("Unicast", "false"),
-                dec.get("EventID", "0"),
-            ))
+            heuristic_output = "output" in name_lower or name_lower == "config"
+            dec = self._conn_decode.get(conn_oid)
+            if not dec:
+                conn_type = "Output" if heuristic_output else "Input"
+                connections.append({
+                    "name": conn_name, "type": conn_type, "rpi": "0.0",
+                    "unicast": "false", "event_id": "0", "stub_output": heuristic_output,
+                })
+                continue
+            c = {
+                "name": conn_name, "type": dec["Type"], "rpi": dec["RPI"],
+                "unicast": dec["Unicast"], "event_id": dec["EventID"],
+                "stub_output": heuristic_output,
+            }
+            fmt = dec["fmt"]
+            direct = fmt == _CONN_FMT_OUTPUT and generic_drive
+            if fmt in (48, 49) or direct:
+                c["InputSize"] = dec["InputSize"]
+            if fmt in (48, 50) or direct:
+                c["OutputSize"] = dec["OutputSize"]
+            if direct:
+                c["InputCxnPoint"] = dec["InputCxnPoint"]
+                c["OutputCxnPoint"] = dec["OutputCxnPoint"]
+            connections.append(c)
 
         # CatalogNumber: prefer the (V,PT,PC,Major) override for hardware-revision
         # ambiguous keys, then the (V,PT,PC) base table; finally fall back to any
