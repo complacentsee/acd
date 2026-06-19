@@ -927,6 +927,68 @@ def _build_produce_map(cur, short_header: bool) -> Dict[int, dict]:
     return out
 
 
+# --- Module I/O connections --------------------------------------------------
+# A module's I/O connections live in cip-0x69 records under the module's
+# RxMapConnectionCollection (the same record family as the produced/consumed tag
+# connections, distinguished by the parameter blob's leading format word). The
+# format word identifies the connection's L5X Type; the rest of the blob carries
+# the requested-packet interval, the unicast/multicast transport, and the event
+# trigger id at fixed, version-stable offsets.
+_CONN_TYPE_BY_FMT = {
+    5: "Input", 6: "Output", 7: "DiagnosticInput",
+    23: "MotionSync", 24: "MotionAsync", 25: "MotionEvent",
+    28: "SafetyInput", 29: "SafetyOutput",
+    48: "StandardDataDriven", 49: "SafetyInputDataDriven",
+    50: "SafetyOutputDataDriven",
+}
+_CONN_FMT_OFF = 0           # u16 connection-format word (-> _CONN_TYPE_BY_FMT)
+_CONN_RPI_OFF = 2           # u32 requested packet interval (microseconds)
+_CONN_EVENT_OFF = 298       # u8 EventID
+_CONN_TRANSPORT_OFF = 323   # u8 transport type (2 == unicast, else multicast)
+
+
+def _build_connection_map(cur, short_header: bool) -> Dict[int, dict]:
+    """Map a module connection record's object_id -> decoded connection values.
+
+    Decodes the RPI, transport (Unicast) and EventID for every cip-0x69 record
+    under a RxMapConnectionCollection whose parameter blob (ext-attr 0x01) leads
+    with a recognised module connection-format word. ModuleBuilder looks the
+    decoded values up by the connection record's object_id; records that are not
+    module connections (e.g. produced/consumed tag connections, or other format
+    words) are simply absent from the map and keep the caller's defaults. Returns
+    {} on any failure.
+    """
+    out: Dict[int, dict] = {}
+    try:
+        cur.execute(
+            "SELECT c.object_id, c.record, f.record "
+            "FROM comps c JOIN comps p ON c.parent_id = p.object_id "
+            "LEFT JOIN comps_full f ON c.object_id = f.object_id "
+            "WHERE p.comp_name = 'RxMapConnectionCollection'"
+        )
+        for oid, rec, full in cur.fetchall():
+            if not rec or not full:
+                continue
+            rec = bytes(rec)
+            if len(rec) < 12 or rec[10] != 0x69:
+                continue
+            ea = CompsRecord.read_value_attrs(bytes(full), short_header, full=True)
+            blob = ea.get(_PRODUCE_EXT_PARAMS)
+            if not blob or len(blob) <= _CONN_TRANSPORT_OFF:
+                continue
+            fmt = struct.unpack_from("<H", blob, _CONN_FMT_OFF)[0]
+            if fmt not in _CONN_TYPE_BY_FMT:
+                continue
+            out[oid] = {
+                "RPI": str(struct.unpack_from("<I", blob, _CONN_RPI_OFF)[0]),
+                "Unicast": "true" if blob[_CONN_TRANSPORT_OFF] == 2 else "false",
+                "EventID": str(blob[_CONN_EVENT_OFF]),
+            }
+    except Exception:
+        return out
+    return out
+
+
 @dataclass
 class Tag(L5xElement):
     name: str
@@ -1456,7 +1518,10 @@ class Module(L5xElement):
     _description: str = field(default="")
     _comm_method: Union[str, None] = field(default=None)
     # Each entry: (name, rpi_str, conn_type_str)
-    _connections: List[Tuple[str, str, str]] = field(default_factory=list)
+    # Each connection: (Name, RPI, Type, Unicast, EventID). RPI/Unicast/EventID
+    # are decoded from the connection record when available, else carry the
+    # defaults the import accepts.
+    _connections: List[Tuple[str, str, str, str, str]] = field(default_factory=list)
     _extended_properties: str = field(default="")
     # True when the project's OPC UA server is enabled; module IO tag stubs then
     # carry OpcUaAccess="None" (see ExportL5x.project_flags).
@@ -1506,7 +1571,7 @@ class Module(L5xElement):
                 return f'<{tag} ExternalAccess="{ext_access}"{opc}/>'
 
             conn_parts: List[str] = []
-            for (conn_name, rpi_str, conn_type) in self._connections:
+            for (conn_name, rpi_str, conn_type, unicast, event_id) in self._connections:
                 safe_name = html.escape(conn_name, quote=True)
                 # Derive InputTag / OutputTag stubs based on connection type.
                 if conn_type == "Output":
@@ -1519,7 +1584,8 @@ class Module(L5xElement):
                     )
                 conn_parts.append(
                     f'<Connection Name="{safe_name}" RPI="{rpi_str}" Type="{conn_type}"'
-                    f' EventID="0" ProgrammaticallySendEventTrigger="false" Unicast="false">'
+                    f' EventID="{event_id}" ProgrammaticallySendEventTrigger="false"'
+                    f' Unicast="{unicast}">'
                     f'{tag_stubs}'
                     f'</Connection>'
                 )
@@ -2499,6 +2565,10 @@ class DataTypeBuilder(L5xElementBuilder):
 class ModuleBuilder(L5xElementBuilder):
     # Map from modid (u32) → module name, built by ControllerBuilder and passed in.
     _modid_to_name: Dict[int, str] = field(default_factory=dict)
+    # Map connection record object_id → decoded {RPI, Unicast, EventID}, built once
+    # by ControllerBuilder (see _build_connection_map). Empty -> connection values
+    # fall back to the import defaults.
+    _conn_decode: Dict[int, dict] = field(default_factory=dict)
 
     def _ip_from_data_collection(self, icp_slot: int) -> str:
         """Look up the Ethernet IP for a local backplane module via RxDataCollection.
@@ -2869,7 +2939,7 @@ class ModuleBuilder(L5xElementBuilder):
         # corresponds to this module's ICP backplane slot (primary) or its IP
         # address (secondary, for EN-connected modules).
         comm_method: Union[str, None] = None
-        connections: List[Tuple[str, str, str]] = []
+        connections: List[Tuple[str, str, str, str, str]] = []
         extended_properties = ""
         if slot or ip_address:
             comm_method, extended_properties = self._comms_from_data_collection(
@@ -2881,23 +2951,31 @@ class ModuleBuilder(L5xElementBuilder):
         # Connection Type is inferred from the name (heuristic):
         #   names containing "output" or equal to "config" -> "Output"
         #   all others -> "Input"
-        # RPI: we do not have a reliable binary decoder for the short connection
-        # records seen in the test data, so we default to "0.0" (acceptable for import).
+        # RPI / Unicast / EventID are decoded from the connection record by
+        # _build_connection_map (looked up by the record's object_id); when the
+        # record is not a recognised module connection they keep import defaults.
         self._cur.execute(
-            "SELECT c2.comp_name FROM comps c1 "
+            "SELECT c2.comp_name, c2.object_id FROM comps c1 "
             "JOIN comps c2 ON c2.parent_id = c1.object_id "
             "WHERE c1.parent_id = ? AND c1.comp_name = 'RxMapConnectionCollection' "
             "AND c2.comp_name NOT IN ('Output') "
             "ORDER BY c2.seq_number",
             (self._object_id,),
         )
-        for (conn_name,) in self._cur.fetchall():
+        for (conn_name, conn_oid) in self._cur.fetchall():
             name_lower = conn_name.lower()
             if "output" in name_lower or name_lower == "config":
                 conn_type = "Output"
             else:
                 conn_type = "Input"
-            connections.append((conn_name, "0.0", conn_type))
+            dec = self._conn_decode.get(conn_oid) or {}
+            connections.append((
+                conn_name,
+                dec.get("RPI", "0.0"),
+                conn_type,
+                dec.get("Unicast", "false"),
+                dec.get("EventID", "0"),
+            ))
 
         # CatalogNumber: prefer the (V,PT,PC,Major) override for hardware-revision
         # ambiguous keys, then the (V,PT,PC) base table; finally fall back to any
@@ -5201,11 +5279,14 @@ class ControllerBuilder(L5xElementBuilder):
                 except Exception:
                     pass
 
-            # Second pass: build Module objects.
+            # Second pass: build Module objects. The connection decode map (RPI/
+            # Unicast/EventID per connection record) is built once and shared.
+            conn_decode = _build_connection_map(self._cur, self._short_header)
             modules = []
             for _, mod_oid, _ in mod_rows:
                 modules.append(
-                    ModuleBuilder(self._cur, mod_oid, modid_to_name).build()
+                    ModuleBuilder(self._cur, mod_oid, modid_to_name,
+                                  _conn_decode=conn_decode).build()
                 )
 
             # Third pass: compute (parent_name, parent_port_id) → child count,
