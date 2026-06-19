@@ -682,7 +682,18 @@ def _consume_conn_tuple(rec: bytes):
     return None
 
 
-def _build_consume_map(cur) -> Dict[int, dict]:
+_CONSUME_CONN_FMT = 9           # connection-format word marking a consumed tag
+# Fixed byte offsets within a consumed connection's parameter blob (ext-attr
+# 0x01); version-stable across the V10..V36 reference corpus. Used by the
+# fallback decoder when the plaintext body tuple is unavailable (a protected
+# record) -- the blob layout differs from the body-record layout the primary
+# scan walks.
+_CI_RPI_OFF = 2                 # u32 RPI (microseconds)
+_CI_REMOTE_LEN_OFF = 34        # u16 RemoteTag length, ASCII follows at +2
+_CI_TRANSPORT_OFF = 323         # u8 transport type (2 == unicast, 1 == multicast)
+
+
+def _build_consume_map(cur, short_header: bool) -> Dict[int, dict]:
     """Map a consumed controller tag's object_id -> its <ConsumeInfo> attributes.
 
     A consumed tag's connection details are NOT in the tag's own record; they live
@@ -697,11 +708,15 @@ def _build_consume_map(cur) -> Dict[int, dict]:
       RemoteInstance = '0' (constant across the reference corpus)
     The consumed tag's own object_id is the u32 in the trailing 0x0190 TLV
     (b"\\x90\\x01\\x00\\x00\\x04\\x00\\x00\\x00"); 0xFFFFFFFF means it is not stored
-    and the connection is skipped. Returns {} on any failure. Source-protected
-    projects encrypt the connection records (no tuple is found), so their consumed
-    tags simply stay Base -- no fabrication, no regression.
+    and the connection is skipped. A second pass (see below) recovers connections
+    the plaintext scan cannot read -- a source-protected/encrypted record, or one
+    that omits the body tag-oid TLV -- from the record's extended attributes.
+    Returns {} on any failure.
     """
     out: Dict[int, dict] = {}
+    o2name: Dict[int, str] = {}
+    o2parent: Dict[int, int] = {}
+    coll_oids: set = set()
     try:
         cur.execute("SELECT object_id, parent_id, comp_name, record FROM comps")
         rows = cur.fetchall()
@@ -749,6 +764,54 @@ def _build_consume_map(cur) -> Dict[int, dict]:
                 "RemoteInstance": "0",
                 "RPI": str(rpi_us // 1000),
                 "Unicast": unicast,
+            }
+    except Exception:
+        return out
+    # Fallback: recover consumed connections the plaintext body scan could not
+    # read -- a source-protected (encrypted) connection record, or one that omits
+    # the body tag-oid TLV. Reading the connection's extended attributes
+    # transparently decrypts a protected ext-attr tail; a consumed controller-tag
+    # connection carries 0x190 (= the tag's object_id) but not 0x191, and its
+    # parameter blob (ext-attr 0x01) leads with the consumed format word. The
+    # blob's internal offsets differ from the body-record offsets the primary
+    # scan walks. Producer is the connection collection's parent module name,
+    # which stays plaintext even on a protected record.
+    try:
+        cur.execute(
+            "SELECT c.object_id, c.parent_id, c.record, f.record "
+            "FROM comps c LEFT JOIN comps_full f ON c.object_id = f.object_id"
+        )
+        for oid, pid, rec, full in cur.fetchall():
+            if pid not in coll_oids or not rec or not full:
+                continue
+            rec = bytes(rec)
+            if len(rec) < 12 or rec[10] != 0x69:
+                continue
+            ea = CompsRecord.read_value_attrs(bytes(full), short_header, full=True)
+            a190 = ea.get(_PRODUCE_EXT_CONSUMED)
+            if not a190 or len(a190) < 4 or _PRODUCE_EXT_PRODUCED in ea:
+                continue
+            tag_oid = struct.unpack_from("<I", a190, 0)[0]
+            if tag_oid in out or tag_oid in (0, 0xFFFFFFFF):
+                continue
+            blob = ea.get(_PRODUCE_EXT_PARAMS)
+            if (not blob or len(blob) <= _CI_TRANSPORT_OFF
+                    or struct.unpack_from("<H", blob, 0)[0] != _CONSUME_CONN_FMT):
+                continue
+            ln = struct.unpack_from("<H", blob, _CI_REMOTE_LEN_OFF)[0]
+            rp = _CI_REMOTE_LEN_OFF + 2
+            if not (1 <= ln <= 60) or rp + ln > len(blob):
+                continue
+            try:
+                remote_tag = blob[rp:rp + ln].decode("ascii")
+            except Exception:
+                continue
+            out[tag_oid] = {
+                "Producer": o2name.get(o2parent.get(pid)) or "",
+                "RemoteTag": remote_tag,
+                "RemoteInstance": "0",
+                "RPI": str(struct.unpack_from("<I", blob, _CI_RPI_OFF)[0] // 1000),
+                "Unicast": "true" if blob[_CI_TRANSPORT_OFF] == 2 else "false",
             }
     except Exception:
         return out
@@ -4989,7 +5052,7 @@ class ControllerBuilder(L5xElementBuilder):
         # modules' RxMapConnectionCollection, keyed by the consumed tag's object_id
         # (built once for the whole controller). A tag found here is emitted as
         # TagType="Consumed" with a <ConsumeInfo> child and no Constant attribute.
-        consume_map = _build_consume_map(self._cur)
+        consume_map = _build_consume_map(self._cur, self._short_header)
         # Produced controller tags: their connection/mapping config lives in the
         # producer modules' RxMapConnectionCollection (FULL form) or in the tag's
         # own record (PLC-mapped form), keyed by the produced tag's object_id. A
