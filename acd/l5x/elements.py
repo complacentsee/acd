@@ -1558,6 +1558,13 @@ class Module(L5xElement):
     # only for a module that owns a :C controller tag (the proven discriminator).
     _config_inner: Union[str, None] = field(default=None)
     _config_size: Union[int, None] = field(default=None)
+    # Connection InputTag / OutputTag <Data> content, captured from the module's
+    # controller :I / :O tags. InputTag carries the Decorated block only; OutputTag
+    # carries the binary + Decorated blocks. None -> the empty stub is emitted.
+    # Populated into a connection only when the module has a single connection of
+    # that tag type (an unambiguous mapping; see to_xml).
+    _input_inner: Union[str, None] = field(default=None)
+    _output_inner: Union[str, None] = field(default=None)
 
     def __post_init__(self):
         super().__post_init__()
@@ -1591,16 +1598,27 @@ class Module(L5xElement):
         # <Communications> section — only emitted when a CommMethod is known.
         comm_xml = ""
         if self._comm_method is not None:
-            # When the project OPC UA server is on, every module ConfigTag/InputTag/
-            # OutputTag carries OpcUaAccess="None". Inject it after ExternalAccess so
-            # all stubs share one rule.
-            def _stub(tag: str, ext_access: str) -> str:
+            # InputTag/OutputTag carry the module's I/O data image, sourced from its
+            # controller :I / :O tags. The data is placed only when the module has a
+            # single connection of that tag type, so the module->tag mapping is
+            # unambiguous; a multi-connection module (each connection carrying its own
+            # distinct image) keeps the empty stub. ExternalAccess is always
+            # Read/Write; OpcUaAccess="None" is added when the project OPC UA server
+            # is on (one rule for every IO tag).
+            def _io_tag(tag: str, inner: Union[str, None]) -> str:
                 opc = ' OpcUaAccess="None"' if self._opc_ua else ''
+                if inner:
+                    return f'<{tag} ExternalAccess="Read/Write"{opc}>{inner}</{tag}>'
                 # The reference writes <Comments> on a module InputTag/OutputTag
                 # only when there is at least one operand <Comment> (always beside
-                # <Data>); it never emits a bare empty <Comments/>. We carry no
-                # per-operand module-IO comments, so emit a self-closing stub.
-                return f'<{tag} ExternalAccess="{ext_access}"{opc}/>'
+                # <Data>); it never emits a bare empty <Comments/>. With no data and
+                # no per-operand comments, emit a self-closing stub.
+                return f'<{tag} ExternalAccess="Read/Write"{opc}/>'
+
+            # Count connections carrying each tag type to gate the single-connection
+            # populate (see _io_tag above).
+            n_input = sum(1 for c in self._connections if not c["stub_output"])
+            n_output = sum(1 for c in self._connections if c.get("has_output", True))
 
             conn_parts: List[str] = []
             for c in self._connections:
@@ -1611,9 +1629,11 @@ class Module(L5xElement):
                 # prior always-emit behaviour.
                 tag_stubs = ""
                 if not c["stub_output"]:
-                    tag_stubs += _stub("InputTag", "Read/Write")
+                    inner = self._input_inner if n_input == 1 else None
+                    tag_stubs += _io_tag("InputTag", inner)
                 if c.get("has_output", True):
-                    tag_stubs += _stub("OutputTag", "Read/Write")
+                    inner = self._output_inner if n_output == 1 else None
+                    tag_stubs += _io_tag("OutputTag", inner)
                 # Connection point / size attributes, present only when OEM emits
                 # them (a generic/drive Output connection, or a data-driven one).
                 extra = "".join(
@@ -2622,15 +2642,17 @@ class ModuleBuilder(L5xElementBuilder):
     # by ControllerBuilder (see _build_connection_map). Empty -> connection values
     # fall back to the import defaults.
     _conn_decode: Dict[int, dict] = field(default_factory=dict)
-    # Module ConfigTag content, built by ControllerBuilder. Keyed by the &hex
-    # object-id reference of the module's controller :C tag: (parent_object_id,
-    # slot) for a slotted card and (self_object_id, None) for an Ethernet device.
-    # Each value is (config_inner_xml, config_size). Empty -> no ConfigTag.
-    _config_map: Dict[tuple, tuple] = field(default_factory=dict)
+    # Module <Communications> tag content, built by ControllerBuilder from the
+    # module's controller config (:C), input (:I) and output (:O) tags. Keyed by the
+    # &hex object-id reference: (parent_object_id, slot) for a slotted card and
+    # (self_object_id, None) for an Ethernet device. Each value is a dict with
+    # optional keys "C" -> (config_inner_xml, config_size), "I" -> input_decorated_xml,
+    # "O" -> output_inner_xml. Empty -> no ConfigTag/populated IO tags.
+    _io_map: Dict[tuple, dict] = field(default_factory=dict)
     # Map module modid (u32) → comps object_id, built with the short-header marker
     # fallback so it is complete on V10..V20 too. Lets a module resolve its parent's
-    # object_id for the _config_map key without depending on friendly-name
-    # resolution (which can mis-parent motion axes on short-header projects).
+    # object_id for the _io_map key without depending on friendly-name resolution
+    # (which can mis-parent motion axes on short-header projects).
     _modid_to_oid: Dict[int, int] = field(default_factory=dict)
 
     def _ip_from_data_collection(self, icp_slot: int) -> str:
@@ -3079,22 +3101,29 @@ class ModuleBuilder(L5xElementBuilder):
             except Exception:
                 pass
 
-        # ConfigTag: a module emits <ConfigTag> iff it owns a controller :C tag
-        # (verified: the reference's ConfigTag set equals its set of Local:N:C config
-        # tags). The :C tag is stored as &<parentOid>:<slot>:C (slotted card) or &<selfOid>:C
-        # (Ethernet device); resolving the owner by object_id rather than the
-        # friendly parent name avoids the slot collision a mis-parented motion axis
-        # would otherwise cause. Try the Ethernet (self) key first, then the slotted
-        # (parent, slot) key.
+        # ConfigTag / InputTag / OutputTag content: a module's <Communications> tags
+        # carry the same <Data> as its controller config (:C), input (:I) and output
+        # (:O) tags (verified byte-identical; and the reference's ConfigTag set equals
+        # its set of :C config tags). Those tags are stored as &<parentOid>:<slot>:X
+        # (slotted card) or &<selfOid>:X (Ethernet device); resolving the owner by
+        # object_id rather than the friendly parent name avoids the slot collision a
+        # mis-parented motion axis would otherwise cause. Try the Ethernet (self) key
+        # first, then the slotted (parent, slot) key.
         config_inner = None
         config_size = None
-        cfg = self._config_map.get((self._object_id, None))
-        if cfg is None:
+        input_inner = None
+        output_inner = None
+        entry = self._io_map.get((self._object_id, None))
+        if entry is None:
             parent_oid = self._modid_to_oid.get(parent_modid)
             if parent_oid is not None:
-                cfg = self._config_map.get((parent_oid, slot))
-        if cfg is not None:
-            config_inner, config_size = cfg
+                entry = self._io_map.get((parent_oid, slot))
+        if entry is not None:
+            cfg = entry.get("C")
+            if cfg is not None:
+                config_inner, config_size = cfg
+            input_inner = entry.get("I")
+            output_inner = entry.get("O")
 
         # Project-level OPC UA flag (see ExportL5x.project_flags); same pattern as
         # TagBuilder. When the project's OPC UA server is on, module IO tag stubs
@@ -3145,6 +3174,8 @@ class ModuleBuilder(L5xElementBuilder):
             _opc_ua=_opc_ua,
             _config_inner=config_inner,
             _config_size=config_size,
+            _input_inner=input_inner,
+            _output_inner=output_inner,
         )
 
 
@@ -5241,12 +5272,13 @@ class ControllerBuilder(L5xElementBuilder):
         # child; unlike Consumed it keeps its Constant attribute (OEM emits it).
         produce_map = _build_produce_map(self._cur, self._short_header)
         tags: List[Tag] = []
-        # Module ConfigTag content, captured from the controller :C tags as they are
-        # built (the :C tag's rendered <Data> blocks ARE the module's ConfigTag
-        # content, validated byte-identical to the reference). Keyed by the &hex
-        # object-id reference parsed from the tag's stored name so the owning module
-        # can look it up; see ModuleBuilder for the key shape.
-        config_data_map: Dict[tuple, tuple] = {}
+        # Module <Communications> tag content, captured from the controller config
+        # (:C), input (:I) and output (:O) tags as they are built (their rendered
+        # <Data> blocks ARE the module's ConfigTag/InputTag/OutputTag content,
+        # validated byte-identical to the reference). Keyed by the &hex object-id
+        # reference parsed from the tag's stored name so the owning module can look it
+        # up; see ModuleBuilder for the key shape and per-IO-type value.
+        io_data_map: Dict[tuple, dict] = {}
         for result in results:
             _tag_object_id = result[1]
             tag = TagBuilder(self._cur, _tag_object_id, _short_header=self._short_header,
@@ -5276,25 +5308,37 @@ class ControllerBuilder(L5xElementBuilder):
             keep_alias = bool(tag.alias_for)
             if (keep_typed or keep_alias) and not tag.name.startswith("$") and (tag._io or ":" not in tag.name) and not tag.name.startswith("__"):
                 tags.append(tag)
-                # Capture this module's ConfigTag content if it is a config (:C)
-                # I/O tag. The stored name is &<hex>:<slot>:C (slotted card) or
-                # &<hex>:C (Ethernet device); the hex is the comps object_id the
-                # owning module resolves against. ConfigSize = first u32 of the
-                # config image minus 4 (validated against the reference).
-                if (tag._io and tag.name.endswith(":C")
-                        and tag._value_bytes and len(tag._value_bytes) >= 4):
-                    cm = re.match(r"^&([0-9a-fA-F]+)(?::(\d+))?:C$", result[0])
+                # Capture this module's <Communications> tag content from its config
+                # (:C), input (:I) and output (:O) controller tags. The stored name is
+                # &<hex>:<slot>:X (slotted card) or &<hex>:X (Ethernet device); the hex
+                # is the comps object_id the owning module resolves against. The tag's
+                # rendered <Data> IS the module's ConfigTag/OutputTag content (binary +
+                # Decorated); the InputTag carries the Decorated block only.
+                if tag._io and tag._value_bytes:
+                    cm = re.match(r"^&([0-9a-fA-F]+)(?::(\d+))?:([CIO])$", result[0])
                     if cm:
                         ref_oid = int(cm.group(1), 16)
                         ref_slot = int(cm.group(2)) if cm.group(2) is not None else None
+                        io_type = cm.group(3)
                         rendered = tag.to_xml()
                         gt = rendered.find(">")
                         inner = rendered[gt + 1:]
                         if inner.endswith("</Tag>"):
                             inner = inner[:-len("</Tag>")]
-                        if inner:
+                        slot_entry = io_data_map.setdefault((ref_oid, ref_slot), {})
+                        if io_type == "C" and inner and len(tag._value_bytes) >= 4:
+                            # ConfigSize = first u32 of the config image minus 4.
                             size = int.from_bytes(tag._value_bytes[0:4], "little") - 4
-                            config_data_map[(ref_oid, ref_slot)] = (inner, size)
+                            slot_entry["C"] = (inner, size)
+                        elif io_type == "O" and inner:
+                            slot_entry["O"] = inner
+                        elif io_type == "I":
+                            # InputTag is the Decorated block only (no binary image).
+                            di = inner.find('<Data Format="Decorated">')
+                            if di >= 0:
+                                end = inner.find("</Data>", di)
+                                if end >= 0:
+                                    slot_entry["I"] = inner[di:end + len("</Data>")]
 
         # Get the Program Collection and get the programs
         self._cur.execute(
@@ -5427,7 +5471,7 @@ class ControllerBuilder(L5xElementBuilder):
                 modules.append(
                     ModuleBuilder(self._cur, mod_oid, modid_to_name,
                                   _conn_decode=conn_decode,
-                                  _config_map=config_data_map,
+                                  _io_map=io_data_map,
                                   _modid_to_oid=modid_to_oid).build()
                 )
 
