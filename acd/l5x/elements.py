@@ -2879,6 +2879,53 @@ class ModuleBuilder(L5xElementBuilder):
 
         return (None, "")
 
+    def _extended_properties_from_data_collection(self, data_link: int) -> str:
+        """Extract the <ExtendedProperties> <public> content for a module.
+
+        The module's <public> block lives in the SAME hash-named RxDataCollection
+        child that carries its port topology (see _ports_from_data_collection),
+        linked by the module's comment_id at e1[0x24] (u32). Match that child by
+        rec[12:14] == data_link & 0xFFFF across ALL RxDataCollection collections --
+        the exact 1:1 key the ports decode uses. This resolves the correct record
+        for every module type (backplane cards, EN bridges, PointIO adapters, drive
+        peripherals); a module whose link finds no <public> yields "".
+
+        Returns the inner content of <public>...</public>, or "" if absent. The
+        record XML is often stored without the closing </public> tag (truncated in
+        the ACD binary), so we reconstruct everything after <public>.
+        """
+        if not data_link:
+            return ""
+        import re as _re
+        want = data_link & 0xFFFF
+        self._cur.execute(
+            "SELECT object_id FROM comps WHERE comp_name='RxDataCollection'"
+        )
+        coll_oids = [r[0] for r in self._cur.fetchall()]
+        for coll_oid in coll_oids:
+            self._cur.execute(
+                "SELECT record FROM comps WHERE parent_id=?", (coll_oid,)
+            )
+            for (raw,) in self._cur.fetchall():
+                raw = bytes(raw)
+                if len(raw) < 14:
+                    continue
+                if int.from_bytes(raw[12:14], "little") != want:
+                    continue
+                xml_start = raw.find(b'<')
+                if xml_start < 0:
+                    continue
+                xml_text = raw[xml_start:].decode("latin-1", errors="replace")
+                pub_start = xml_text.find("<public>")
+                if pub_start < 0:
+                    continue
+                after_pub = xml_text[pub_start + len("<public>"):]
+                end_tag_m = _re.search(r'</pub', after_pub)
+                if end_tag_m:
+                    return after_pub[:end_tag_m.start()]
+                return after_pub.rstrip("\x00 \r\n")
+        return ""
+
     def _ports_from_data_collection(self, data_link: int) -> "Union[str, None]":
         """Build the <Ports> block from the module's RxDataCollection topology blob.
 
@@ -3141,16 +3188,19 @@ class ModuleBuilder(L5xElementBuilder):
             description = desc_row[0] or ""
 
         # --- Communications and ExtendedProperties ---
-        # Both are extracted from the hash-named child of RxDataCollection that
-        # corresponds to this module's ICP backplane slot (primary) or its IP
-        # address (secondary, for EN-connected modules).
+        # CommMethod is resolved from the module's ICP slot / IP address. The
+        # <ExtendedProperties> <public> block comes from the hash-named
+        # RxDataCollection child the module links to by comment_id (e1[0x24]); this
+        # 1:1 link resolves the right record for every module type (backplane cards,
+        # EN bridges, PointIO adapters, drive peripherals), where the slot/IP
+        # heuristic mislinked or missed them.
         comm_method: Union[str, None] = None
         connections: List[dict] = []
         extended_properties = ""
+        data_link = struct.unpack("<I", e1[0x24:0x28])[0] if len(e1) >= 0x28 else 0
         if slot or ip_address:
-            comm_method, extended_properties = self._comms_from_data_collection(
-                slot, ip_address
-            )
+            comm_method, _ = self._comms_from_data_collection(slot, ip_address)
+        extended_properties = self._extended_properties_from_data_collection(data_link)
 
         # Read individual connection records from RxMapConnectionCollection children.
         # Each child's comp_name is the connection Name in the L5X output.
@@ -3348,7 +3398,6 @@ class ModuleBuilder(L5xElementBuilder):
         is_root = (parent_name == name)
         ports_override = None
         if not is_root:
-            data_link = struct.unpack("<I", e1[0x24:0x28])[0] if len(e1) >= 0x28 else 0
             ports_override = self._ports_from_data_collection(data_link)
 
         return Module(
