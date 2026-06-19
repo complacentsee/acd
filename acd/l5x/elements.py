@@ -1599,16 +1599,15 @@ class Module(L5xElement):
             conn_parts: List[str] = []
             for c in self._connections:
                 safe_name = html.escape(c["name"], quote=True)
-                # Derive InputTag / OutputTag stubs from the (unchanged) name
-                # heuristic, decoupled from the decoded connection Type.
-                if c["stub_output"]:
-                    tag_stubs = _stub("OutputTag", "Read/Write")
-                else:
-                    # Input or InputOutput: include both stubs.
-                    tag_stubs = (
-                        _stub("InputTag", "Read Only")
-                        + _stub("OutputTag", "Read/Write")
-                    )
+                # InputTag follows the (unchanged) name heuristic. OutputTag is
+                # suppressed when the connection decoded with no output data
+                # (OutputSize 0); when the connection did not decode, keep the
+                # prior always-emit behaviour.
+                tag_stubs = ""
+                if not c["stub_output"]:
+                    tag_stubs += _stub("InputTag", "Read/Write")
+                if c.get("has_output", True):
+                    tag_stubs += _stub("OutputTag", "Read/Write")
                 # Connection point / size attributes, present only when OEM emits
                 # them (a generic/drive Output connection, or a data-driven one).
                 extra = "".join(
@@ -3019,6 +3018,8 @@ class ModuleBuilder(L5xElementBuilder):
                 "name": conn_name, "type": dec["Type"], "rpi": dec["RPI"],
                 "unicast": dec["Unicast"], "event_id": dec["EventID"],
                 "stub_output": heuristic_output,
+                # A connection with no output data carries no <OutputTag>.
+                "has_output": dec["OutputSize"] > 0,
             }
             fmt = dec["fmt"]
             direct = fmt == _CONN_FMT_OUTPUT and generic_drive
