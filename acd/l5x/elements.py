@@ -662,6 +662,99 @@ def _build_default_data(data_type: Union[str, None],
         return ""
 
 
+def _consume_conn_tuple(rec: bytes):
+    """Locate a consumed/produced connection's parameter tuple in a cip-0x69 record.
+
+    The tuple is (u32 typeid in 0x300..0x330)(u16 fmt)(u32 rpi_microseconds), where
+    the RPI is a positive whole multiple of 500 us. Absolute offsets shift with the
+    ACD/record version, so the tuple is located by scan rather than a fixed offset.
+    Returns (offset_of_typeid, fmt, rpi_us) or None. fmt == 9 marks a CONSUMED
+    connection (10 = produced; other values are motion/diagnostic connections).
+    """
+    for off in range(0x4E, len(rec) - 10):
+        t2 = struct.unpack_from("<I", rec, off)[0]
+        if not (0x300 <= t2 <= 0x330):
+            continue
+        fmt = struct.unpack_from("<H", rec, off + 4)[0]
+        rpi = struct.unpack_from("<I", rec, off + 6)[0]
+        if 0 < rpi <= 10_000_000 and rpi % 500 == 0:
+            return off, fmt, rpi
+    return None
+
+
+def _build_consume_map(cur) -> Dict[int, dict]:
+    """Map a consumed controller tag's object_id -> its <ConsumeInfo> attributes.
+
+    A consumed tag's connection details are NOT in the tag's own record; they live
+    in a cip-0x69 "connection" record under the producer module's
+    RxMapConnectionCollection. For each such record with a CONSUMED parameter tuple
+    (fmt == 9, see _consume_conn_tuple) we recover:
+      Producer       = the connection collection's parent module friendly name
+      RPI            = rpi_microseconds // 1000  (the L5X RPI is in ms)
+      RemoteTag      = u16-length-prefixed ASCII at tuple_offset + 38
+      Unicast        = 'true' iff the transport enum (u32 at the producer object
+                       reference found from offset 0x100) == 2, else 'false'
+      RemoteInstance = '0' (constant across the reference corpus)
+    The consumed tag's own object_id is the u32 in the trailing 0x0190 TLV
+    (b"\\x90\\x01\\x00\\x00\\x04\\x00\\x00\\x00"); 0xFFFFFFFF means it is not stored
+    and the connection is skipped. Returns {} on any failure. Source-protected
+    projects encrypt the connection records (no tuple is found), so their consumed
+    tags simply stay Base -- no fabrication, no regression.
+    """
+    out: Dict[int, dict] = {}
+    try:
+        cur.execute("SELECT object_id, parent_id, comp_name, record FROM comps")
+        rows = cur.fetchall()
+        o2name = {r[0]: r[2] for r in rows}
+        o2parent = {r[0]: r[1] for r in rows}
+        coll_oids = {r[0] for r in rows if r[2] == "RxMapConnectionCollection"}
+        for oid, pid, nm, rec in rows:
+            if pid not in coll_oids or not rec:
+                continue
+            rec = bytes(rec)
+            if len(rec) < 12 or rec[10] != 0x69:
+                continue
+            ft = _consume_conn_tuple(rec)
+            if ft is None:
+                continue
+            t2pos, fmt, rpi_us = ft
+            if fmt != 9:
+                continue
+            m = rec.rfind(b"\x90\x01\x00\x00\x04\x00\x00\x00")
+            if m < 0 or m + 12 > len(rec):
+                continue
+            tag_oid = struct.unpack_from("<I", rec, m + 8)[0]
+            if tag_oid in (0, 0xFFFFFFFF):
+                continue
+            rp = t2pos + 38
+            remote_tag = None
+            if rp + 2 <= len(rec):
+                ln = struct.unpack_from("<H", rec, rp)[0]
+                if 1 <= ln <= 60 and rp + 2 + ln <= len(rec):
+                    try:
+                        remote_tag = rec[rp + 2:rp + 2 + ln].decode("ascii")
+                    except Exception:
+                        remote_tag = None
+            if not remote_tag:
+                continue
+            unicast = "false"
+            obj2 = rec[0x16:0x1A]
+            up = rec.find(obj2, 0x100)
+            if up >= 0 and up + 0x17 <= len(rec):
+                if struct.unpack_from("<I", rec, up + 0x13)[0] == 2:
+                    unicast = "true"
+            out[tag_oid] = {
+                "Producer": o2name.get(o2parent.get(pid)) or "",
+                "RemoteTag": remote_tag,
+                "RemoteInstance": "0",
+                "RPI": str(rpi_us // 1000),
+                "Unicast": unicast,
+            }
+    except Exception:
+        return out
+    return out
+
+
 @dataclass
 class Tag(L5xElement):
     name: str
@@ -717,6 +810,10 @@ class Tag(L5xElement):
     # Set for a recognised alias whose AliasFor target we cannot yet build, so it
     # is emitted as Base but carries no <Data> (OEM emits none on an alias).
     _no_data: bool = False
+    # ConsumeInfo for a Consumed tag: dict with Producer/RemoteTag/RemoteInstance/
+    # RPI/Unicast. When set, tag_type is "Consumed" and a <ConsumeInfo/> child is
+    # emitted as the first child (before Comments/Data). None for ordinary tags.
+    _consume_info: Union[dict, None] = None
 
     def _inject_tag_attrs(self, base: str) -> str:
         """Insert OpcUaAccess / Class attributes into the opening <Tag ...> of base.
@@ -996,13 +1093,29 @@ class Tag(L5xElement):
                 if decorated:
                     data_xml = decorated
 
-        if not comments_xml and not desc_xml and not data_xml:
+        # --- ConsumeInfo child (Consumed tags) ---
+        # OEM emits <ConsumeInfo> as the FIRST child of a Consumed tag, before
+        # Comments/Data. Attribute order matches OEM (Producer, RemoteTag,
+        # RemoteInstance, RPI, Unicast).
+        consume_xml = ""
+        if self._consume_info:
+            ci = self._consume_info
+            consume_xml = (
+                f'<ConsumeInfo Producer="{html.escape(str(ci.get("Producer", "")), quote=True)}"'
+                f' RemoteTag="{html.escape(str(ci.get("RemoteTag", "")), quote=True)}"'
+                f' RemoteInstance="{ci.get("RemoteInstance", "0")}"'
+                f' RPI="{ci.get("RPI", "")}"'
+                f' Unicast="{ci.get("Unicast", "false")}"/>'
+            )
+
+        if not consume_xml and not comments_xml and not desc_xml and not data_xml:
             return base
 
-        # Insert Comments (if any), then Description, then Data, immediately after
-        # the opening tag. Logix emits <Comments> before <Description>/<Data>.
+        # Insert ConsumeInfo (Consumed tags), then Comments, Description, Data,
+        # immediately after the opening tag. Logix emits ConsumeInfo first, then
+        # <Comments> before <Description>/<Data>.
         idx = base.index(">")
-        return base[:idx + 1] + comments_xml + desc_xml + data_xml + base[idx + 1:]
+        return base[:idx + 1] + consume_xml + comments_xml + desc_xml + data_xml + base[idx + 1:]
 
 
 @dataclass
@@ -4736,6 +4849,11 @@ class ControllerBuilder(L5xElementBuilder):
             + str(_tag_collection_object_id)
         )
         results = self._cur.fetchall()
+        # Consumed controller tags: their connection details live in the producer
+        # modules' RxMapConnectionCollection, keyed by the consumed tag's object_id
+        # (built once for the whole controller). A tag found here is emitted as
+        # TagType="Consumed" with a <ConsumeInfo> child and no Constant attribute.
+        consume_map = _build_consume_map(self._cur)
         tags: List[Tag] = []
         for result in results:
             _tag_object_id = result[1]
@@ -4743,6 +4861,11 @@ class ControllerBuilder(L5xElementBuilder):
                              _acd_major=self._acd_major).build()
             tag._data_types_map = data_types_map
             tag._taginfo_layout = self._taginfo_layout
+            ci = consume_map.get(_tag_object_id)
+            if ci is not None:
+                tag.tag_type = "Consumed"
+                tag.constant = None
+                tag._consume_info = ci
             # Module I/O tags carry a ':' (Local:1:C) and are kept; the ':' filter
             # only drops other internal ':'-named records. Per-point I/O ALIAS
             # tags (<Module>:1:I) carry no DataType (the value lives on the
