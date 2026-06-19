@@ -3287,6 +3287,48 @@ class ModuleBuilder(L5xElementBuilder):
                     if img is not None and 0 < len(img) <= _CONFIG_IMG_MAX:
                         configscript = (_tag_value.render_hex(img), len(img))
 
+        # Fallbacks for residual modules the pointer rules above miss. ConfigData: the
+        # module's ext-attr 0x13e (surfaced only by read_value_attrs on the full record)
+        # is the holder object id directly. ConfigScript: a comment_id inside the e1
+        # `20 6a` TLV resolves to a holder via the same cid index. Both read the holder
+        # image via its ext-attr 0x66. Only run when no ConfigTag was found (mutually
+        # exclusive) and the primary rule left the slot unresolved.
+        if config_inner is None and (configdata is None or configscript is None):
+            self._cur.execute(
+                "SELECT record FROM comps_full WHERE object_id=?", (self._object_id,))
+            _mr = self._cur.fetchone()
+            if _mr:
+                try:
+                    _ma = CompsRecord.read_value_attrs(bytes(_mr[0]), self._short_header)
+                except Exception:
+                    _ma = {}
+                if configdata is None:
+                    _ref = _ma.get(0x13E)
+                    if _ref and len(_ref) == 4:
+                        img = _config_holder_image(
+                            self._cur, struct.unpack("<I", _ref)[0], self._short_header)
+                        if img is not None and len(img) >= 4:
+                            u = struct.unpack_from("<I", img, 0)[0] - 4
+                            csize = u if 0 <= u <= _CONFIG_IMG_MAX else len(img)
+                            configdata = (_tag_value.render_hex(img), csize)
+                if configscript is None:
+                    _e1f = _ma.get(0x001) or e1
+                    j = _e1f.find(b"\x20\x6a")
+                    if j >= 0 and len(_e1f) >= j + 5:
+                        sel = _e1f[j + 2]
+                        deltas = (3,) if sel == 0x24 else (4,) if sel == 0x25 else (3, 4)
+                        for _d in deltas:
+                            if len(_e1f) < j + _d + 2:
+                                continue
+                            cid = struct.unpack_from("<H", _e1f, j + _d)[0]
+                            oid = self._cfg_by_cid.get(cid) if cid else None
+                            if oid is None:
+                                continue
+                            img = _config_holder_image(self._cur, oid, self._short_header)
+                            if img is not None and 0 < len(img) <= _CONFIG_IMG_MAX:
+                                configscript = (_tag_value.render_hex(img), len(img))
+                                break
+
         # Project-level OPC UA flag (see ExportL5x.project_flags); same pattern as
         # TagBuilder. When the project's OPC UA server is on, module IO tag stubs
         # carry OpcUaAccess="None".
