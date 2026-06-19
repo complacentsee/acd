@@ -755,6 +755,115 @@ def _build_consume_map(cur) -> Dict[int, dict]:
     return out
 
 
+# --- Produced controller tags ------------------------------------------------
+# A produced tag advertises a tag for other controllers to consume. Its config
+# takes one of two forms, both decoded by _build_produce_map:
+#  * FULL (networked produce): the parameters live in a cip-0x69 connection
+#    record under a RxMapConnectionCollection that carries extended attribute
+#    0x191 (= the produced tag's object_id) and NOT 0x190; the parameter blob is
+#    ext-attr 0x01, whose leading connection-format word is 10 (9 marks a
+#    consumed connection, and other values mark the module I/O class-1
+#    connections that share the same 0x190/0x191/0x192 attributes). ProduceCount,
+#    the two boolean flags and the RPI triple sit at fixed offsets in the blob.
+#  * PLC (PLC/SLC-mapped produce): the tag's OWN record carries a single ext-attr
+#    0x67 (the u32 PLCMappingFile) and there is no connection record.
+_PRODUCE_CONN_FMT = 10          # connection-format word marking a produced tag
+_PRODUCE_EXT_PRODUCED = 0x191   # produced-tag object_id (on the connection record)
+_PRODUCE_EXT_CONSUMED = 0x190   # present on consumed / module I/O connections
+_PRODUCE_EXT_PARAMS = 0x01      # connection parameter blob
+_PRODUCE_EXT_PLCMAP = 0x67      # PLCMappingFile (u32) on the tag's own record
+# Fixed byte offsets within the parameter blob (ext-attr 0x01); version-stable
+# across the V10..V36 reference corpus.
+_PI_PSET_OFF = 308              # u32 ProgrammaticallySendEventTrigger (0/1)
+_PI_COUNT_OFF = 321             # u16 ProduceCount (number of consumers)
+_PI_UNICAST_OFF = 324          # u32 UnicastPermitted (0/1)
+_PI_MIN_RPI_OFF = 774          # u32 MinimumRPI (microseconds)
+_PI_MAX_RPI_OFF = 778          # u32 MaximumRPI (microseconds)
+_PI_DEFAULT_RPI_OFF = 782      # u32 DefaultRPI (microseconds)
+
+
+def _produce_rpi_ms(us: int) -> str:
+    """Render a connection RPI (microseconds) as its L5X millisecond string.
+
+    Whole milliseconds print with no fraction (2000 -> "2"); a sub-millisecond
+    remainder prints three decimals to match Logix (200 -> "0.200",
+    536870900 -> "536870.900").
+    """
+    if us % 1000 == 0:
+        return str(us // 1000)
+    return f"{us // 1000}.{us % 1000:03d}"
+
+
+def _build_produce_map(cur, short_header: bool) -> Dict[int, dict]:
+    """Map a produced controller tag's object_id -> its <ProduceInfo> attributes.
+
+    Both produce forms are keyed here by the produced tag's own object_id. FULL
+    connections are found by walking cip-0x69 records under a
+    RxMapConnectionCollection and selecting those whose ext attrs carry 0x191 but
+    not 0x190 and whose parameter blob (ext-attr 0x01) leads with format word 10;
+    ProduceCount, the flags and the RPI triple are read from fixed blob offsets.
+    PLC-mapped produces are found by reading ext-attr 0x67 from the tag's own
+    record (a cheap byte pre-filter avoids walking every tag's attributes).
+    Returns {} on any failure. read_value_attrs transparently decrypts a
+    source-protected ext-attr tail, so an encrypted produce connection decodes
+    from the same attributes.
+    """
+    out: Dict[int, dict] = {}
+    try:
+        cur.execute(
+            "SELECT c.object_id, c.parent_id, c.comp_name, c.record, f.record "
+            "FROM comps c LEFT JOIN comps_full f ON c.object_id = f.object_id"
+        )
+        rows = cur.fetchall()
+        coll_oids = {r[0] for r in rows if r[2] == "RxMapConnectionCollection"}
+        plc_sig = struct.pack("<I", _PRODUCE_EXT_PLCMAP)
+        for oid, pid, nm, rec, full in rows:
+            if not rec or not full:
+                continue
+            rec = bytes(rec)
+            if len(rec) < 12:
+                continue
+            cip = rec[10]
+            if cip == 0x69 and pid in coll_oids:
+                ea = CompsRecord.read_value_attrs(bytes(full), short_header, full=True)
+                a191 = ea.get(_PRODUCE_EXT_PRODUCED)
+                if not a191 or len(a191) < 4 or _PRODUCE_EXT_CONSUMED in ea:
+                    continue
+                blob = ea.get(_PRODUCE_EXT_PARAMS)
+                if not blob or len(blob) < _PI_DEFAULT_RPI_OFF + 4:
+                    continue
+                if struct.unpack_from("<I", blob, 0)[0] != _PRODUCE_CONN_FMT:
+                    continue
+                tag_oid = struct.unpack_from("<I", a191, 0)[0]
+                if tag_oid in (0, 0xFFFFFFFF):
+                    continue
+                pset = struct.unpack_from("<I", blob, _PI_PSET_OFF)[0]
+                count = struct.unpack_from("<H", blob, _PI_COUNT_OFF)[0]
+                uni = struct.unpack_from("<I", blob, _PI_UNICAST_OFF)[0]
+                mn = struct.unpack_from("<I", blob, _PI_MIN_RPI_OFF)[0]
+                mx = struct.unpack_from("<I", blob, _PI_MAX_RPI_OFF)[0]
+                df = struct.unpack_from("<I", blob, _PI_DEFAULT_RPI_OFF)[0]
+                out[tag_oid] = {
+                    "ProduceCount": str(count),
+                    "ProgrammaticallySendEventTrigger": "true" if pset else "false",
+                    "UnicastPermitted": "true" if uni else "false",
+                    "MinimumRPI": _produce_rpi_ms(mn),
+                    "MaximumRPI": _produce_rpi_ms(mx),
+                    "DefaultRPI": _produce_rpi_ms(df),
+                }
+            elif cip == 0x6B and plc_sig in bytes(full):
+                if oid in out:
+                    continue
+                ea = CompsRecord.read_value_attrs(bytes(full), short_header, full=True)
+                plc = ea.get(_PRODUCE_EXT_PLCMAP)
+                if not plc or len(plc) < 4:
+                    continue
+                out[oid] = {"PLCMappingFile": str(struct.unpack_from("<I", plc, 0)[0])}
+    except Exception:
+        return out
+    return out
+
+
 @dataclass
 class Tag(L5xElement):
     name: str
@@ -814,6 +923,12 @@ class Tag(L5xElement):
     # RPI/Unicast. When set, tag_type is "Consumed" and a <ConsumeInfo/> child is
     # emitted as the first child (before Comments/Data). None for ordinary tags.
     _consume_info: Union[dict, None] = None
+    # ProduceInfo for a Produced tag. Either the FULL form (ProduceCount,
+    # ProgrammaticallySendEventTrigger, UnicastPermitted, MinimumRPI, MaximumRPI,
+    # DefaultRPI) or the PLC-mapped form (a single PLCMappingFile). When set,
+    # tag_type is "Produced" and a <ProduceInfo/> child is emitted as the first
+    # child (before Comments/Data). None for ordinary tags.
+    _produce_info: Union[dict, None] = None
 
     def _inject_tag_attrs(self, base: str) -> str:
         """Insert OpcUaAccess / Class attributes into the opening <Tag ...> of base.
@@ -1108,14 +1223,35 @@ class Tag(L5xElement):
                 f' Unicast="{ci.get("Unicast", "false")}"/>'
             )
 
-        if not consume_xml and not comments_xml and not desc_xml and not data_xml:
+        # --- ProduceInfo child (Produced tags) ---
+        # OEM emits <ProduceInfo> as the FIRST child of a Produced tag, before
+        # Comments/Data. The FULL form carries the connection parameters; the
+        # PLC-mapped form carries only PLCMappingFile.
+        produce_xml = ""
+        if self._produce_info:
+            pi = self._produce_info
+            if "PLCMappingFile" in pi:
+                produce_xml = f'<ProduceInfo PLCMappingFile="{pi["PLCMappingFile"]}"/>'
+            else:
+                produce_xml = (
+                    f'<ProduceInfo ProduceCount="{pi.get("ProduceCount", "1")}"'
+                    f' ProgrammaticallySendEventTrigger="{pi.get("ProgrammaticallySendEventTrigger", "false")}"'
+                    f' UnicastPermitted="{pi.get("UnicastPermitted", "false")}"'
+                    f' MinimumRPI="{pi.get("MinimumRPI", "")}"'
+                    f' MaximumRPI="{pi.get("MaximumRPI", "")}"'
+                    f' DefaultRPI="{pi.get("DefaultRPI", "")}"/>'
+                )
+
+        if (not consume_xml and not produce_xml and not comments_xml
+                and not desc_xml and not data_xml):
             return base
 
-        # Insert ConsumeInfo (Consumed tags), then Comments, Description, Data,
-        # immediately after the opening tag. Logix emits ConsumeInfo first, then
-        # <Comments> before <Description>/<Data>.
+        # Insert ConsumeInfo/ProduceInfo (Consumed/Produced tags), then Comments,
+        # Description, Data, immediately after the opening tag. Logix emits the
+        # Consume/Produce info first, then <Comments> before <Description>/<Data>.
         idx = base.index(">")
-        return base[:idx + 1] + consume_xml + comments_xml + desc_xml + data_xml + base[idx + 1:]
+        return (base[:idx + 1] + consume_xml + produce_xml + comments_xml
+                + desc_xml + data_xml + base[idx + 1:])
 
 
 @dataclass
@@ -4854,6 +4990,12 @@ class ControllerBuilder(L5xElementBuilder):
         # (built once for the whole controller). A tag found here is emitted as
         # TagType="Consumed" with a <ConsumeInfo> child and no Constant attribute.
         consume_map = _build_consume_map(self._cur)
+        # Produced controller tags: their connection/mapping config lives in the
+        # producer modules' RxMapConnectionCollection (FULL form) or in the tag's
+        # own record (PLC-mapped form), keyed by the produced tag's object_id. A
+        # tag found here is emitted as TagType="Produced" with a <ProduceInfo>
+        # child; unlike Consumed it keeps its Constant attribute (OEM emits it).
+        produce_map = _build_produce_map(self._cur, self._short_header)
         tags: List[Tag] = []
         for result in results:
             _tag_object_id = result[1]
@@ -4866,6 +5008,10 @@ class ControllerBuilder(L5xElementBuilder):
                 tag.tag_type = "Consumed"
                 tag.constant = None
                 tag._consume_info = ci
+            pi = produce_map.get(_tag_object_id)
+            if pi is not None:
+                tag.tag_type = "Produced"
+                tag._produce_info = pi
             # Module I/O tags carry a ':' (Local:1:C) and are kept; the ':' filter
             # only drops other internal ':'-named records. Per-point I/O ALIAS
             # tags (<Module>:1:I) carry no DataType (the value lives on the
