@@ -5744,9 +5744,8 @@ class ControllerBuilder(L5xElementBuilder):
             # First pass: build modid→name map so child modules can resolve their parent name.
             from acd.generated.comps.rx_generic import RxGeneric as _RxG
             modid_to_name: Dict[int, str] = {}
-            # modid→object_id map for ConfigTag keying. Unlike modid_to_name (left
-            # as-is to avoid changing the emitted ParentModule), this applies the
-            # short-header 44 02 00 00 marker fallback so it is complete on V10..V20.
+            # modid→object_id map for ConfigTag keying. On short-header (V10..V20)
+            # projects it applies the 44 02 00 00 marker fallback so it is complete.
             modid_to_oid: Dict[int, int] = {}
             for db_name, mod_oid, mod_rec in mod_rows:
                 display_name = "?" if (db_name.startswith("$") and db_name.endswith("$")) else db_name
@@ -5756,16 +5755,26 @@ class ControllerBuilder(L5xElementBuilder):
                         exts = {er.attribute_id: bytes(er.value) for er in r.extended_records}
                         e1 = exts.get(0x001, b"")
                         if len(e1) >= 0x30:
-                            modid = struct.unpack("<I", e1[0x2C:0x30])[0]
-                            modid_to_name[modid] = display_name
-                        e1o = e1
-                        if len(e1o) < 0x30:
+                            # e1[0x2C] is the modid that backplane children reference
+                            # (their e1[0x16]). It reads 0 for an Ethernet-family rack
+                            # adapter (1734-AENT and the like) whose own identity sits
+                            # behind the EtherNet/IP attrs; the real modid for those is
+                            # the record-header comment_id (RxGeneric.comment_id), which
+                            # equals e1[0x2C] wherever the latter is nonzero. Prefer
+                            # e1[0x2C]; fall back to comment_id only when it is 0, so
+                            # existing keys are byte-identical and the adapter's cards
+                            # (which today wrongly resolve ParentModule to "Local" and
+                            # miss their :C ConfigTag) resolve to it.
+                            modid = struct.unpack("<I", e1[0x2C:0x30])[0] or r.comment_id
+                            if modid:
+                                modid_to_name[modid] = display_name
+                                modid_to_oid[modid] = mod_oid
+                        else:
                             raw_mr = bytes(mod_rec)
                             mk = raw_mr.find(b"\x44\x02\x00\x00")
                             if mk >= 0 and len(raw_mr) - (mk + 4) >= 0x30:
                                 e1o = raw_mr[mk + 4:]
-                        if len(e1o) >= 0x30:
-                            modid_to_oid[struct.unpack("<I", e1o[0x2C:0x30])[0]] = mod_oid
+                                modid_to_oid[struct.unpack("<I", e1o[0x2C:0x30])[0]] = mod_oid
                 except Exception:
                     pass
 
