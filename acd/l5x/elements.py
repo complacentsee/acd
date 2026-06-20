@@ -2053,6 +2053,8 @@ class Controller(L5xElement):
     # (the DataLog feature ships in v24); older controllers omit it entirely.
     # Set by the builder; default True keeps any other caller's prior output.
     _emit_data_logs: bool = field(default=True)
+    # The controller's own <Description> (first child), or None.
+    _description: Union[str, None] = field(default=None)
 
     def __post_init__(self):
         super().__post_init__()
@@ -2071,6 +2073,12 @@ class Controller(L5xElement):
         idx = base.index(">")
         open_tag = base[: idx + 1]
         inner = base[idx + 1 : -len("</Controller>")]
+        # The controller's own Description is the first child.
+        desc_xml = (
+            f'<Description>\n<![CDATA[{_xml_sane(self._description)}]]>\n</Description>'
+            if self._description else ""
+        )
+        open_tag = open_tag + desc_xml
         # RedundancyInfo: Enabled comes from binary; no pad attributes in golden.
         redundancy_enabled_str = "true" if self._redundancy_enabled else "false"
         redundancy_info = (
@@ -5710,6 +5718,28 @@ class ControllerBuilder(L5xElementBuilder):
         else:
             comment_results = []
 
+        # --- Controller own Description ---
+        # Same own-description key as datatypes/modules: parent = comment_id*0x10000
+        # + cip_type, member_ref 0, object_id == 1 (excludes scratch/operand rows
+        # under the same key). Recover the comment_id from the plaintext main record
+        # for source-protected controllers (the text is decrypted in the comments
+        # table). Best-effort: any failure leaves no description.
+        controller_description: Union[str, None] = None
+        _desc_parent = _comment_parent
+        if _desc_parent is None:
+            _pm = _rxgeneric_plaintext_main(bytes(results[0][4]))
+            if _pm is not None:
+                _desc_parent = (_pm.comment_id * 0x10000) + _pm.cip_type
+        if _desc_parent is not None:
+            self._cur.execute(
+                "SELECT record_string FROM comments "
+                "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
+                (_desc_parent,),
+            )
+            _drow = self._cur.fetchone()
+            if _drow and _drow[0]:
+                controller_description = _drow[0]
+
         def _decode_utf16(key):
             raw = extended_records.get(key)
             if raw is None or len(raw) < 2:
@@ -6282,6 +6312,7 @@ class ControllerBuilder(L5xElementBuilder):
             # <DataLogs> ships with the DataLog feature in v24; gate it on the
             # same v24+/5x80 signal as the project-download settings above.
             _emit_data_logs=_v24_plus,
+            _description=controller_description,
         )
 
 
