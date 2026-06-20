@@ -4637,6 +4637,10 @@ def routine_type_enum(idx: int) -> str:
 @dataclass
 class RoutineBuilder(L5xElementBuilder):
     _short_header: bool = field(default=False)
+    # Precomputed routine object_id -> own Description for short-header files
+    # (built file-wide by ControllerBuilder so the cross-routine collision gate
+    # can see every routine). Empty on long-header, where the lookup is inline.
+    _short_routine_desc: Dict[int, str] = field(default_factory=dict)
 
     def build(self) -> Routine:
         self._cur.execute(
@@ -4769,13 +4773,16 @@ class RoutineBuilder(L5xElementBuilder):
         # at record[14:18]; the own description carries object_id==1 (scratch /
         # operand rows that share the key carry a different object_id) and an empty
         # tag_reference. Excluding nonzero rung_content avoids any rung-comment
-        # collision under a shared key. Short-header own-description recovery is not
-        # attempted here (its bare-comment_id key collides across routines of a
-        # program — the per-routine member_ref discriminator is not globally
-        # unique), so those routines keep no description rather than risk a wrong
-        # one. Wrapped so any failure degrades to no description.
+        # collision under a shared key. Short-header (V10-V21) own descriptions
+        # come from the file-wide, collision-gated map built by ControllerBuilder
+        # (_build_short_routine_descriptions): the bare-comment_id key collides
+        # across a program's routines, so a routine is resolved only when its
+        # (parent, member_ref) is unique in the file. Wrapped so any failure
+        # degrades to no description.
         description: Union[str, None] = None
-        if not self._short_header:
+        if self._short_header:
+            description = self._short_routine_desc.get(self._object_id)
+        else:
             try:
                 parent_key = (r.comment_id * 0x10000) + r.cip_type
                 member_ref = (
@@ -4880,6 +4887,7 @@ class AoiBuilder(L5xElementBuilder):
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
     _short_header: bool = field(default=False)
     _taginfo_layout: Dict[str, object] = field(default_factory=dict)
+    _short_routine_desc: Dict[int, str] = field(default_factory=dict)
 
     def build(self) -> AOI:
         self._cur.execute(
@@ -5123,7 +5131,8 @@ class AoiBuilder(L5xElementBuilder):
                 try:
                     routines.append(RoutineBuilder(
                         self._cur, child_oid,
-                        _short_header=self._short_header).build())
+                        _short_header=self._short_header,
+                        _short_routine_desc=self._short_routine_desc).build())
                 except Exception:
                     pass
 
@@ -5356,6 +5365,8 @@ class ProgramBuilder(L5xElementBuilder):
     _acd_major: int = field(default=0)
     # {owner_tag_object_id -> rendered <AlarmConditions>} for program-scope tags.
     _alarm_map: Dict[int, str] = field(default_factory=dict)
+    # {routine_object_id -> own Description} for short-header files (collision-gated).
+    _short_routine_desc: Dict[int, str] = field(default_factory=dict)
 
     def build(self) -> Program:
         self._cur.execute(
@@ -5423,7 +5434,8 @@ class ProgramBuilder(L5xElementBuilder):
         routines = []
         for child in routine_results:
             routines.append(RoutineBuilder(
-                self._cur, child[1], _short_header=self._short_header).build())
+                self._cur, child[1], _short_header=self._short_header,
+                _short_routine_desc=self._short_routine_desc).build())
 
         # Get the Program Scoped Tags
         self._cur.execute(
@@ -5535,6 +5547,55 @@ class TaskBuilder(L5xElementBuilder):
             event_info,
             scheduled_programs,
         )
+
+
+def _build_short_routine_descriptions(cur) -> Dict[int, str]:
+    """Map routine object_id -> own Description for short-header (V10-V21) files.
+
+    A short-header routine's own description lives in the comments table at
+    parent == 0x6D0000 | (comment_id & 0xFFFF) -- the rung-comment record tag --
+    keyed by the per-routine member_ref at record[16:20], with a zero
+    rung_content (rung comments under the same parent carry the nonzero rung id).
+    The (comment_id & 0xFFFF) parent collides across the routines of one program,
+    so the member_ref discriminator is not globally unique: where two routines
+    map to the same (parent, member_ref) the description cannot be attributed to
+    one of them, so BOTH are dropped (a fabricated description is worse than a
+    missing one). Only routines whose (parent, member_ref) is unique in the file
+    are resolved. Best-effort: any parse failure simply omits that routine.
+    """
+    cur.execute(
+        "SELECT object_id, record FROM comps WHERE parent_id IN "
+        "(SELECT object_id FROM comps WHERE comp_name='RxRoutineCollection')"
+    )
+    keyed: Dict[int, Tuple[int, int]] = {}
+    counts: Dict[Tuple[int, int], int] = {}
+    for oid, rec in cur.fetchall():
+        rec = bytes(rec)
+        if len(rec) < 20:
+            continue
+        try:
+            cid = RxGeneric.from_bytes(rec).comment_id
+        except Exception:
+            continue
+        parent = 0x6D0000 | (cid & 0xFFFF)
+        mref = struct.unpack_from("<I", rec, 16)[0]
+        keyed[oid] = (parent, mref)
+        counts[(parent, mref)] = counts.get((parent, mref), 0) + 1
+    out: Dict[int, str] = {}
+    for oid, (parent, mref) in keyed.items():
+        if counts[(parent, mref)] != 1:
+            continue
+        cur.execute(
+            "SELECT record_string FROM comments "
+            "WHERE parent=? AND member_ref=? AND record_type=1 "
+            "AND (rung_content IS NULL OR rung_content=0) "
+            "AND record_string!='' LIMIT 1",
+            (parent, mref),
+        )
+        drow = cur.fetchone()
+        if drow and drow[0]:
+            out[oid] = drow[0]
+    return out
 
 
 @dataclass
@@ -5795,6 +5856,16 @@ class ControllerBuilder(L5xElementBuilder):
             alarm_map = _build_alarm_conditions(self._cur, self._short_header)
         except Exception:
             alarm_map = {}
+        # Short-header (V10-V21) routine own descriptions, resolved file-wide with
+        # a cross-routine collision gate (see _build_short_routine_descriptions).
+        # Long-header routines resolve their description inline in RoutineBuilder.
+        try:
+            short_routine_desc = (
+                _build_short_routine_descriptions(self._cur)
+                if self._short_header else {}
+            )
+        except Exception:
+            short_routine_desc = {}
         for result in results:
             _tag_object_id = result[1]
             tag = TagBuilder(self._cur, _tag_object_id, _short_header=self._short_header,
@@ -5910,7 +5981,7 @@ class ControllerBuilder(L5xElementBuilder):
         for result in results:
             _program_object_id = result[1]
             programs.append(
-                ProgramBuilder(self._cur, _program_object_id, data_types_map, redundancy_enabled, _short_header=self._short_header, _taginfo_layout=self._taginfo_layout, _acd_major=self._acd_major, _alarm_map=alarm_map).build()
+                ProgramBuilder(self._cur, _program_object_id, data_types_map, redundancy_enabled, _short_header=self._short_header, _taginfo_layout=self._taginfo_layout, _acd_major=self._acd_major, _alarm_map=alarm_map, _short_routine_desc=short_routine_desc).build()
             )
 
         # Build comment_id → program name map for task scheduled-program resolution.
@@ -5965,6 +6036,7 @@ class ControllerBuilder(L5xElementBuilder):
                 _data_types_map=data_types_map,
                 _short_header=self._short_header,
                 _taginfo_layout=self._taginfo_layout,
+                _short_routine_desc=short_routine_desc,
             ).build())
 
         # Get the Module (IO) Collection and build all Module elements.
