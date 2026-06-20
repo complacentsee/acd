@@ -4631,8 +4631,13 @@ class RoutineBuilder(L5xElementBuilder):
 
         try:
             r = RxGeneric.from_bytes(results[0][3])
-        except Exception as e:
-            return Routine(results[0][0], results[0][0], "", [])
+        except Exception:
+            # RxGeneric cannot parse a source-protected routine record, but the
+            # routine type index still sits at raw record offset 0x3e (1=RLL,
+            # 2=FBD, 3=SFC, 4=ST). Recover @Type from it instead of emitting "".
+            rec0 = results[0][3]
+            rtype = routine_type_enum(rec0[0x3e]) if len(rec0) > 0x3e else ""
+            return Routine(results[0][0], results[0][0], rtype, [])
 
         record = results[0][3]
         name = results[0][0]
