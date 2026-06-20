@@ -1982,6 +1982,16 @@ class Program(L5xElement):
     use_as_folder: Union[str, None]  # None -> omit attr (V10..V20 projects)
     tags: List[Tag]        # Tags section before Routines (matches L5X export order)
     routines: List[Routine]
+    _description: Union[str, None] = field(default=None)
+
+    def to_xml(self) -> str:
+        base = super().to_xml()
+        if not self._description:
+            return base
+        # The program's own Description is the first child.
+        desc_xml = f'<Description>\n<![CDATA[{_xml_sane(self._description)}]]>\n</Description>'
+        idx = base.index(">")
+        return base[:idx + 1] + desc_xml + base[idx + 1:]
 
 
 @dataclass
@@ -5621,8 +5631,40 @@ class ProgramBuilder(L5xElementBuilder):
         # deterministic signal.)
         use_as_folder: Union[str, None] = "false" if self._acd_major >= 21 else None
 
+        # --- Program own Description ---
+        # Long header: object_id==1 own-description key. Short header (V10-V21):
+        # the bare comment_id with sub_record_length == the owner cip. A program's
+        # cip is 0x68 -- the SAME as ordinary tags -- so the cip filter alone
+        # cannot tell a program-own row from a colliding tag row at a shared
+        # comment_id; require EXACTLY ONE matching row (else a collision is
+        # present and the description is dropped rather than fabricated).
+        program_description: Union[str, None] = None
+        if self._short_header:
+            if len(prog_record) >= 14:
+                _pcid = struct.unpack_from("<H", prog_record, 12)[0]
+                _pcip = struct.unpack_from("<H", prog_record, 10)[0]
+                self._cur.execute(
+                    "SELECT record_string FROM comments "
+                    "WHERE parent=? AND member_ref=0 AND record_type IN (1,2) "
+                    "AND sub_record_length=? AND record_string!=''",
+                    (_pcid, _pcip),
+                )
+                _prows = self._cur.fetchall()
+                if len(_prows) == 1 and _prows[0][0]:
+                    program_description = _prows[0][0]
+        elif _prog_comment_parent is not None:
+            self._cur.execute(
+                "SELECT record_string FROM comments "
+                "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
+                (_prog_comment_parent,),
+            )
+            _prow = self._cur.fetchone()
+            if _prow and _prow[0]:
+                program_description = _prow[0]
+
         return Program(name, name, "false", main_routine_name, fault_routine_name,
-                       disabled, sync_redundancy, use_as_folder, tags, routines)
+                       disabled, sync_redundancy, use_as_folder, tags, routines,
+                       _description=program_description)
 
 
 _TASK_TYPE_MAP = {1: "EVENT", 2: "PERIODIC", 4: "CONTINUOUS"}
