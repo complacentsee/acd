@@ -3226,6 +3226,49 @@ class ModuleBuilder(L5xElementBuilder):
                 return int(m.group(1))
         return None
 
+    def _recover_from_full(self):
+        """Rebuild (r, exts) for a module whose truncated comps record won't parse.
+
+        Returns a lightweight stand-in for the RxGeneric record (an object with
+        ``cip_type`` and ``comment_id``) plus the {attribute_id: bytes} extended-
+        attribute map, both read from the untruncated comps_full stream. Returns
+        (None, {}) when no full record exists, the record is not a cip-0x69 module,
+        or the identity attribute 0x001 is absent — so the caller falls back to the
+        all-zero Module exactly as before.
+        """
+        try:
+            self._cur.execute(
+                "SELECT record FROM comps_full WHERE object_id=?",
+                (self._object_id,),
+            )
+            row = self._cur.fetchone()
+            if not row or not row[0]:
+                return None, {}
+            full = bytes(row[0])
+            body_off = CompsRecord.body_offset(self._short_header)
+            # RxGeneric prelude within the full body: cip_type u16 @+10,
+            # comment_id u16 @+12 (validated byte-identical to RxGeneric on every
+            # record whose truncated buffer still parses).
+            if len(full) < body_off + 14:
+                return None, {}
+            cip_type = struct.unpack_from("<H", full, body_off + 10)[0]
+            if cip_type != 0x69:
+                return None, {}
+            comment_id = struct.unpack_from("<H", full, body_off + 12)[0]
+            exts = CompsRecord.read_value_attrs(full, self._short_header, full=True)
+            if len(exts.get(0x001, b"")) < 0x30:
+                return None, {}
+
+            class _RecoveredRecord:
+                pass
+
+            r = _RecoveredRecord()
+            r.cip_type = cip_type
+            r.comment_id = comment_id
+            return r, exts
+        except Exception:
+            return None, {}
+
     def build(self) -> Module:
         self._cur.execute(
             "SELECT comp_name, object_id, record FROM comps WHERE object_id=" + str(self._object_id)
@@ -3238,15 +3281,34 @@ class ModuleBuilder(L5xElementBuilder):
         # cards, etc.).  Logix Designer exports these with Name="?".
         name = "?" if (db_name.startswith("$") and db_name.endswith("$")) else db_name
 
+        # The comps `record` column is the FafaComps buffer truncated to
+        # record_length(@0)-148. On long-header (V24+) projects that have been
+        # re-saved by a newer Studio, count_record (@body+78) reads garbage and the
+        # tail is trimmed by a few bytes, so RxGeneric.from_bytes either throws
+        # ("requested <huge> bytes") or — were it to parse — would miss attributes.
+        # Whole controllers (incl. the Local CPU) export this way, which made every
+        # one of their modules collapse to an all-zero identity. Recover the real
+        # record from the untruncated comps_full stream: read_value_attrs walks the
+        # attribute table by length (ignoring count_record), and the RxGeneric
+        # prelude (cip_type u16 @body+10, comment_id u16 @body+12) is read directly
+        # from the full body. Only used when the truncated record fails to yield a
+        # usable cip-0x69 module, so records that parse normally are untouched.
+        r = None
         try:
             r = RxGeneric.from_bytes(raw_rec)
         except Exception:
-            return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false", "false")
+            r = None
 
-        if r.cip_type != 0x69:
-            return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false", "false")
+        if r is not None and r.cip_type == 0x69:
+            exts: Dict[int, bytes] = {
+                er.attribute_id: bytes(er.value) for er in r.extended_records
+            }
+        else:
+            r, exts = self._recover_from_full()
+            if r is None:
+                return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false",
+                              "false")
 
-        exts: Dict[int, bytes] = {er.attribute_id: bytes(er.value) for er in r.extended_records}
         e1 = exts.get(0x001, b"")
         if len(e1) < 0x30:
             # Some module records (seen on V10..V20 projects) do not surface the
@@ -3259,6 +3321,26 @@ class ModuleBuilder(L5xElementBuilder):
             marker = raw_rec.find(b"\x44\x02\x00\x00")
             if marker >= 0 and len(raw_rec) - (marker + 4) >= 0x30:
                 e1 = raw_rec[marker + 4:]
+        if len(e1) < 0x30:
+            # The identity attribute 0x001 can be absent from the truncated
+            # FafaComps `record` buffer while present in the untruncated
+            # comps_full stream (long-header modules whose record is truncated
+            # before 0x001 surfaces). Recover it from comps_full before giving up,
+            # the same way ConfigData/ForceData read their images.
+            try:
+                self._cur.execute(
+                    "SELECT record FROM comps_full WHERE object_id=?",
+                    (self._object_id,),
+                )
+                _cf = self._cur.fetchone()
+                if _cf and _cf[0]:
+                    _fe1 = CompsRecord.read_value_attrs(
+                        bytes(_cf[0]), self._short_header, full=True
+                    ).get(0x001, b"")
+                    if len(_fe1) >= 0x30:
+                        e1 = _fe1
+            except Exception:
+                pass
         if len(e1) < 0x30:
             major_fault = "true" if name == "Local" else "false"
             return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false", major_fault,
