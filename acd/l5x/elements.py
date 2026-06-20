@@ -6281,6 +6281,47 @@ class ProgramBuilder(L5xElementBuilder):
 _TASK_TYPE_MAP = {1: "EVENT", 2: "PERIODIC", 4: "CONTINUOUS"}
 
 
+def _read_task_config(e01: bytes):
+    """Recover (type, rate, priority, watchdog, disable, inhibit) from a task's
+    ext-attr 0x01 blob, or None if the blob is absent / an unrecognised layout.
+
+    Type/Priority/Rate sit at fixed offsets from the START of the blob (a short
+    layout at 0x28C, a long one at 0x109C); Watchdog/DisableUpdateOutputs/
+    InhibitTask sit at fixed offsets from the END (a variable middle section moves
+    them within the record, but the tail is constant: Watchdog u32 at len-0x64,
+    the two flag bits at len-0x40 / len-0x3C). Rate/Watchdog are microseconds; a
+    sub-millisecond value is rendered with three decimals to match the reference.
+    The Type word must read as a valid enum or the layout is unrecognised -> None
+    (caller falls back) so a wrong layout never emits garbage config.
+    """
+    L = len(e01)
+    if L < 0x64:
+        return None
+    t_off, p_off, r_off = (0x28C, 0x28E, 0x202) if L < 2000 else (0x109C, 0x109E, 0x1012)
+    if t_off + 2 > L:
+        return None
+    type_val = struct.unpack_from("<H", e01, t_off)[0]
+    if type_val not in _TASK_TYPE_MAP:
+        return None
+    task_type = _TASK_TYPE_MAP[type_val]
+
+    def _ms(us):
+        return str(us // 1000) if us % 1000 == 0 else "%.3f" % (us / 1000.0)
+
+    priority = str(struct.unpack_from("<H", e01, p_off)[0]) if p_off + 2 <= L else "10"
+    rate = None
+    if task_type != "CONTINUOUS" and r_off + 4 <= L:
+        rate = _ms(struct.unpack_from("<I", e01, r_off)[0])
+    return {
+        "type": task_type,
+        "rate": rate,
+        "priority": priority,
+        "watchdog": _ms(struct.unpack_from("<I", e01, L - 0x64)[0]),
+        "disable": "true" if (e01[L - 0x40] & 1) else "false",
+        "inhibit": "true" if (e01[L - 0x3C] & 1) else "false",
+    }
+
+
 @dataclass
 class TaskBuilder(L5xElementBuilder):
     def build(self, comment_id_to_program: Dict[int, str]) -> Task:
@@ -6288,23 +6329,44 @@ class TaskBuilder(L5xElementBuilder):
             "SELECT comp_name, record FROM comps WHERE object_id=" + str(self._object_id)
         )
         row = self._cur.fetchone()
-        name, record = row[0], row[1]
+        name, record = row[0], bytes(row[1])
 
-        # All task config fields live within ext[0x01], accessed via absolute BLOB offsets.
-        # These offsets were reverse-engineered from PROJ_N.ACD (V36). V10..V21
-        # task bodies are shorter/source-protected, so emit a valid default PERIODIC task
-        # rather than reading out-of-range -> the L5X skeleton still exports.
-        record = bytes(record)
-        if len(record) < 0x112F:
-            return Task(name, name, "PERIODIC", "10", "10", "10", "false", "false", None, [])
-        rate_us = struct.unpack_from("<I", record, 0x106C)[0]
-        type_val = struct.unpack_from("<H", record, 0x10F6)[0]
-        priority = struct.unpack_from("<H", record, 0x10F8)[0]
-        watchdog_us = struct.unpack_from("<I", record, 0x110A)[0]
-        disable_update = record[0x112E]
-
-        task_type = _TASK_TYPE_MAP.get(type_val, "PERIODIC")
-        rate_str = str(rate_us // 1000) if task_type != "CONTINUOUS" else None
+        # Task config comes from ext-attr 0x01 (a layout consistent across files);
+        # fall back to the legacy single-file absolute record offsets, then to a
+        # valid PERIODIC default for short/opaque (V10..V21) bodies.
+        e01 = b""
+        try:
+            _r = RxGeneric.from_bytes(record)
+            e01 = {er.attribute_id: bytes(er.value)
+                   for er in _r.extended_records}.get(0x01, b"")
+        except Exception:
+            try:
+                e01 = CompsRecord.read_ext_attrs_from_record(record).get(0x01, b"")
+            except Exception:
+                e01 = b""
+        cfg = _read_task_config(e01)
+        if cfg is not None:
+            task_type = cfg["type"]
+            rate_str = cfg["rate"]
+            priority_str = cfg["priority"]
+            watchdog_str = cfg["watchdog"]
+            disable_str = cfg["disable"]
+            inhibit_str = cfg["inhibit"]
+        elif len(record) >= 0x112F:
+            rate_us = struct.unpack_from("<I", record, 0x106C)[0]
+            type_val = struct.unpack_from("<H", record, 0x10F6)[0]
+            priority = struct.unpack_from("<H", record, 0x10F8)[0]
+            watchdog_us = struct.unpack_from("<I", record, 0x110A)[0]
+            disable_update = record[0x112E]
+            task_type = _TASK_TYPE_MAP.get(type_val, "PERIODIC")
+            rate_str = str(rate_us // 1000) if task_type != "CONTINUOUS" else None
+            priority_str = str(priority)
+            watchdog_str = str(watchdog_us // 1000)
+            disable_str = "true" if disable_update else "false"
+            inhibit_str = "false"
+        else:
+            return Task(name, name, "PERIODIC", "10", "10", "10",
+                        "false", "false", None, [])
 
         # Scheduled programs: ext[0x01] value starts at BLOB offset 0x5A.
         # Format: u16 count followed by N u32 comment_ids.
@@ -6328,10 +6390,10 @@ class TaskBuilder(L5xElementBuilder):
             name,
             task_type,
             rate_str,
-            str(priority),
-            str(watchdog_us // 1000),
-            "true" if disable_update else "false",
-            "false",
+            priority_str,
+            watchdog_str,
+            disable_str,
+            inhibit_str,
             event_info,
             scheduled_programs,
         )
