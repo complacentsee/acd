@@ -3394,7 +3394,6 @@ class ModuleBuilder(L5xElementBuilder):
             "SELECT c2.comp_name, c2.object_id FROM comps c1 "
             "JOIN comps c2 ON c2.parent_id = c1.object_id "
             "WHERE c1.parent_id = ? AND c1.comp_name = 'RxMapConnectionCollection' "
-            "AND c2.comp_name NOT IN ('Output') "
             "ORDER BY c2.seq_number",
             (self._object_id,),
         )
@@ -3405,7 +3404,13 @@ class ModuleBuilder(L5xElementBuilder):
             product_type in _CONN_DIRECT_PRODUCT_TYPES
             or (product_type == 0 and vendor == _CONN_GENERIC_VENDOR)
         )
-        for (conn_name, conn_oid) in self._cur.fetchall():
+        # The local chassis / CPU module ("Local") exposes its backplane only as an
+        # Output topology record (read above for chassis size/slot), never as a
+        # discrete <Connection> -- the reference emits no connections for it -- so
+        # skip its connection records (every "Local" module in the reference has an
+        # empty <Connections/>).
+        conn_rows = [] if name == "Local" else self._cur.fetchall()
+        for (conn_name, conn_oid) in conn_rows:
             name_lower = conn_name.lower()
             heuristic_output = "output" in name_lower or name_lower == "config"
             dec = self._conn_decode.get(conn_oid)
