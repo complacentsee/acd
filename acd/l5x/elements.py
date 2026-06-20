@@ -1163,6 +1163,11 @@ class Tag(L5xElement):
     # before the Decorated tree). None for tags with no force holder. Set by
     # ControllerBuilder from the tag's force-holder ext-attr (0x6b).
     _force_data: Union[str, None] = None
+    # Pre-rendered <AlarmConditions> block for a tag that owns configured alarm
+    # conditions (V33+). Emitted as the FIRST child of <Tag> (before Comments/Data).
+    # Empty for tags with no alarms. Set by Controller/ProgramBuilder from the
+    # alarm map keyed by this tag's object id (see _build_alarm_conditions).
+    _alarm_xml: str = field(default="")
 
     def _inject_tag_attrs(self, base: str) -> str:
         """Insert OpcUaAccess / Class attributes into the opening <Tag ...> of base.
@@ -1481,16 +1486,16 @@ class Tag(L5xElement):
                     f' DefaultRPI="{pi.get("DefaultRPI", "")}"/>'
                 )
 
-        if (not consume_xml and not produce_xml and not comments_xml
-                and not desc_xml and not data_xml):
+        if (not self._alarm_xml and not consume_xml and not produce_xml
+                and not comments_xml and not desc_xml and not data_xml):
             return base
 
-        # Insert ConsumeInfo/ProduceInfo (Consumed/Produced tags), then Comments,
-        # Description, Data, immediately after the opening tag. Logix emits the
-        # Consume/Produce info first, then <Comments> before <Description>/<Data>.
+        # Insert <AlarmConditions> first (Logix emits it before everything else on
+        # a tag), then ConsumeInfo/ProduceInfo (Consumed/Produced tags), then
+        # Comments, Description, Data, immediately after the opening tag.
         idx = base.index(">")
-        return (base[:idx + 1] + consume_xml + produce_xml + comments_xml
-                + desc_xml + data_xml + base[idx + 1:])
+        return (base[:idx + 1] + self._alarm_xml + consume_xml + produce_xml
+                + comments_xml + desc_xml + data_xml + base[idx + 1:])
 
 
 @dataclass
@@ -5118,6 +5123,184 @@ class AoiBuilder(L5xElementBuilder):
         )
 
 
+# Boolean <AlarmCondition> attributes the reference always emits "false" (none of
+# the ~1500 pool conditions has any of these set). Severity-bit fields cover only
+# Used/AlarmSet*/AckRequired (see _build_alarm_conditions).
+_ALARM_FALSE_BOOLS = (
+    "InFault", "Latched", "ProgAck", "OperAck", "ProgReset", "OperReset",
+    "ProgSuppress", "OperSuppress", "ProgUnsuppress", "OperUnsuppress",
+    "OperShelve", "ProgUnshelve", "OperUnshelve", "ProgDisable", "OperDisable",
+    "ProgEnable", "OperEnable", "AlarmCountReset",
+)
+_ALARM_CT_EXPR = {"TRIP": "= 1", "LO": "<=", "HI": ">="}
+
+
+def _build_alarm_conditions(cur, short_header):
+    """Build per-tag <AlarmConditions> blocks from RxConfiguredAlarmCollection.
+
+    Returns {owner_tag_object_id: rendered_<AlarmConditions>_xml}. The owning tag
+    is the first @hex@ object-id token of the instance's Input reference (ext-attr
+    0x6a); keying by object id (not name) is scope- and collision-safe.
+
+    A tag's block is emitted ONLY when every one of its conditions decodes cleanly
+    AND all condition Names within the block are DISTINCT -- duplicate names are
+    matched by occurrence position in the comparator, so authored order (which is
+    not recoverable) would matter; such blocks (and any partially-decoding tag) are
+    omitted, leaving them as element_missing (never net-worse).
+    """
+    cur.execute("SELECT object_id FROM comps WHERE comp_name='RxConfiguredAlarmCollection'")
+    row = cur.fetchone()
+    if row is None:
+        return {}
+    coll = row[0]
+    cur.execute("SELECT object_id, comp_name FROM comps")
+    oid2name = {o: n for o, n in cur.fetchall()}
+    # Definition suffix set (instances whose suffix matches emit AlarmConditionDefinition).
+    def_suffixes = set()
+    cur.execute("SELECT object_id FROM comps WHERE comp_name='RxAlarmConditionDefinitionCollection'")
+    drow = cur.fetchone()
+    if drow is not None:
+        cur.execute("SELECT comp_name FROM comps WHERE parent_id=?", (drow[0],))
+        for (n,) in cur.fetchall():
+            m = re.match(r"_AD[0-9A-Fa-f]{8}_(.+)$", n)
+            if m:
+                def_suffixes.add(m.group(1))
+
+    def _f32(rec, off):
+        v = struct.unpack_from("<f", rec, off)[0]
+        return f"{v:.1f}" if v == int(v) else repr(v)
+
+    def _resolve(s):
+        # Replace @hex@ object-id tokens with their comp_names; first token = owner.
+        owner = None
+        out = []
+        for i, p in enumerate(re.split(r"@([0-9A-Fa-f]+)@", s)):
+            if i % 2 == 1:
+                nm = oid2name.get(int(p, 16), "")
+                if owner is None:
+                    owner_name = nm
+                    owner = int(p, 16)
+                out.append(nm)
+            else:
+                out.append(p)
+        return "".join(out), owner, (owner_name if owner is not None else "")
+
+    cur.execute(
+        "SELECT comp_name, object_id, record FROM comps WHERE parent_id=? ORDER BY seq_number",
+        (coll,))
+    by_owner = {}  # owner_oid -> list of (cond_dict, ok_bool)
+    for cname, oid, rec in cur.fetchall():
+        rec = bytes(rec)
+        ok = True
+        try:
+            nlen = struct.unpack_from("<H", rec, 0x5a)[0]
+            name = rec[0x5c:0x5c + nlen].decode("ascii")
+            ctlen = struct.unpack_from("<H", rec, 0x84)[0]
+            ct = rec[0x86:0x86 + ctlen].decode("ascii")
+            cur.execute("SELECT record FROM comps_full WHERE object_id=?", (oid,))
+            frow = cur.fetchone()
+            attrs = CompsRecord.read_value_attrs(bytes(frow[0]), short_header, full=True) if frow else {}
+            in_s = attrs.get(0x6a, b"").decode("utf-16-le", errors="ignore").split("\x00")[0]
+            inp, owner_oid, owner_name = _resolve(in_s)
+            if owner_name and inp.startswith(owner_name):
+                inp = inp[len(owner_name):]
+            if inp == "":
+                inp = "."
+            assoc = None
+            a66 = attrs.get(0x66, b"").decode("utf-16-le", errors="ignore").split("\x00")[0]
+            if a66:
+                ar, _, _ = _resolve(a66)
+                if owner_name and ar.startswith(owner_name):
+                    ar = ar[len(owner_name):]
+                assoc = ar if ar else "."
+            expr = _ALARM_CT_EXPR.get(ct)
+            if owner_oid is None or expr is None or not name:
+                ok = False
+            flagA = struct.unpack_from("<H", rec, 0x196)[0]
+            flagB = struct.unpack_from("<H", rec, 0x19a)[0]
+            suf = re.match(r"_CA[0-9A-Fa-f]{8}_(.+)$", cname)
+            acd = suf.group(1) if (suf and suf.group(1) in def_suffixes) else None
+            jk = struct.unpack_from("<I", rec, 0x0a)[0]
+            cam = cac = None
+            cur.execute(
+                "SELECT tag_reference, record_string FROM comments WHERE parent=? AND record_type=4",
+                (jk,))
+            for tr, rs in cur.fetchall():
+                if tr == "CAM":
+                    cam = rs
+                elif tr == "CAC":
+                    cac = rs
+            cond = {
+                "Name": name, "AlarmConditionDefinition": acd, "Input": inp,
+                "ConditionType": ct, "Limit": _f32(rec, 0x19c),
+                "Severity": str(struct.unpack_from("<H", rec, 0x1a0)[0]),
+                "OnDelay": str(struct.unpack_from("<I", rec, 0x1a4)[0]),
+                "OffDelay": str(struct.unpack_from("<I", rec, 0x1a8)[0]),
+                "ShelveDuration": str(struct.unpack_from("<I", rec, 0x1ac)[0]),
+                "MaxShelveDuration": str(struct.unpack_from("<I", rec, 0x1b0)[0]),
+                "Deadband": _f32(rec, 0x1b4),
+                "Used": "true" if flagB & 1 else "false",
+                "AlarmSetOperIncluded": "true" if flagB & 2 else "false",
+                "AlarmSetRollupIncluded": "true" if flagB & 4 else "false",
+                "AckRequired": "true" if flagA & 4 else "false",
+                "EvaluationPeriod": "500 millisecond", "Expression": expr,
+                "AssocTag1": assoc, "_cam": cam, "_cac": cac,
+            }
+        except Exception:
+            owner_oid, cond, ok = None, None, False
+        by_owner.setdefault(owner_oid, []).append((cond, ok))
+
+    out = {}
+    for owner_oid, conds in by_owner.items():
+        if owner_oid is None:
+            continue
+        if not all(ok for _c, ok in conds):
+            continue
+        names = [c["Name"] for c, _ in conds]
+        if len(names) != len(set(names)):  # duplicate names -> ordering matters; skip
+            continue
+        out[owner_oid] = _render_alarm_conditions([c for c, _ in conds])
+    return out
+
+
+def _render_alarm_conditions(conds):
+    """Render a list of decoded condition dicts into an <AlarmConditions> block."""
+    def _esc(v):
+        return html.escape(v, quote=True)
+    parts = ["<AlarmConditions>"]
+    for c in conds:
+        a = [f'Name="{_esc(c["Name"])}"']
+        if c["AlarmConditionDefinition"] is not None:
+            a.append(f'AlarmConditionDefinition="{_esc(c["AlarmConditionDefinition"])}"')
+        a.append(f'Input="{_esc(c["Input"])}"')
+        for k in ("ConditionType", "Limit", "Severity", "OnDelay", "OffDelay",
+                  "ShelveDuration", "MaxShelveDuration", "Deadband", "Used",
+                  "AlarmSetOperIncluded", "AlarmSetRollupIncluded"):
+            a.append(f'{k}="{_esc(c[k])}"')
+        a.append('InFault="false"')
+        a.append(f'AckRequired="{c["AckRequired"]}"')
+        for k in _ALARM_FALSE_BOOLS[1:]:  # skip InFault (already emitted)
+            a.append(f'{k}="false"')
+        a.append(f'EvaluationPeriod="{c["EvaluationPeriod"]}"')
+        a.append(f'Expression="{_esc(c["Expression"])}"')
+        if c["AssocTag1"] is not None:
+            a.append(f'AssocTag1="{_esc(c["AssocTag1"])}"')
+        cam, cac = c["_cam"], c["_cac"]
+        if cam is None and cac is None:
+            cfg = "<AlarmConfig/>"
+        else:
+            cfg = "<AlarmConfig>"
+            if cam is not None:
+                cfg += ('<Messages><Message Type="CAM"><Text Lang="en-US">\n'
+                        f"<![CDATA[{cam}]]>\n</Text></Message></Messages>")
+            if cac is not None:
+                cfg += f"<AlarmClass>\n<![CDATA[{cac}]]>\n</AlarmClass>"
+            cfg += "</AlarmConfig>"
+        parts.append(f'<AlarmCondition {" ".join(a)}>{cfg}</AlarmCondition>')
+    parts.append("</AlarmConditions>")
+    return "".join(parts)
+
+
 @dataclass
 class ProgramBuilder(L5xElementBuilder):
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
@@ -5125,6 +5308,8 @@ class ProgramBuilder(L5xElementBuilder):
     _short_header: bool = field(default=False)
     _taginfo_layout: Dict[str, object] = field(default_factory=dict)
     _acd_major: int = field(default=0)
+    # {owner_tag_object_id -> rendered <AlarmConditions>} for program-scope tags.
+    _alarm_map: Dict[int, str] = field(default_factory=dict)
 
     def build(self) -> Program:
         self._cur.execute(
@@ -5214,6 +5399,7 @@ class ProgramBuilder(L5xElementBuilder):
                                  _acd_major=self._acd_major).build()
                 tag._data_types_map = self._data_types_map
                 tag._taginfo_layout = self._taginfo_layout
+                tag._alarm_xml = self._alarm_map.get(result[1], "")
                 tags.append(tag)
 
         if _prog_comment_parent is not None:
@@ -5557,10 +5743,16 @@ class ControllerBuilder(L5xElementBuilder):
                         force_pool[_foid] = _frec[410:410 + _flen]
         except Exception:
             force_pool = {}
+        # Per-tag <AlarmConditions> blocks (V33+), keyed by owning tag object id.
+        try:
+            alarm_map = _build_alarm_conditions(self._cur, self._short_header)
+        except Exception:
+            alarm_map = {}
         for result in results:
             _tag_object_id = result[1]
             tag = TagBuilder(self._cur, _tag_object_id, _short_header=self._short_header,
                              _acd_major=self._acd_major).build()
+            tag._alarm_xml = alarm_map.get(_tag_object_id, "")
             tag._data_types_map = data_types_map
             tag._taginfo_layout = self._taginfo_layout
             ci = consume_map.get(_tag_object_id)
@@ -5671,7 +5863,7 @@ class ControllerBuilder(L5xElementBuilder):
         for result in results:
             _program_object_id = result[1]
             programs.append(
-                ProgramBuilder(self._cur, _program_object_id, data_types_map, redundancy_enabled, _short_header=self._short_header, _taginfo_layout=self._taginfo_layout, _acd_major=self._acd_major).build()
+                ProgramBuilder(self._cur, _program_object_id, data_types_map, redundancy_enabled, _short_header=self._short_header, _taginfo_layout=self._taginfo_layout, _acd_major=self._acd_major, _alarm_map=alarm_map).build()
             )
 
         # Build comment_id → program name map for task scheduled-program resolution.
