@@ -86,8 +86,13 @@ class L5xElement:
                                 new_child_list.append(element.to_xml())
                             else:
                                 new_child_list.append(f"<{element}/>")
+                        # A list section is normally a bare wrapper, but some
+                        # carry their own attributes (e.g. the safety signature on
+                        # AddOnInstructionDefinitions); _section_attrs maps the field
+                        # name to a pre-rendered attribute string.
+                        _sa = getattr(self, "_section_attrs", {}).get(attribute, "")
                         child_list.append(
-                            f'<{section_name}>{"".join(new_child_list)}</{section_name}>'
+                            f'<{section_name}{_sa}>{"".join(new_child_list)}</{section_name}>'
                         )
                 else:
                     if attribute == "cls":
@@ -2161,6 +2166,10 @@ class Controller(L5xElement):
     _emit_data_logs: bool = field(default=True)
     # The controller's own <Description> (first child), or None.
     _description: Union[str, None] = field(default=None)
+    # A safety-signed project stamps the <AddOnInstructionDefinitions> collection
+    # with these two attributes; both None on a standard/unsigned project (omitted).
+    _aoi_safety_signature: Union[str, None] = field(default=None)
+    _aoi_safety_signature_timestamp: Union[str, None] = field(default=None)
 
     def __post_init__(self):
         super().__post_init__()
@@ -2171,6 +2180,13 @@ class Controller(L5xElement):
             "project_sn": "ProjectSN",
             "can_use_rpi_from_producer": "CanUseRPIFromProducer",
         }
+        self._section_attrs: Dict[str, str] = {}
+        if self._aoi_safety_signature is not None:
+            self._section_attrs["aois"] = (
+                f' SafetySignature="{self._aoi_safety_signature}"'
+                f' SafetySignatureTimestamp="'
+                f'{html.escape(self._aoi_safety_signature_timestamp or "", quote=True)}"'
+            )
 
     def to_xml(self) -> str:
         base = super().to_xml()
@@ -7040,6 +7056,21 @@ class ControllerBuilder(L5xElementBuilder):
         auto_diags = "false" if (is_5x80 or _modern_unknown_cpu) else None
         web_server = "false" if (is_5x80 or _modern_unknown_cpu) else None
 
+        # <AddOnInstructionDefinitions> safety signature: a safety-signed project
+        # carries Generated-Safety-Signature timestamp comments (tag_reference
+        # "Timestamp\x11GSS"). When present, the reference stamps the AOI collection
+        # element with an all-zero signature and the (modal) GSS timestamp.
+        aoi_sig = aoi_sig_ts = None
+        try:
+            _gss = [g[0] for g in self._cur.execute(
+                "SELECT record_string FROM comments WHERE tag_reference=?",
+                ("Timestamp\x11GSS",)).fetchall() if g[0]]
+            if _gss:
+                aoi_sig = " - ".join(["00000000"] * 8)
+                aoi_sig_ts = max(sorted(set(_gss)), key=_gss.count)
+        except Exception:
+            aoi_sig = aoi_sig_ts = None
+
         return Controller(
             controller_name,
             "Target",
@@ -7075,6 +7106,8 @@ class ControllerBuilder(L5xElementBuilder):
             # same v24+/5x80 signal as the project-download settings above.
             _emit_data_logs=_v24_plus,
             _description=controller_description,
+            _aoi_safety_signature=aoi_sig,
+            _aoi_safety_signature_timestamp=aoi_sig_ts,
         )
 
 
