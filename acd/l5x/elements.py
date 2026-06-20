@@ -1724,17 +1724,21 @@ class Module(L5xElement):
             conn_parts: List[str] = []
             for c in self._connections:
                 safe_name = html.escape(c["name"], quote=True)
-                # InputTag follows the (unchanged) name heuristic. OutputTag is
+                # A motion sync/async/event connection carries no I/O assembly:
+                # emit a bare <Connection> with no InputTag/OutputTag. Otherwise
+                # InputTag follows the name heuristic and is present only when the
+                # connection carries input data (InputSize > 0); OutputTag is
                 # suppressed when the connection decoded with no output data
-                # (OutputSize 0); when the connection did not decode, keep the
-                # prior always-emit behaviour.
+                # (OutputSize 0). Connections that did not decode keep the prior
+                # always-emit behaviour (has_input/is_motion default True/False).
                 tag_stubs = ""
-                if not c["stub_output"]:
-                    inner = self._input_inner if n_input == 1 else None
-                    tag_stubs += _io_tag("InputTag", inner)
-                if c.get("has_output", True):
-                    inner = self._output_inner if n_output == 1 else None
-                    tag_stubs += _io_tag("OutputTag", inner)
+                if not c.get("is_motion", False):
+                    if not c["stub_output"] and c.get("has_input", True):
+                        inner = self._input_inner if n_input == 1 else None
+                        tag_stubs += _io_tag("InputTag", inner)
+                    if c.get("has_output", True):
+                        inner = self._output_inner if n_output == 1 else None
+                        tag_stubs += _io_tag("OutputTag", inner)
                 # Connection point / size attributes, present only when OEM emits
                 # them (a generic/drive Output connection, or a data-driven one).
                 extra = "".join(
@@ -2978,6 +2982,40 @@ class ModuleBuilder(L5xElementBuilder):
                 return after_pub.rstrip("\x00 \r\n")
         return ""
 
+    def _comm_method_from_data_link(self, data_link: int) -> "Union[str, None]":
+        """Resolve CommMethod (<CF>) from the module's comment_id link.
+
+        STAGING: same record/key as _extended_properties_from_data_collection.
+        Validated byte-exact pool-wide (990 GOOD / 0 WRONG). Emits nothing on a
+        link-miss.
+        """
+        if not data_link:
+            return None
+        import re as _re
+        want = data_link & 0xFFFF
+        self._cur.execute(
+            "SELECT object_id FROM comps WHERE comp_name='RxDataCollection'"
+        )
+        coll_oids = [r[0] for r in self._cur.fetchall()]
+        for coll_oid in coll_oids:
+            self._cur.execute(
+                "SELECT record FROM comps WHERE parent_id=?", (coll_oid,)
+            )
+            for (raw,) in self._cur.fetchall():
+                raw = bytes(raw)
+                if len(raw) < 14:
+                    continue
+                if int.from_bytes(raw[12:14], "little") != want:
+                    continue
+                xml_start = raw.find(b'<')
+                if xml_start < 0:
+                    continue
+                xml_text = raw[xml_start:].decode("latin-1", errors="replace")
+                cf_m = _re.search(r'<CF>(\d+)</CF>', xml_text)
+                if cf_m:
+                    return cf_m.group(1)
+        return None
+
     def _ports_from_data_collection(self, data_link: int) -> "Union[str, None]":
         """Build the <Ports> block from the module's RxDataCollection topology blob.
 
@@ -3262,8 +3300,8 @@ class ModuleBuilder(L5xElementBuilder):
         connections: List[dict] = []
         extended_properties = ""
         data_link = struct.unpack("<I", e1[0x24:0x28])[0] if len(e1) >= 0x28 else 0
-        if slot or ip_address:
-            comm_method, _ = self._comms_from_data_collection(slot, ip_address)
+        # STAGING: CommMethod resolved via the comment_id link (full Communications).
+        comm_method = self._comm_method_from_data_link(data_link)
         extended_properties = self._extended_properties_from_data_collection(data_link)
 
         # Read individual connection records from RxMapConnectionCollection children.
@@ -3304,8 +3342,14 @@ class ModuleBuilder(L5xElementBuilder):
                 "name": conn_name, "type": dec["Type"], "rpi": dec["RPI"],
                 "unicast": dec["Unicast"], "event_id": dec["EventID"],
                 "stub_output": heuristic_output,
-                # A connection with no output data carries no <OutputTag>.
+                # A connection with no output/input data carries no Output/InputTag.
                 "has_output": dec["OutputSize"] > 0,
+                "has_input": dec["InputSize"] > 0,
+                # Motion sync/async/event connections carry no I/O assembly at all
+                # (bare <Connection>); MotionDiagnostics is NOT one of these and
+                # does carry IO tags, so match the three exact types only.
+                "is_motion": dec["Type"] in (
+                    "MotionAsync", "MotionEvent", "MotionSync"),
             }
             fmt = dec["fmt"]
             direct = fmt == _CONN_FMT_OUTPUT and generic_drive
@@ -3416,7 +3460,14 @@ class ModuleBuilder(L5xElementBuilder):
                     _ma = CompsRecord.read_value_attrs(bytes(_mr[0]), self._short_header)
                 except Exception:
                     _ma = {}
-                if configdata is None:
+                # The 0x13e fallback is a speculative recovery, used only when the
+                # reliable primary pointer found nothing. A communications-adapter
+                # module (product_type 12: EN/DeviceNet bridges, scanners) that has
+                # real config reaches it through the primary pointer; a missing
+                # primary there means "no config", so do not speculate -- the 0x13e
+                # ext-attr on these resolves to a generic image the reference does
+                # not render as <ConfigData>.
+                if configdata is None and product_type != 12:
                     _ref = _ma.get(0x13E)
                     if _ref and len(_ref) == 4:
                         img = _config_holder_image(
