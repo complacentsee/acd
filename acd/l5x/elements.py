@@ -4400,6 +4400,9 @@ class ParameterBuilder(L5xElementBuilder):
     _short_header: bool = field(default=False)
     # Owning AOI's bare comment_id; the short-header description key.
     _owner_comment_id: int = field(default=0)
+    # {member_name: description} from the AOI datatype member-description join
+    # (long header). Preferred over the per-tag lookup below when it has an entry.
+    _member_desc: Dict[str, str] = field(default_factory=dict)
 
     def build(self) -> Parameter:
         self._cur.execute(
@@ -4480,8 +4483,13 @@ class ParameterBuilder(L5xElementBuilder):
         # (e.g. a lone 0x1d control byte, which would additionally produce invalid
         # XML). Skip the lookup on the SP path rather than emit a bogus Description;
         # the real text needs a separate comment-decryption that is not yet cracked.
-        description: Union[str, None] = None
-        if sp:
+        # Prefer the AOI datatype member-description map (long header): it keys by
+        # the datatype comment_id, which is correct for both plain and
+        # source-protected AOIs, where the per-tag lookup below is not.
+        description: Union[str, None] = self._member_desc.get(name)
+        if description is not None:
+            pass
+        elif sp:
             pass
         elif self._short_header:
             # V10-V21: the parameter description is in the comments table keyed by
@@ -4533,6 +4541,9 @@ class LocalTagBuilder(L5xElementBuilder):
     _short_header: bool = field(default=False)
     # Owning AOI's bare comment_id; the short-header description key.
     _owner_comment_id: int = field(default=0)
+    # {member_name: description} from the AOI datatype member-description join
+    # (long header). Preferred over the per-tag lookup below when it has an entry.
+    _member_desc: Dict[str, str] = field(default_factory=dict)
 
     def build(self) -> LocalTag:
         self._cur.execute(
@@ -4583,10 +4594,12 @@ class LocalTagBuilder(L5xElementBuilder):
             radix = None
 
         # --- Description ---
-        # SP projects encrypt the comment text, so skip the lookup on the SP path
-        # (the stored comment is undecryptable garbage that would also break XML).
-        description: Union[str, None] = None
-        if sp:
+        # Prefer the AOI datatype member-description map (long header), which keys
+        # by the datatype comment_id and is correct for source-protected AOIs too.
+        description: Union[str, None] = self._member_desc.get(name)
+        if description is not None:
+            pass
+        elif sp:
             pass
         elif self._short_header:
             # V10-V21: keyed by the owning AOI's bare comment_id + the local-tag
@@ -4906,16 +4919,59 @@ class AoiBuilder(L5xElementBuilder):
         # datatype members, so they share the datatype's comment_id, as plain UDT
         # members do.) Verified V16: descriptions resolve off this comment_id.
         aoi_comment_id = 0
+        aoi_dt_oid = None
         try:
             _dtrow = self._cur.execute(
-                "SELECT record FROM comps WHERE comp_name=? AND parent_id="
+                "SELECT object_id, record FROM comps WHERE comp_name=? AND parent_id="
                 "(SELECT object_id FROM comps WHERE comp_name='RxDataTypeCollection')",
                 (name,),
             ).fetchone()
-            if _dtrow and _dtrow[0] is not None:
-                aoi_comment_id = RxGeneric.from_bytes(bytes(_dtrow[0])).comment_id
+            if _dtrow and _dtrow[1] is not None:
+                aoi_dt_oid = _dtrow[0]
+                _dtrec = bytes(_dtrow[1])
+                try:
+                    aoi_comment_id = RxGeneric.from_bytes(_dtrec).comment_id
+                except Exception:
+                    # Source-protected AOI datatype: read comment_id from the
+                    # plaintext main record (only the ext-attr tail is encrypted).
+                    _pm = _rxgeneric_plaintext_main(_dtrec)
+                    aoi_comment_id = _pm.comment_id if _pm is not None else 0
         except Exception:
             aoi_comment_id = 0
+            aoi_dt_oid = None
+
+        # Long-header AOI Parameter/LocalTag descriptions are member descriptions
+        # of the AOI's backing datatype, keyed by (datatype comment_id*0x10000 +
+        # 0x6c, member_ref) where member_ref is the datatype member record's
+        # bytes[14:18] -- the same key the UDT member-description join uses. (The
+        # ParameterBuilder's own-comment_id key finds an unrelated row; the real
+        # text now also decrypts for source-protected AOIs.) Build a
+        # {member_name: description} map once and pass it to the builders, which
+        # prefer it over their existing per-tag lookup so nothing regresses. Short
+        # header keeps the bare-comment_id + name path inside the builders.
+        aoi_member_desc: Dict[str, str] = {}
+        if not self._short_header and aoi_comment_id and aoi_dt_oid is not None:
+            try:
+                _parent = (aoi_comment_id * 0x10000) + 0x6C
+                _mc = self._cur.execute(
+                    "SELECT object_id FROM comps WHERE parent_id=? AND "
+                    "comp_name='RxTypeMemberCollection'", (aoi_dt_oid,)).fetchone()
+                if _mc:
+                    for _mnm, _mrec in self._cur.execute(
+                            "SELECT comp_name, record FROM comps WHERE parent_id=? "
+                            "ORDER BY seq_number", (_mc[0],)).fetchall():
+                        _mrec = bytes(_mrec)
+                        if len(_mrec) < 18:
+                            continue
+                        _mref = struct.unpack_from("<I", _mrec, 14)[0]
+                        _drow = self._cur.execute(
+                            "SELECT record_string FROM comments WHERE parent=? AND "
+                            "member_ref=? AND record_string!='' LIMIT 1",
+                            (_parent, _mref)).fetchone()
+                        if _drow and _drow[0]:
+                            aoi_member_desc[_mnm] = _drow[0]
+            except Exception:
+                aoi_member_desc = {}
 
         # --- AOI Parameter/LocalTag prototype DefaultData value images ---
         # Resolve the AOI's hidden __DEFVAL backing ONCE: a consolidated image of
@@ -5083,7 +5139,7 @@ class AoiBuilder(L5xElementBuilder):
 
                 if is_param:
                     try:
-                        p = ParameterBuilder(self._cur, child_oid, _short_header=self._short_header, _owner_comment_id=aoi_comment_id).build()
+                        p = ParameterBuilder(self._cur, child_oid, _short_header=self._short_header, _owner_comment_id=aoi_comment_id, _member_desc=aoi_member_desc).build()
                         # Wire the value-emission maps so <DefaultData> can be
                         # built (mirrors how TagBuilder receives them). Failure
                         # to attach degrades to no-DefaultData, never crashes.
@@ -5101,7 +5157,7 @@ class AoiBuilder(L5xElementBuilder):
                         pass
                 else:
                     try:
-                        lt = LocalTagBuilder(self._cur, child_oid, _short_header=self._short_header, _owner_comment_id=aoi_comment_id).build()
+                        lt = LocalTagBuilder(self._cur, child_oid, _short_header=self._short_header, _owner_comment_id=aoi_comment_id, _member_desc=aoi_member_desc).build()
                         try:
                             lt._data_types_map = self._data_types_map
                             lt._taginfo_layout = self._taginfo_layout
