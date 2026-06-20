@@ -2248,22 +2248,19 @@ class MemberBuilder(L5xElementBuilder):
         results = self._cur.fetchall()
 
         name = results[0][0]
-        sp_member = False
         try:
             r = RxGeneric.from_bytes(results[0][3])
         except Exception as e:
             # Source-protected member record: its own ext-attr tail is encrypted,
             # but every field this builder needs comes from ``self.record`` (the
             # member descriptor blob, passed in already-decrypted by the datatype
-            # builder). Recover comment_id/cip_type from the plaintext main_record.
-            # The member-description comment key does NOT resolve for source-
-            # protected members (it matches stray 1-byte rows), so descriptions are
-            # left off here (member descriptions are rare anyway). Fall back to a
-            # plain member only when even the main_record is unreadable.
+            # builder). Recover comment_id/cip_type from the plaintext main_record;
+            # the comment text is decrypted in the comments table, so the
+            # member-description key resolves the same as for a plain member. Fall
+            # back to a plain member only when even the main_record is unreadable.
             r = _rxgeneric_plaintext_main(results[0][3])
             if r is None:
                 return Member(name, name, "", 0, "Decimal", False, None, None, "Read/Write")
-            sp_member = True
 
         extended_records: Dict[int, List[int]] = {}
         for extended_record in getattr(r, "extended_records", []):
@@ -2350,10 +2347,14 @@ class MemberBuilder(L5xElementBuilder):
         # The member's description is identified in the comments table by a
         # member_ref value extracted from bytes [14:18] of the comps record.
         # This value is non-zero for sub-elements (members) and zero for the
-        # owning object's own description.
+        # owning object's own description. Source-protected members work the same
+        # way: comment_id/cip_type come from the plaintext main record and the
+        # comment text is decrypted in the comments table, so the same key
+        # resolves (the member_ref is unique per member, so a member with no
+        # description simply finds no row -- no over-emission).
         description: Union[str, None] = None
         raw_comps = bytes(results[0][3])
-        if not sp_member and len(raw_comps) >= 18:
+        if len(raw_comps) >= 18:
             member_ref = struct.unpack_from("<I", raw_comps, 14)[0]
             if member_ref:
                 self._cur.execute(
@@ -5058,6 +5059,11 @@ class AoiBuilder(L5xElementBuilder):
             rev_minor = struct.unpack_from("<H", e01, 0x1C)[0] if len(e01) > 0x1D else 0
         except Exception:
             rev_major, rev_minor = 1, 0
+            # Source-protected AOI: recover comment_id/cip_type from the plaintext
+            # main record so the own-description lookup below still runs (the
+            # description text is decrypted in the comments table). The revision
+            # lives in the encrypted ext[0x01], so it keeps the 1.0 default.
+            _r_aoi = _rxgeneric_plaintext_main(aoi_record)
         revision = f"{rev_major}.{rev_minor}"
 
         # --- Vendor from comps record ---
