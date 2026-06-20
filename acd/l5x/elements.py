@@ -5741,26 +5741,45 @@ class ControllerBuilder(L5xElementBuilder):
             comment_results = []
 
         # --- Controller own Description ---
-        # Same own-description key as datatypes/modules: parent = comment_id*0x10000
-        # + cip_type, member_ref 0, object_id == 1 (excludes scratch/operand rows
-        # under the same key). Recover the comment_id from the plaintext main record
-        # for source-protected controllers (the text is decrypted in the comments
-        # table). Best-effort: any failure leaves no description.
+        # Long header: own-description key parent = comment_id*0x10000 + cip_type,
+        # member_ref 0, object_id == 1 (excludes scratch/operand rows). Recover the
+        # comment_id from the plaintext main record for source-protected
+        # controllers. Short header (V10-V21): the controller's own description is
+        # keyed by the bare comment_id (member_ref 0, record_type 1/2) -- the same
+        # scheme as short-header tags. Unlike datatypes/modules, a controller's
+        # comment_id collides only with description-less records (its child
+        # collections), so the lookup is unambiguous without a uniqueness gate
+        # (verified pool-wide: 0 false positives across every short-header file).
+        # Best-effort: any failure leaves no description.
         controller_description: Union[str, None] = None
-        _desc_parent = _comment_parent
-        if _desc_parent is None:
-            _pm = _rxgeneric_plaintext_main(bytes(results[0][4]))
-            if _pm is not None:
-                _desc_parent = (_pm.comment_id * 0x10000) + _pm.cip_type
-        if _desc_parent is not None:
-            self._cur.execute(
-                "SELECT record_string FROM comments "
-                "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
-                (_desc_parent,),
-            )
-            _drow = self._cur.fetchone()
-            if _drow and _drow[0]:
-                controller_description = _drow[0]
+        if self._short_header:
+            _crec = bytes(results[0][4])
+            if len(_crec) >= 14:
+                _ccid = struct.unpack_from("<H", _crec, 12)[0]
+                self._cur.execute(
+                    "SELECT record_string FROM comments "
+                    "WHERE parent=? AND member_ref=0 AND record_type IN (1,2) "
+                    "AND record_string!='' LIMIT 1",
+                    (_ccid,),
+                )
+                _drow = self._cur.fetchone()
+                if _drow and _drow[0]:
+                    controller_description = _drow[0]
+        else:
+            _desc_parent = _comment_parent
+            if _desc_parent is None:
+                _pm = _rxgeneric_plaintext_main(bytes(results[0][4]))
+                if _pm is not None:
+                    _desc_parent = (_pm.comment_id * 0x10000) + _pm.cip_type
+            if _desc_parent is not None:
+                self._cur.execute(
+                    "SELECT record_string FROM comments "
+                    "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
+                    (_desc_parent,),
+                )
+                _drow = self._cur.fetchone()
+                if _drow and _drow[0]:
+                    controller_description = _drow[0]
 
         def _decode_utf16(key):
             raw = extended_records.get(key)
