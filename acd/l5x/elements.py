@@ -5631,6 +5631,7 @@ class AoiBuilder(L5xElementBuilder):
 
         # --- Revision (major.minor) from ext[0x01] ---
         _r_aoi: Union[RxGeneric, None] = None
+        e01 = b""
         try:
             r = RxGeneric.from_bytes(aoi_record)
             _r_aoi = r
@@ -5643,9 +5644,24 @@ class AoiBuilder(L5xElementBuilder):
             # Source-protected AOI: recover comment_id/cip_type from the plaintext
             # main record so the own-description lookup below still runs (the
             # description text is decrypted in the comments table). The revision
-            # lives in the encrypted ext[0x01], so it keeps the 1.0 default.
+            # lives in the encrypted ext[0x01], so it keeps the 1.0 default. Decrypt
+            # the ext tail so the execute flags below are still recovered.
             _r_aoi = _rxgeneric_plaintext_main(aoi_record)
+            try:
+                e01 = CompsRecord.read_ext_attrs_from_record(aoi_record).get(0x01, b"")
+            except Exception:
+                e01 = b""
         revision = f"{rev_major}.{rev_minor}"
+
+        # --- Execute flags from ext[0x01] byte 0x02 ---
+        # bit 0 = ExecuteEnableInFalse, bit 4 = ExecutePrescan (both present in the
+        # plaintext ext on normal AOIs and in the decrypted ext tail on
+        # source-protected ones; 0 false-positives pool-wide). ExecutePostscan is
+        # never set in the reference, so it stays "false". Fail-safe to "false" when
+        # the ext is absent/too short.
+        _flag_byte = e01[0x02] if len(e01) > 0x02 else 0
+        execute_enable_in_false = "true" if (_flag_byte & 0x01) else "false"
+        execute_prescan = "true" if (_flag_byte & 0x10) else "false"
 
         # --- Vendor from comps record ---
         # The u16 length @0xA6 / UTF-8 @0xA8 layout is V34+; on older records (e.g.
@@ -5824,7 +5840,7 @@ class AoiBuilder(L5xElementBuilder):
             name, name, revision,
             meta["revision_extension"],
             vendor,
-            "false", "false", "false",
+            execute_prescan, "false", execute_enable_in_false,
             meta["created_date"], meta["created_by"],
             meta["edited_date"], meta["edited_by"],
             meta["software_revision"],
