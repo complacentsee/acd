@@ -15,7 +15,7 @@ from acd.generated.comps.rx_generic import RxGeneric
 from acd.l5x.catalog_numbers import CATALOG_NUMBERS, CATALOG_NUMBERS_BY_MAJOR
 from acd.l5x.port_structures import PORT_STRUCTURES
 from acd.l5x import tag_value as _tag_value
-from acd.record.comps import CompsRecord, _SP_MARKER
+from acd.record.comps import CompsRecord, _SP_MARKER, decrypt_sp_nameless
 
 
 # XML 1.0 forbids the C0 control characters except TAB (0x09), LF (0x0A) and
@@ -5685,11 +5685,27 @@ class AoiBuilder(L5xElementBuilder):
         # on ciphertext. Sanitize the decoded value (drop XML-illegal control bytes)
         # and treat an empty result as absent so the attribute is omitted rather
         # than emitting control bytes / an empty Vendor="".
+        # On a source-protected AOI the whole ext-attr tail (which contains this
+        # slot) is ciphertext, so 0xA6 reads a garbage u16 length and 0xA8 reads
+        # ciphertext -- the Vendor value is NOT recoverable for SP AOIs from any
+        # decryptable source (it is not in the comps ext-attrs nor the nameless
+        # body). Fail CLOSED: only accept the slot when it is a clean, fully
+        # in-record, strict-UTF-8 printable string; otherwise emit no Vendor attr
+        # (omit) rather than ciphertext garbage. This suppresses the 49 SP garbage
+        # emissions (17 where the OEM has no Vendor -> now correct; 32 where the
+        # OEM has a real Vendor -> now omitted = false-negative, vs today's wrong
+        # value). NON-SP V34+ records pass through unchanged (slot is clean).
         vlen = struct.unpack_from("<H", aoi_record, 0xA6)[0] if len(aoi_record) > 0xA8 else 0
         vendor: Union[str, None] = None
-        if vlen > 0:
-            _vendor = _xml_sane(aoi_record[0xA8:0xA8 + vlen].decode("utf-8", errors="replace"))
-            vendor = _vendor if _vendor.strip() else None
+        if 0 < vlen and 0xA8 + vlen <= len(aoi_record):
+            try:
+                _vendor = aoi_record[0xA8:0xA8 + vlen].decode("utf-8")
+            except UnicodeDecodeError:
+                _vendor = ""
+            # Reject the slot if it carries any byte XML forbids / any decode
+            # replacement char (a ciphertext slot that happened to decode).
+            if _vendor.strip() and _xml_sane(_vendor) == _vendor and "�" not in _vendor:
+                vendor = _vendor
 
         # --- Metadata from large nameless record ---
         self._cur.execute(
@@ -5698,7 +5714,18 @@ class AoiBuilder(L5xElementBuilder):
         )
         nameless_row = self._cur.fetchone()
         if nameless_row and len(bytes(nameless_row[0])) > 50:
-            meta = _parse_aoi_nameless(bytes(nameless_row[0]))
+            nm_rec = bytes(nameless_row[0])
+            # Source-protected AOIs store the metadata body (CreatedBy/EditedBy/
+            # SoftwareRevision/RevisionExtension/dates) AES-encrypted behind the
+            # aa96aa0a marker. Decrypt it back to the ordinary plaintext layout so
+            # the same parser recovers them; the strings are UTF-16-LE, same as a
+            # non-protected record. Degrades to the raw record (-> empty/garbage,
+            # i.e. today's behaviour) when no project SP key validates.
+            if _SP_MARKER in nm_rec:
+                _dec = decrypt_sp_nameless(nm_rec)
+                if _dec is not None:
+                    nm_rec = _dec
+            meta = _parse_aoi_nameless(nm_rec)
         else:
             meta = {"created_by": "", "created_date": "", "edited_by": "", "edited_date": "",
                     "software_revision": "", "revision_extension": None}

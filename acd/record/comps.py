@@ -138,6 +138,58 @@ def _decrypt_value_attrs(ciphertext: bytes, full: bool = False) -> dict:
             nblocks += 1
     return {}
 
+
+def decrypt_sp_nameless(record: bytes) -> Optional[bytes]:
+    """Decrypt a source-protected AOI *nameless* metadata record in place.
+
+    A non-protected AOI nameless record is ``header(20B) + ffffffff + body`` where
+    ``body`` is ``[u16 ver=1][fffeff-strings + FILETIMEs ...]`` (created_by /
+    created_date / edited_by / software_revision / revision_extension / edited_date
+    -- the layout ``_parse_aoi_nameless`` walks). On a source-protected AOI that
+    body is AES-256-CBC encrypted (IV=0, the project SP key) with the SAME marker
+    framing the comps ext-attr tail uses: ``aa96aa0a`` replaces the ``ffffffff``
+    sentinel, the plaintext byte length sits at ``marker+4`` (u16), and the
+    ciphertext (PKCS7-padded, then 0xFF-filled to the record's slot size) starts at
+    ``marker+18``. Strings are UTF-16-LE (the fffeff prefix), NOT UTF-8.
+
+    Returns a reconstructed PLAINTEXT record (``header + ffffffff + decrypted
+    body``) that ``_parse_aoi_nameless`` can parse byte-for-byte as if it were
+    never protected, or ``None`` when there is no marker (already plaintext) or no
+    SP key validates (project key unknown -> caller keeps its existing behaviour).
+    """
+    try:
+        midx = record.find(_SP_MARKER)
+        if midx < 0:
+            return None
+        # Plaintext length is framed at marker+4 (u16); round up to the AES block
+        # so trailing 0xFF slot-fill past the padded ciphertext is excluded.
+        plen = int.from_bytes(record[midx + 4:midx + 6], "little")
+        ctlen = ((plen + 15) // 16) * 16
+        ct = record[midx + _SP_CT_OFFSET:midx + _SP_CT_OFFSET + ctlen]
+        nblk = len(ct) // 16
+        if nblk == 0:
+            return None
+        order = list(_SP_KEYS)
+        hint = _SP_KEY_HINT[0]
+        if hint is not None:
+            order.sort(key=lambda kv: 0 if kv[0] == hint else 1)
+        for config, key in order:
+            aes = _sp_aes(config, key)
+            head = _sp_cbc(ct, aes, 1)
+            # A real body begins u16 ver==1 then the first empty fffeff string.
+            if not (head[0:2] == b"\x01\x00" and head[2:5] == b"\xff\xfe\xff"):
+                continue
+            _SP_KEY_HINT[0] = config
+            pt = _sp_cbc(ct, aes, nblk)
+            pad = pt[-1] if pt else 0
+            if 1 <= pad <= 16 and pt[-pad:] == bytes([pad]) * pad:
+                pt = pt[:-pad]
+            return record[:midx] + b"\xff\xff\xff\xff" + pt
+        return None
+    except Exception:
+        return None
+
+
 # --- SHORT (V10..V21) comps header layout ------------------------------------
 # RSLogix5000 V21-and-earlier store comps with a FAFA/FDFD header that is 4 bytes
 # SHORTER than V24+ (the V24+ "long" header inserts a zero u32 at payload offset
