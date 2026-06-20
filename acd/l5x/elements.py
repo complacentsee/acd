@@ -1788,8 +1788,40 @@ class Module(L5xElement):
                     f'<ConfigScript Size="{cs_size}">'
                     f'<Data>{cs_hex}</Data></ConfigScript>'
                 )
+            # PrimCxn*/SecCxn* connection-size attributes on <Communications>.
+            # A generic-profile module (Rockwell vendor, ProductType 0), a DeviceNet
+            # scanner (ProductType 12), or a 753-NET drive (ProductType 123) records
+            # its primary "Standard" Output connection's assembly sizes at the
+            # Communications level — the assembly is user-configured rather than fixed
+            # by a catalog Module Definition. Catalog cards, comms bridges/adapters,
+            # drive-peripheral modules and specific drive profiles omit them, so the
+            # primary connection must be present and decoded (Name "Standard",
+            # Type "Output"). The values are that connection's decoded Input/Output
+            # sizes; a two-connection scanner also states its secondary "Status"
+            # Input connection's input size (SecCxnInputSize only).
+            primcxn_attrs = ""
+            if self.vendor == 1 and self.product_type in (0, 12, 123):
+                prim = next(
+                    (c for c in self._connections
+                     if c.get("name") == "Standard" and c.get("type") == "Output"
+                     and "in_size" in c),
+                    None,
+                )
+                if prim is not None:
+                    primcxn_attrs = (
+                        f' PrimCxnInputSize="{prim["in_size"]}"'
+                        f' PrimCxnOutputSize="{prim["out_size"]}"'
+                    )
+                    sec = next(
+                        (c for c in self._connections
+                         if c.get("name") == "Status" and c.get("type") == "Input"
+                         and "in_size" in c),
+                        None,
+                    )
+                    if sec is not None:
+                        primcxn_attrs += f' SecCxnInputSize="{sec["in_size"]}"'
             comm_xml = (
-                f'<Communications CommMethod="{self._comm_method}">'
+                f'<Communications CommMethod="{self._comm_method}"{primcxn_attrs}>'
                 f'{config_xml}{script_xml}{connections_xml}'
                 f'</Communications>'
             )
@@ -3345,6 +3377,11 @@ class ModuleBuilder(L5xElementBuilder):
                 # A connection with no output/input data carries no Output/InputTag.
                 "has_output": dec["OutputSize"] > 0,
                 "has_input": dec["InputSize"] > 0,
+                # Raw decoded assembly sizes, kept on every decoded connection so the
+                # Communications-level PrimCxn*/SecCxn* attributes can read them even
+                # when they are not surfaced as Connection size attributes.
+                "in_size": dec["InputSize"],
+                "out_size": dec["OutputSize"],
                 # Motion sync/async/event connections carry no I/O assembly at all
                 # (bare <Connection>); MotionDiagnostics is NOT one of these and
                 # does carry IO tags, so match the three exact types only.
