@@ -4443,6 +4443,8 @@ class ParameterBuilder(L5xElementBuilder):
     # {member_name: description} from the AOI datatype member-description join
     # (long header). Preferred over the per-tag lookup below when it has an entry.
     _member_desc: Dict[str, str] = field(default_factory=dict)
+    # The AOI definition comp's comment_id (short-header parameter desc key).
+    _owner_def_cid: int = field(default=0)
 
     def build(self) -> Parameter:
         self._cur.execute(
@@ -4529,22 +4531,30 @@ class ParameterBuilder(L5xElementBuilder):
         description: Union[str, None] = self._member_desc.get(name)
         if description is not None:
             pass
-        elif sp:
-            pass
         elif self._short_header:
-            # V10-V21: the parameter description is in the comments table keyed by
-            # the owning AOI's bare comment_id with the parameter NAME in
-            # tag_reference (same scheme as short-header datatype members; verified
-            # V16). record_type is an ordinal, so it is not filtered.
-            if self._owner_comment_id:
+            # V10-V21 AOI parameter description join. The parameter record's
+            # bytes[14:18] encode (selector << 16 | per-parameter member_ref); the
+            # description lives at parent = (selector << 16) | the AOI definition
+            # comment_id, with that member_ref, record_type 1, and
+            # sub_record_length == the AOI definition cip (0x338). The cip filter
+            # excludes a colliding tag/string row that shares the comment_id. This
+            # runs before the sp guard: bytes[14:18] are plaintext even on
+            # source-protected parameters, and the text decrypts in the comments
+            # table.
+            if self._owner_def_cid and len(raw_rec) >= 18:
+                _b14 = struct.unpack_from("<I", raw_rec, 14)[0]
+                _parent = ((_b14 & 0xFFFF) << 16) | self._owner_def_cid
                 self._cur.execute(
                     "SELECT record_string FROM comments "
-                    "WHERE parent=? AND tag_reference=? AND record_string!='' LIMIT 1",
-                    (self._owner_comment_id, name),
+                    "WHERE record_type=1 AND parent=? AND member_ref=? "
+                    "AND sub_record_length=? AND record_string!='' LIMIT 1",
+                    (_parent, _b14 >> 16, 0x338),
                 )
                 desc_row = self._cur.fetchone()
                 if desc_row and desc_row[0]:
                     description = desc_row[0]
+        elif sp:
+            pass
         elif len(raw_rec) >= 18:
             # V24+ long header: bytes [14:18] are the member_ref into the comments
             # table, keyed by comment_id*0x10000 + cip.
@@ -4584,6 +4594,8 @@ class LocalTagBuilder(L5xElementBuilder):
     # {member_name: description} from the AOI datatype member-description join
     # (long header). Preferred over the per-tag lookup below when it has an entry.
     _member_desc: Dict[str, str] = field(default_factory=dict)
+    # The AOI definition comp's comment_id (short-header local-tag desc key).
+    _owner_def_cid: int = field(default=0)
 
     def build(self) -> LocalTag:
         self._cur.execute(
@@ -4639,20 +4651,26 @@ class LocalTagBuilder(L5xElementBuilder):
         description: Union[str, None] = self._member_desc.get(name)
         if description is not None:
             pass
-        elif sp:
-            pass
         elif self._short_header:
-            # V10-V21: keyed by the owning AOI's bare comment_id + the local-tag
-            # NAME in tag_reference (same scheme as short-header members/params).
-            if self._owner_comment_id:
+            # V10-V21 AOI local-tag description join (same as ParameterBuilder):
+            # record bytes[14:18] = (selector << 16 | member_ref); description at
+            # parent = (selector << 16) | AOI-def comment_id, that member_ref,
+            # record_type 1, sub_record_length == AOI def cip (0x338, which excludes
+            # a colliding tag/string row). Runs before the sp guard.
+            if self._owner_def_cid and len(raw_rec) >= 18:
+                _b14 = struct.unpack_from("<I", raw_rec, 14)[0]
+                _parent = ((_b14 & 0xFFFF) << 16) | self._owner_def_cid
                 self._cur.execute(
                     "SELECT record_string FROM comments "
-                    "WHERE parent=? AND tag_reference=? AND record_string!='' LIMIT 1",
-                    (self._owner_comment_id, name),
+                    "WHERE record_type=1 AND parent=? AND member_ref=? "
+                    "AND sub_record_length=? AND record_string!='' LIMIT 1",
+                    (_parent, _b14 >> 16, 0x338),
                 )
                 desc_row = self._cur.fetchone()
                 if desc_row and desc_row[0]:
                     description = desc_row[0]
+        elif sp:
+            pass
         elif len(raw_rec) >= 18:
             # V24+ long header: bytes [14:18] are the member_ref into the comments
             # table, keyed by comment_id*0x10000 + cip.
@@ -4951,6 +4969,9 @@ class AoiBuilder(L5xElementBuilder):
 
         aoi_record = bytes(results[0][3])
         name = results[0][0]
+        # The AOI definition comp's own comment_id (u16 @ record offset 12); the
+        # short-header Parameter/LocalTag description join keys off it.
+        aoi_def_cid = struct.unpack_from("<H", aoi_record, 12)[0] if len(aoi_record) >= 14 else 0
 
         # The AOI's parameter/local-tag descriptions are keyed (short header) by
         # the comment_id of the AOI's DATATYPE comp -- the cip-0x6c struct under
@@ -5184,7 +5205,7 @@ class AoiBuilder(L5xElementBuilder):
 
                 if is_param:
                     try:
-                        p = ParameterBuilder(self._cur, child_oid, _short_header=self._short_header, _owner_comment_id=aoi_comment_id, _member_desc=aoi_member_desc).build()
+                        p = ParameterBuilder(self._cur, child_oid, _short_header=self._short_header, _owner_comment_id=aoi_comment_id, _member_desc=aoi_member_desc, _owner_def_cid=aoi_def_cid).build()
                         # Wire the value-emission maps so <DefaultData> can be
                         # built (mirrors how TagBuilder receives them). Failure
                         # to attach degrades to no-DefaultData, never crashes.
@@ -5202,7 +5223,7 @@ class AoiBuilder(L5xElementBuilder):
                         pass
                 else:
                     try:
-                        lt = LocalTagBuilder(self._cur, child_oid, _short_header=self._short_header, _owner_comment_id=aoi_comment_id, _member_desc=aoi_member_desc).build()
+                        lt = LocalTagBuilder(self._cur, child_oid, _short_header=self._short_header, _owner_comment_id=aoi_comment_id, _member_desc=aoi_member_desc, _owner_def_cid=aoi_def_cid).build()
                         try:
                             lt._data_types_map = self._data_types_map
                             lt._taginfo_layout = self._taginfo_layout
