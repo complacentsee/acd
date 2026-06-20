@@ -2483,6 +2483,9 @@ class DataTypeBuilder(L5xElementBuilder):
     # short-header ControllerBuilder path; defaults False -> identical V24+
     # behaviour.
     _short_header: bool = field(default=False)
+    # File-wide {comment_id: #comps records carrying it}; used by the short-header
+    # own-description uniqueness gate. Empty on long header.
+    _cid_counts: Dict[int, int] = field(default_factory=dict)
 
     def build(self) -> DataType:
         self._cur.execute(
@@ -2758,14 +2761,33 @@ class DataTypeBuilder(L5xElementBuilder):
         # and their record_string is a name-fragment, so requiring object_id == 1
         # drops those fabricated Descriptions while keeping the real one.
         description: Union[str, None] = None
-        self._cur.execute(
-            "SELECT record_string FROM comments "
-            "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
-            ((r.comment_id * 0x10000) + r.cip_type,),
-        )
-        desc_row = self._cur.fetchone()
-        if desc_row and desc_row[0]:
-            description = desc_row[0]
+        if self._short_header:
+            # V10-V21: the datatype's own description is keyed by its bare
+            # comment_id (member_ref 0, record_type 1/2) -- the same scheme as
+            # short-header tags. That bare key collides with cip-0x68 tags that
+            # share the comment_id (e.g. a datatype stamped with an unrelated tag's
+            # description), so emit only when this comment_id is unique across all
+            # comps records (the file-wide _cid_counts map): a shared comment_id is
+            # ambiguous and dropped rather than fabricated.
+            if self._cid_counts.get(r.comment_id, 0) == 1:
+                self._cur.execute(
+                    "SELECT record_string FROM comments "
+                    "WHERE parent=? AND member_ref=0 AND record_type IN (1,2) "
+                    "AND record_string!='' LIMIT 1",
+                    (r.comment_id,),
+                )
+                desc_row = self._cur.fetchone()
+                if desc_row and desc_row[0]:
+                    description = desc_row[0]
+        else:
+            self._cur.execute(
+                "SELECT record_string FROM comments "
+                "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
+                ((r.comment_id * 0x10000) + r.cip_type,),
+            )
+            desc_row = self._cur.fetchone()
+            if desc_row and desc_row[0]:
+                description = desc_row[0]
 
         dt = DataType(name, name, string_family, class_type, children, description)
         dt._emit_predefined = self._short_header
@@ -5859,6 +5881,20 @@ class ControllerBuilder(L5xElementBuilder):
             )
             aoi_names = {row[0] for row in self._cur.fetchall()}
 
+        # Short-header datatype own-description uniqueness gate: count comment_id
+        # occurrences across ALL comps records (comment_id is the u16 at record
+        # offset 12 in every header family, readable even on source-protected
+        # records whose ext-attr tail is encrypted) so DataTypeBuilder can drop a
+        # datatype whose bare-comment_id key collides with a tag that shares it.
+        cid_counts: Dict[int, int] = {}
+        if self._short_header:
+            self._cur.execute("SELECT record FROM comps")
+            for (_crec,) in self._cur.fetchall():
+                _crec = bytes(_crec)
+                if len(_crec) >= 14:
+                    _c = struct.unpack_from("<H", _crec, 12)[0]
+                    cid_counts[_c] = cid_counts.get(_c, 0) + 1
+
         data_types: List[DataType] = []
         # all_data_types_map includes ProductDefined types (excluded from L5X output but
         # needed for generating Decorated XML for tags that reference those types).
@@ -5866,7 +5902,8 @@ class ControllerBuilder(L5xElementBuilder):
         for result in results:
             _data_type_object_id = result[1]
             dt = DataTypeBuilder(
-                self._cur, _data_type_object_id, _short_header=self._short_header
+                self._cur, _data_type_object_id, _short_header=self._short_header,
+                _cid_counts=cid_counts,
             ).build()
             all_data_types_map[dt.name.upper()] = dt
             if self._short_header:
