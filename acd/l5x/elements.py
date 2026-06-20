@@ -6126,33 +6126,60 @@ class ProgramBuilder(L5xElementBuilder):
         prog_record = bytes(results[0][3])
         name = results[0][0]
 
-        # V10..V21 program bodies are source-protected/opaque -> degrade to a
-        # name-only Program rather than crashing.
+        # V10..V21 program bodies are source-protected/opaque -> decrypt the ext
+        # tail so the routine references below still resolve.
         try:
             r = RxGeneric.from_bytes(prog_record)
             exts: Dict[int, bytes] = {e.attribute_id: bytes(e.value) for e in r.extended_records}
             _prog_comment_parent = (r.comment_id * 0x10000) + r.cip_type
         except Exception:
             r = None
-            exts = {}
+            try:
+                exts = CompsRecord.read_ext_attrs_from_record(prog_record)
+            except Exception:
+                exts = {}
             _prog_comment_parent = None
+        _rxok = r is not None
 
-        # --- MainRoutineName and FaultRoutineName from extended records ---
-        # ext[0x12D] = MainRoutine object_id, ext[0x066] = FaultRoutine object_id
+        # routine object_id -> name for this program (children of its
+        # RxRoutineCollection) -- the namespace MainRoutine/FaultRoutine reference.
+        routs: Dict[int, str] = {}
+        _rcoll = self._cur.execute(
+            "SELECT object_id FROM comps WHERE parent_id=? AND "
+            "comp_name='RxRoutineCollection' LIMIT 1", (self._object_id,)).fetchone()
+        if _rcoll:
+            for _rn, _ro in self._cur.execute(
+                    "SELECT comp_name, object_id FROM comps WHERE parent_id=?",
+                    (_rcoll[0],)).fetchall():
+                routs[_ro] = _rn
+
+        # --- MainRoutineName / FaultRoutineName ---
+        # MainRoutine object_id is ext[0x12D] (long header / decrypted SP) or, when
+        # absent, the u32 at record offset 0x1C6 (short header); resolve it within
+        # THIS program's routines (a global comp lookup pulled in unrelated comps and
+        # missed source-protected programs). A program with neither reference but
+        # exactly one routine named "main" uses that. FaultRoutine is ext[0x066],
+        # emitted only when it is a real (non-sentinel) routine of this program --
+        # the prior global lookup matched a junk object_id 0xFFFFFFFF comp and
+        # emitted a bogus FaultRoutineName.
         main_routine_name: Union[str, None] = None
         fault_routine_name: Union[str, None] = None
         if 0x12D in exts and len(exts[0x12D]) >= 4:
-            main_oid = struct.unpack_from("<I", exts[0x12D], 0)[0]
-            if main_oid:
-                self._cur.execute("SELECT comp_name FROM comps WHERE object_id=" + str(main_oid))
-                row = self._cur.fetchone()
-                main_routine_name = row[0] if row else None
+            _mo = struct.unpack_from("<I", exts[0x12D], 0)[0]
+            if _mo in routs:
+                main_routine_name = routs[_mo]
+        if main_routine_name is None and _rxok and len(prog_record) >= 0x1CA:
+            _mo = struct.unpack_from("<I", prog_record, 0x1C6)[0]
+            if _mo in routs:
+                main_routine_name = routs[_mo]
+        if main_routine_name is None:
+            _cand = [n for n in routs.values() if n.lower() == "main"]
+            if len(_cand) == 1:
+                main_routine_name = _cand[0]
         if 0x066 in exts and len(exts[0x066]) >= 4:
-            fault_oid = struct.unpack_from("<I", exts[0x066], 0)[0]
-            if fault_oid:
-                self._cur.execute("SELECT comp_name FROM comps WHERE object_id=" + str(fault_oid))
-                row = self._cur.fetchone()
-                fault_routine_name = row[0] if row else None
+            _fo = struct.unpack_from("<I", exts[0x066], 0)[0]
+            if _fo and _fo != 0xFFFFFFFF and _fo in routs:
+                fault_routine_name = routs[_fo]
 
         # --- Disabled flag from ext[0x01] at offset 0x24 ---
         # A u32 of 0xFFFFFFFF means the program is disabled; 0x00000000 means enabled.
