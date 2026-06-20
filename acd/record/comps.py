@@ -349,7 +349,17 @@ class CompsRecord:
                 pos += 8
                 if ln < 0 or pos + ln > n:
                     break
-                out[attr_id] = body[pos:pos + ln]
+                # Keep the FIRST occurrence of each attribute id. The walk runs
+                # past the declared attribute table (so a trailing image attr is
+                # still seen), but on a forced / relocated-value backing the bytes
+                # after the real attributes (zero padding plus the 0x82/0x6b force
+                # holder refs) parse as spurious (id, len) pairs and can re-emit an
+                # id already captured -- e.g. a stray 4-byte 0x66 that would clobber
+                # the real inline design-value image. The genuine attributes always
+                # precede that region, and datatype member descriptors use unique
+                # incrementing ids, so keeping the first occurrence is correct.
+                if attr_id not in out:
+                    out[attr_id] = body[pos:pos + ln]
                 pos += ln
         except Exception:
             return {}
