@@ -6392,21 +6392,37 @@ class TaskBuilder(L5xElementBuilder):
             disable_str = "true" if disable_update else "false"
             inhibit_str = "false"
         else:
-            return Task(name, name, "PERIODIC", "10", "10", "10",
-                        "false", "false", None, [])
+            # Short/opaque (V10..V21) body: keep the valid PERIODIC default config
+            # but still fall through so the scheduled-program list (which lives in
+            # the raw record) is recovered.
+            task_type = "PERIODIC"
+            rate_str = "10"
+            priority_str = "10"
+            watchdog_str = "10"
+            disable_str = "false"
+            inhibit_str = "false"
 
-        # Scheduled programs: ext[0x01] value starts at BLOB offset 0x5A.
-        # Format: u16 count followed by N u32 comment_ids.
-        prog_count = struct.unpack_from("<H", record, 0x5A)[0]
+        # Scheduled programs (ordered): a u16 count followed by that many u32
+        # program comment_ids. When the task carries ext-attr 0x01 the list sits at
+        # its offset 0x00 (count) / 0x02 (ids); otherwise it is in the raw record at
+        # 0x8A / 0x8C. (The old fixed record[0x5A] read landed on the wrong field for
+        # most layouts, dropping the schedule.)
+        if e01:
+            _buf, _oc, _oa = e01, 0x00, 0x02
+        else:
+            _buf, _oc, _oa = record, 0x8A, 0x8C
         scheduled_programs = []
-        for i in range(prog_count):
-            off = 0x5A + 2 + i * 4
-            if off + 4 > len(record):  # bound by the actual buffer (real files vary)
-                break
-            cid = struct.unpack_from("<I", record, off)[0]
-            prog_name = comment_id_to_program.get(cid)
-            if prog_name:
-                scheduled_programs.append(ScheduledProgram(prog_name, prog_name))
+        if _oc + 2 <= len(_buf):
+            prog_count = struct.unpack_from("<H", _buf, _oc)[0]
+            for i in range(prog_count):
+                off = _oa + 4 * i
+                if off + 4 > len(_buf):
+                    break
+                cid = struct.unpack_from("<I", _buf, off)[0]
+                prog_name = (comment_id_to_program.get(cid)
+                             or comment_id_to_program.get(cid & 0xFFFF))
+                if prog_name:
+                    scheduled_programs.append(ScheduledProgram(prog_name, prog_name))
 
         event_info = None
         if task_type == "EVENT":
