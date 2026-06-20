@@ -961,6 +961,10 @@ _CONN_DATADRIVEN_FMTS = {48, 49, 50}
 # Module Definition already fixes the assembly. See ModuleBuilder.
 _CONN_DIRECT_PRODUCT_TYPES = {123, 127, 142, 143, 150, 151}
 _CONN_GENERIC_VENDOR = 1
+# The rack-optimized CommMethod (0x40000000): such a module bundles its I/O into
+# the rack adapter's connection and emits a single <RackConnection> instead of a
+# discrete <Connection>.
+_RACK_COMM_METHOD = "1073741824"
 
 
 def _build_connection_map(cur, short_header: bool) -> Dict[int, dict]:
@@ -1660,6 +1664,11 @@ class Module(L5xElement):
     # that tag type (an unambiguous mapping; see to_xml).
     _input_inner: Union[str, None] = field(default=None)
     _output_inner: Union[str, None] = field(default=None)
+    # Whether the module owns an :I / :O tag (a rack card's input :I tag carries no
+    # design-value image, so _input_inner can be None even when the card has input);
+    # used to decide a <RackConnection>'s InAliasTag / OutAliasTag presence.
+    _rack_has_input: bool = field(default=False)
+    _rack_has_output: bool = field(default=False)
     # <ConfigData>/<ConfigScript> for a module with a config image but no controller
     # :C tag (mutually exclusive with the ConfigTag above). Each is (hex_data, size)
     # or None. The raw <Data> is masked by the comparator; the size attribute is the
@@ -1754,8 +1763,26 @@ class Module(L5xElement):
                     f'{tag_stubs}'
                     f'</Connection>'
                 )
-            joined = "".join(conn_parts)
-            connections_xml = f'<Connections>{joined}</Connections>' if joined else '<Connections/>'
+            # A rack-optimized module (the rack CommMethod) bundles its slot into
+            # the adapter's rack connection rather than owning a discrete
+            # <Connection>, so it emits a single <RackConnection> carrying an
+            # <InAliasTag>/<OutAliasTag> for each direction the card has data in.
+            # The card's input/output data presence is its captured :I / :O tag
+            # (input cards -> In; basic output cards -> Out; electronic output
+            # cards, which also carry a diagnostic input image, -> both).
+            if self._comm_method == _RACK_COMM_METHOD:
+                aliases = ""
+                if self._rack_has_input:
+                    aliases += "<InAliasTag/>"
+                if self._rack_has_output:
+                    aliases += "<OutAliasTag/>"
+                connections_xml = (
+                    f"<Connections><RackConnection>{aliases}"
+                    f"</RackConnection></Connections>"
+                )
+            else:
+                joined = "".join(conn_parts)
+                connections_xml = f'<Connections>{joined}</Connections>' if joined else '<Connections/>'
             # <ConfigTag> — the module's config assembly image, emitted as the first
             # child of <Communications> (before <Connections>). The content is the
             # module's controller :C tag <Data> blocks (captured verbatim); a module
@@ -3429,6 +3456,8 @@ class ModuleBuilder(L5xElementBuilder):
         config_size = None
         input_inner = None
         output_inner = None
+        rack_has_input = False
+        rack_has_output = False
         entry = self._io_map.get((self._object_id, None))
         if entry is None:
             parent_oid = self._modid_to_oid.get(parent_modid)
@@ -3440,6 +3469,8 @@ class ModuleBuilder(L5xElementBuilder):
                 config_inner, config_size = cfg
             input_inner = entry.get("I")
             output_inner = entry.get("O")
+            rack_has_input = bool(entry.get("has_I"))
+            rack_has_output = bool(entry.get("has_O"))
 
         # <ConfigData>/<ConfigScript>: a module with a config image but NO controller
         # :C tag (mutually exclusive with ConfigTag) carries the image as a raw
@@ -3581,6 +3612,8 @@ class ModuleBuilder(L5xElementBuilder):
             _config_size=config_size,
             _input_inner=input_inner,
             _output_inner=output_inner,
+            _rack_has_input=rack_has_input,
+            _rack_has_output=rack_has_output,
             _config_data=configdata,
             _config_script=configscript,
         )
@@ -6175,6 +6208,20 @@ class ControllerBuilder(L5xElementBuilder):
         # reference parsed from the tag's stored name so the owning module can look it
         # up; see ModuleBuilder for the key shape and per-IO-type value.
         io_data_map: Dict[tuple, dict] = {}
+        # Which (owner oid, slot) carry an :I / :O module tag, independent of whether
+        # that tag has a design-value image. A rack input card's :I tag has none, so
+        # the value-keyed capture below would miss it; this presence flag lets a
+        # rack module decide its InAliasTag / OutAliasTag without a value image.
+        self._cur.execute(
+            "SELECT comp_name FROM comps WHERE comp_name LIKE '&%:I' "
+            "OR comp_name LIKE '&%:O'"
+        )
+        for (_cn,) in self._cur.fetchall():
+            _pm = re.match(r"^&([0-9a-fA-F]+)(?::(\d+))?:([IO])$", _cn)
+            if _pm:
+                _k = (int(_pm.group(1), 16),
+                      int(_pm.group(2)) if _pm.group(2) is not None else None)
+                io_data_map.setdefault(_k, {})["has_" + _pm.group(3)] = True
         # Force-image holders: RxDataCollection children carry an I/O tag's installed
         # force image as a length-prefixed blob at record offset 410 (u32 length at
         # 406), keyed by object id. A forced I/O tag points at its holder via the
