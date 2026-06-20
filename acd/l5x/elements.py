@@ -966,6 +966,23 @@ _CONN_GENERIC_VENDOR = 1
 # discrete <Connection>.
 _RACK_COMM_METHOD = "1073741824"
 
+# A connection <InputTag> reuses its backing controller tag's rendered inner, but
+# with the raw value block (Format="L5K" or a format-less raw-hex <Data>) and any
+# <AlarmConditions> removed -- the reference keeps only Description / Comments /
+# EngineeringUnits / Maxes / Mins / ForceData / <Data Format="Decorated"> there.
+# An <OutputTag> keeps the backing inner verbatim. (Validated byte- and order-
+# identical pool-wide.)
+_RAW_DATA_BLOCK_RE = re.compile(
+    r'<Data\b(?![^>]*Format="(?:Decorated|String)")[^>]*>.*?</Data>', re.S)
+_ALARM_BLOCK_RE = re.compile(r'<AlarmConditions\b.*?</AlarmConditions>', re.S)
+
+
+def _strip_input_tag_inner(inner: str) -> str:
+    """Transform a backing tag's rendered inner into an <InputTag>'s inner."""
+    inner = _ALARM_BLOCK_RE.sub("", inner)
+    inner = _RAW_DATA_BLOCK_RE.sub("", inner)
+    return inner
+
 
 def _build_connection_map(cur, short_header: bool) -> Dict[int, dict]:
     """Map a module connection record's object_id -> decoded connection values.
@@ -1664,6 +1681,9 @@ class Module(L5xElement):
     # that tag type (an unambiguous mapping; see to_xml).
     _input_inner: Union[str, None] = field(default=None)
     _output_inner: Union[str, None] = field(default=None)
+    # The module's status (:S) tag inner, used by a Status/MotionDiagnostics
+    # connection's <InputTag> (the others use _input_inner / the :I tag).
+    _status_inner: Union[str, None] = field(default=None)
     # Whether the module owns an :I / :O tag (a rack card's input :I tag carries no
     # design-value image, so _input_inner can be None even when the card has input);
     # used to decide a <RackConnection>'s InAliasTag / OutAliasTag presence.
@@ -1725,29 +1745,28 @@ class Module(L5xElement):
                 # no per-operand comments, emit a self-closing stub.
                 return f'<{tag} ExternalAccess="Read/Write"{opc}/>'
 
-            # Count connections carrying each tag type to gate the single-connection
-            # populate (see _io_tag above).
-            n_input = sum(1 for c in self._connections if not c["stub_output"])
-            n_output = sum(1 for c in self._connections if c.get("has_output", True))
-
             conn_parts: List[str] = []
             for c in self._connections:
                 safe_name = html.escape(c["name"], quote=True)
                 # A motion sync/async/event connection carries no I/O assembly:
-                # emit a bare <Connection> with no InputTag/OutputTag. Otherwise
-                # InputTag follows the name heuristic and is present only when the
-                # connection carries input data (InputSize > 0); OutputTag is
-                # suppressed when the connection decoded with no output data
-                # (OutputSize 0). Connections that did not decode keep the prior
-                # always-emit behaviour (has_input/is_motion default True/False).
+                # emit a bare <Connection> with no InputTag/OutputTag. Otherwise an
+                # InputTag is present when the connection carries input data
+                # (InputSize > 0) and an OutputTag when it carries output data. Each
+                # reuses the module's backing tag content: the InputTag uses the :I
+                # tag (or the status :S tag for a Status/MotionDiagnostics
+                # connection), the OutputTag uses the :O tag. Connections that did
+                # not decode keep the prior always-emit behaviour (has_input/
+                # has_output/is_motion default True/False).
                 tag_stubs = ""
                 if not c.get("is_motion", False):
-                    if not c["stub_output"] and c.get("has_input", True):
-                        inner = self._input_inner if n_input == 1 else None
+                    if c.get("has_input", True):
+                        cn = c["name"]
+                        inner = (self._status_inner
+                                 if ("Status" in cn or "MotionDiagnostics" in cn)
+                                 else self._input_inner)
                         tag_stubs += _io_tag("InputTag", inner)
                     if c.get("has_output", True):
-                        inner = self._output_inner if n_output == 1 else None
-                        tag_stubs += _io_tag("OutputTag", inner)
+                        tag_stubs += _io_tag("OutputTag", self._output_inner)
                 # Connection point / size attributes, present only when OEM emits
                 # them (a generic/drive Output connection, or a data-driven one).
                 extra = "".join(
@@ -3456,6 +3475,7 @@ class ModuleBuilder(L5xElementBuilder):
         config_size = None
         input_inner = None
         output_inner = None
+        status_inner = None
         rack_has_input = False
         rack_has_output = False
         entry = self._io_map.get((self._object_id, None))
@@ -3469,6 +3489,7 @@ class ModuleBuilder(L5xElementBuilder):
                 config_inner, config_size = cfg
             input_inner = entry.get("I")
             output_inner = entry.get("O")
+            status_inner = entry.get("S")
             rack_has_input = bool(entry.get("has_I"))
             rack_has_output = bool(entry.get("has_O"))
 
@@ -3612,6 +3633,7 @@ class ModuleBuilder(L5xElementBuilder):
             _config_size=config_size,
             _input_inner=input_inner,
             _output_inner=output_inner,
+            _status_inner=status_inner,
             _rack_has_input=rack_has_input,
             _rack_has_output=rack_has_output,
             _config_data=configdata,
@@ -6319,10 +6341,11 @@ class ControllerBuilder(L5xElementBuilder):
                 # (:C), input (:I) and output (:O) controller tags. The stored name is
                 # &<hex>:<slot>:X (slotted card) or &<hex>:X (Ethernet device); the hex
                 # is the comps object_id the owning module resolves against. The tag's
-                # rendered <Data> IS the module's ConfigTag/OutputTag content (binary +
-                # Decorated); the InputTag carries the Decorated block only.
+                # rendered inner IS a connection's ConfigTag/OutputTag/InputTag content:
+                # an OutputTag keeps the inner verbatim; an InputTag (and the status :S
+                # tag) keeps it minus the raw value block and any <AlarmConditions>.
                 if tag._io and tag._value_bytes:
-                    cm = re.match(r"^&([0-9a-fA-F]+)(?::(\d+))?:([CIO])$", result[0])
+                    cm = re.match(r"^&([0-9a-fA-F]+)(?::(\d+))?:([CIOS])$", result[0])
                     if cm:
                         ref_oid = int(cm.group(1), 16)
                         ref_slot = int(cm.group(2)) if cm.group(2) is not None else None
@@ -6339,16 +6362,8 @@ class ControllerBuilder(L5xElementBuilder):
                             slot_entry["C"] = (inner, size)
                         elif io_type == "O" and inner:
                             slot_entry["O"] = inner
-                        elif io_type == "I":
-                            # InputTag is the Decorated block only (no binary image),
-                            # preceded by <ForceData> when the tag carries forces.
-                            di = inner.find('<Data Format="Decorated">')
-                            if di >= 0:
-                                end = inner.find("</Data>", di)
-                                if end >= 0:
-                                    fblock = (f'<ForceData>{tag._force_data}</ForceData>'
-                                              if tag._force_data else '')
-                                    slot_entry["I"] = fblock + inner[di:end + len("</Data>")]
+                        elif io_type in ("I", "S") and inner:
+                            slot_entry[io_type] = _strip_input_tag_inner(inner)
 
         # Get the Program Collection and get the programs
         self._cur.execute(
