@@ -6,6 +6,60 @@ from typing import Optional
 
 from acd.database.dbextract import DatRecord
 from acd.generated.comments.fafa_coments import FafaComents
+from acd.record.comps import (
+    _SP_KEYS, _SP_KEY_HINT, _SP_MARKER, _sp_aes, _sp_cbc,
+)
+
+
+def _decrypt_sp_comment_text(raw_full: bytes) -> Optional[str]:
+    """Recover the plaintext text of a source-protected comment record, or None.
+
+    A source-protected project AES-256-CBC encrypts the comment record's text
+    tail with the SAME project key used for the comps ext-attr tails (the marker
+    ``aa 96 aa 0a`` then the ciphertext at marker+18, IV = 16 zero bytes). The
+    decrypted body mirrors the plaintext AsciiRecord body --
+    ``[member_ref u32][rung_content u32][object_id u32][UTF-8 text][NUL][PKCS7]``
+    -- so the text begins 12 bytes in. The record's lookup keys (record_type,
+    parent, member_ref) are already correct in the parsed record (they live in the
+    plaintext header, which the kaitai parser reads); only the text tail is
+    encrypted, so the caller keeps its parsed keys and swaps in this text.
+
+    The project config is shared with the comps decryptor, so the cached
+    ``_SP_KEY_HINT`` config is tried first; a candidate is accepted when its
+    plaintext ends in valid PKCS7 padding and the text region is valid UTF-8.
+    """
+    mi = raw_full.find(_SP_MARKER)
+    if mi < 0:
+        return None
+    ct = raw_full[mi + 18:]
+    nblocks = len(ct) // 16
+    if nblocks < 1:
+        return None
+    order = list(_SP_KEYS)
+    hint = _SP_KEY_HINT[0]
+    if hint is not None:
+        order.sort(key=lambda kv: 0 if kv[0] == hint else 1)
+    for config, key in order:
+        aes = _sp_aes(config, key)
+        pt = _sp_cbc(ct, aes, nblocks)
+        if len(pt) < 13:
+            continue
+        pad = pt[-1]
+        if not (1 <= pad <= 16) or pt[-pad:] != bytes([pad]) * pad:
+            continue
+        body = pt[12:-pad]
+        seg = body.split(b"\x00", 1)[0]
+        try:
+            text = seg.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        # A correct key yields a printable description; reject random plaintext
+        # from a wrong key (it would fail UTF-8 above, but also guard short noise).
+        if not text or sum(c.isprintable() or c in "\r\n\t" for c in text) < len(text) * 0.8:
+            continue
+        _SP_KEY_HINT[0] = config
+        return text
+    return None
 
 
 @dataclass
@@ -271,6 +325,25 @@ class CommentsRecord:
 
     @staticmethod
     def parse(dat_record: DatRecord, short_header: bool = False) -> Optional[tuple]:
+        result = CommentsRecord._parse_core(dat_record, short_header)
+        if result is None:
+            return None
+        # Source-protected records carry the comment text AES-encrypted after the
+        # comps marker; the parsers above recover the lookup keys (from the
+        # plaintext header) but a garbage text. Swap in the decrypted text when the
+        # marker is present so the recovered keys map to the real Description.
+        try:
+            raw_full = bytes(dat_record.record.record_buffer)
+            if _SP_MARKER in raw_full:
+                text = _decrypt_sp_comment_text(raw_full)
+                if text is not None:
+                    result = result[:3] + (text,) + result[4:]
+        except Exception:
+            pass
+        return result
+
+    @staticmethod
+    def _parse_core(dat_record: DatRecord, short_header: bool = False) -> Optional[tuple]:
         if dat_record.identifier != 64250:
             return None
         raw_full = bytes(dat_record.record.record_buffer)
