@@ -4012,6 +4012,7 @@ class TagBuilder(L5xElementBuilder):
             # decodable; anything else (module image, UDT, ...) -> bail.
             base_elem_bits = None
             base_is_array = False
+            bdname = None
             try:
                 br = RxGeneric.from_bytes(bytes(row[1]))
                 if br.main_record.data_type:
@@ -4025,10 +4026,20 @@ class TagBuilder(L5xElementBuilder):
                     base_is_array = bool(getattr(br.main_record, "dimension_1", 0))
             except Exception:
                 base_elem_bits = None
-            if base_elem_bits is None:
-                return None
 
             bit_off = struct.unpack_from("<I", raw_rec, 0x26)[0]
+
+            # Whole-tag alias: the alias mirrors the entire base scalar tag -- its
+            # datatype equals the base's and it points at the base's start -- so the
+            # target is the bare base symbol with no subscript or member (e.g. a
+            # motion axis/group alias onto another axis/group). This holds for any
+            # base type, so resolve it before the atomic-only element-width path.
+            if (alias_dt_name and bdname and alias_dt_name == bdname
+                    and bit_off == 0 and not base_is_array):
+                return base
+
+            if base_elem_bits is None:
+                return None
 
             if alias_dt_name in ("BOOL", "BIT"):
                 idx = bit_off // base_elem_bits
