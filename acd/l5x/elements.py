@@ -3559,6 +3559,9 @@ class TagBuilder(L5xElementBuilder):
     # <Data> block style: V<=24 (and short-header V10-V21) write a raw-hex
     # <Data>XX XX..</Data> image, V28+ write <Data Format="L5K">.
     _acd_major: int = field(default=0)
+    # Owning program's comment_id (short-header program-tag description key); 0
+    # for controller-scope tags.
+    _program_cid: int = field(default=0)
 
     def _short_header_alias_for(self, raw_rec: bytes) -> Union[str, None]:
         """Decode a V10..V21 short-header alias target, or None if not an alias.
@@ -4219,6 +4222,31 @@ class TagBuilder(L5xElementBuilder):
                 )
                 desc_row = self._cur.fetchone()
                 if desc_row and desc_row[0] and not desc_row[1]:
+                    comment_results = [("", desc_row[0])]
+            except Exception:
+                comment_results = []
+        elif self._program_cid and r.cip_type != 0x6B and len(raw_rec) >= 18:
+            # V10-V21 PROGRAM-scoped tag own description. cip-0x68 program tags
+            # share a comment_id, so the bare-cid lookup collides; instead key off
+            # the tag record's bytes[14:18] = (selector << 16 | member_ref): the
+            # description is at parent = (selector << 16) | the program's
+            # comment_id, that member_ref, record_type 1, and sub_record_length ==
+            # 0x68 (the program-tag cip, which drops a colliding row owned by a
+            # different comp). Folding the selector into the parent high-word
+            # disambiguates instruction-backing tags (ADD_*/SSUM_*/DIV_*) that the
+            # bare member_ref alone could not -- the collision that blocked this
+            # bucket before. Wrapped to degrade to no description on any failure.
+            try:
+                _b14 = struct.unpack_from("<I", raw_rec, 14)[0]
+                _parent = ((_b14 & 0xFFFF) << 16) | self._program_cid
+                self._cur.execute(
+                    "SELECT record_string FROM comments "
+                    "WHERE record_type=1 AND parent=? AND member_ref=? "
+                    "AND sub_record_length=0x68 AND record_string!='' LIMIT 1",
+                    (_parent, _b14 >> 16),
+                )
+                desc_row = self._cur.fetchone()
+                if desc_row and desc_row[0]:
                     comment_results = [("", desc_row[0])]
             except Exception:
                 comment_results = []
@@ -5598,9 +5626,13 @@ class ProgramBuilder(L5xElementBuilder):
                 "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
                 + str(results[0][1])
             )
+            _prog_cid = (
+                struct.unpack_from("<H", prog_record, 12)[0]
+                if self._short_header and len(prog_record) >= 14 else 0
+            )
             for result in self._cur.fetchall():
                 tag = TagBuilder(self._cur, result[1], _short_header=self._short_header,
-                                 _acd_major=self._acd_major).build()
+                                 _acd_major=self._acd_major, _program_cid=_prog_cid).build()
                 tag._data_types_map = self._data_types_map
                 tag._taginfo_layout = self._taginfo_layout
                 tag._alarm_xml = self._alarm_map.get(result[1], "")
