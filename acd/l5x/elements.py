@@ -6842,6 +6842,33 @@ class ControllerBuilder(L5xElementBuilder):
                             if mk >= 0 and len(raw_mr) - (mk + 4) >= 0x30:
                                 e1o = raw_mr[mk + 4:]
                                 modid_to_oid[struct.unpack("<I", e1o[0x2C:0x30])[0]] = mod_oid
+                            else:
+                                # Long-header module whose truncated record omits the
+                                # 0x001 identity: recover the modid from comps_full so
+                                # the adapter is mapped and its child cards resolve
+                                # their :C ConfigTag (e.g. VendorD point_IO_adapter / Local,
+                                # whose own modid is the comment_id). Collision-safe:
+                                # never overwrite a modid already mapped from a
+                                # normally-parsed record.
+                                _cf = self._cur.execute(
+                                    "SELECT record FROM comps_full WHERE object_id=?",
+                                    (mod_oid,),
+                                ).fetchone()
+                                if _cf and _cf[0]:
+                                    _full = bytes(_cf[0])
+                                    _bo = CompsRecord.body_offset(self._short_header)
+                                    if (len(_full) >= _bo + 14 and struct.unpack_from(
+                                            "<H", _full, _bo + 10)[0] == 0x69):
+                                        _e1 = CompsRecord.read_value_attrs(
+                                            _full, self._short_header, full=True
+                                        ).get(0x001, b"")
+                                        if len(_e1) >= 0x30:
+                                            _cid = struct.unpack_from("<H", _full, _bo + 12)[0]
+                                            _modid = struct.unpack(
+                                                "<I", _e1[0x2C:0x30])[0] or _cid
+                                            if _modid and _modid not in modid_to_oid:
+                                                modid_to_name[_modid] = display_name
+                                                modid_to_oid[_modid] = mod_oid
                 except Exception:
                     pass
 
