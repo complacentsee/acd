@@ -1310,6 +1310,12 @@ class Tag(L5xElement):
             _dtb = self.data_type.split("[")[0].upper() if self.data_type else ""
             if self.radix is not None and _dtb and _dtb not in _ATOMIC_TAG_TYPES:
                 self.radix = None
+            # "NullType" is the no-radix sentinel (motion/axis and other non-
+            # displayable types); the reference never writes Radix="NullType" on a
+            # <Tag> element, so drop it. This also covers alias tags onto such types,
+            # whose empty data_type slips past the type-based suppression above.
+            if self.radix == "NullType":
+                self.radix = None
             base = self._inject_tag_attrs(super().to_xml())
 
         # --- Comments child element (operand-keyed member/bit/array comments) ---
