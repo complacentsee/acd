@@ -2483,9 +2483,6 @@ class DataTypeBuilder(L5xElementBuilder):
     # short-header ControllerBuilder path; defaults False -> identical V24+
     # behaviour.
     _short_header: bool = field(default=False)
-    # File-wide {comment_id: #comps records carrying it}; used by the short-header
-    # own-description uniqueness gate. Empty on long header.
-    _cid_counts: Dict[int, int] = field(default_factory=dict)
 
     def build(self) -> DataType:
         self._cur.execute(
@@ -2765,20 +2762,20 @@ class DataTypeBuilder(L5xElementBuilder):
             # V10-V21: the datatype's own description is keyed by its bare
             # comment_id (member_ref 0, record_type 1/2) -- the same scheme as
             # short-header tags. That bare key collides with cip-0x68 tags that
-            # share the comment_id (e.g. a datatype stamped with an unrelated tag's
-            # description), so emit only when this comment_id is unique across all
-            # comps records (the file-wide _cid_counts map): a shared comment_id is
-            # ambiguous and dropped rather than fabricated.
-            if self._cid_counts.get(r.comment_id, 0) == 1:
-                self._cur.execute(
-                    "SELECT record_string FROM comments "
-                    "WHERE parent=? AND member_ref=0 AND record_type IN (1,2) "
-                    "AND record_string!='' LIMIT 1",
-                    (r.comment_id,),
-                )
-                desc_row = self._cur.fetchone()
-                if desc_row and desc_row[0]:
-                    description = desc_row[0]
+            # share the comment_id, but the short-header own-description record
+            # stores its OWNER's cip_type in the sub_record_length column, so
+            # filtering on sub_record_length == this datatype's cip_type (a
+            # datatype is 0x6c; the colliding tag is 0x68) selects the right row
+            # unambiguously -- no uniqueness gate needed.
+            self._cur.execute(
+                "SELECT record_string FROM comments "
+                "WHERE parent=? AND member_ref=0 AND record_type IN (1,2) "
+                "AND sub_record_length=? AND record_string!='' LIMIT 1",
+                (r.comment_id, r.cip_type),
+            )
+            desc_row = self._cur.fetchone()
+            if desc_row and desc_row[0]:
+                description = desc_row[0]
         else:
             self._cur.execute(
                 "SELECT record_string FROM comments "
@@ -3223,11 +3220,23 @@ class ModuleBuilder(L5xElementBuilder):
         # object_id are scratch values (e.g. export timestamps) whose record_string
         # would otherwise leak in as a fabricated Description, so require object_id == 1.
         description = ""
-        self._cur.execute(
-            "SELECT record_string FROM comments "
-            "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
-            ((r.comment_id * 0x10000) + r.cip_type,),
-        )
+        if self._short_header:
+            # V10-V21: own description keyed by the bare comment_id; the
+            # short-header own-description record stores the owner's cip_type in
+            # sub_record_length, so filter on it (a module is 0x69) to skip a
+            # cip-0x68 tag that shares this comment_id.
+            self._cur.execute(
+                "SELECT record_string FROM comments "
+                "WHERE parent=? AND member_ref=0 AND record_type IN (1,2) "
+                "AND sub_record_length=? AND record_string!='' LIMIT 1",
+                (r.comment_id, r.cip_type),
+            )
+        else:
+            self._cur.execute(
+                "SELECT record_string FROM comments "
+                "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
+                ((r.comment_id * 0x10000) + r.cip_type,),
+            )
         desc_row = self._cur.fetchone()
         if desc_row:
             description = desc_row[0] or ""
@@ -5233,15 +5242,28 @@ class AoiBuilder(L5xElementBuilder):
         revision_note = ""
         if _r_aoi is not None:
             aoi_comment_parent = (_r_aoi.comment_id * 0x10000) + _r_aoi.cip_type
-            # The AOI's own description carries object_id == 1; the extended-help
-            # text rows under the same key carry a nonzero object_id (with a
-            # non-empty tag_reference such as UDI_EXT_HELP) and are not emitted by
-            # OEM as a Description, so require object_id == 1 to exclude them.
-            self._cur.execute(
-                "SELECT record_string FROM comments "
-                "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
-                (aoi_comment_parent,),
-            )
+            if self._short_header:
+                # V10-V21: own description keyed by the bare comment_id; the
+                # short-header own-description record stores the owner's cip_type
+                # in sub_record_length, so filter on it to skip the cip-0x68 tag
+                # that may share this comment_id (the AOI's own cip is 0x338).
+                self._cur.execute(
+                    "SELECT record_string FROM comments "
+                    "WHERE parent=? AND member_ref=0 AND record_type IN (1,2) "
+                    "AND sub_record_length=? AND record_string!='' LIMIT 1",
+                    (_r_aoi.comment_id, _r_aoi.cip_type),
+                )
+            else:
+                # The AOI's own description carries object_id == 1; the
+                # extended-help text rows under the same key carry a nonzero
+                # object_id (with a non-empty tag_reference such as UDI_EXT_HELP)
+                # and are not emitted by OEM as a Description, so require
+                # object_id == 1 to exclude them.
+                self._cur.execute(
+                    "SELECT record_string FROM comments "
+                    "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
+                    (aoi_comment_parent,),
+                )
             desc_row = self._cur.fetchone()
             if desc_row and desc_row[0]:
                 aoi_description = desc_row[0]
@@ -5756,11 +5778,15 @@ class ControllerBuilder(L5xElementBuilder):
             _crec = bytes(results[0][4])
             if len(_crec) >= 14:
                 _ccid = struct.unpack_from("<H", _crec, 12)[0]
+                _ccip = struct.unpack_from("<H", _crec, 10)[0]
+                # The short-header own-description record stores the owner cip_type
+                # in sub_record_length; filter on it to skip a cip-0x68 tag that
+                # shares the controller's comment_id.
                 self._cur.execute(
                     "SELECT record_string FROM comments "
                     "WHERE parent=? AND member_ref=0 AND record_type IN (1,2) "
-                    "AND record_string!='' LIMIT 1",
-                    (_ccid,),
+                    "AND sub_record_length=? AND record_string!='' LIMIT 1",
+                    (_ccid, _ccip),
                 )
                 _drow = self._cur.fetchone()
                 if _drow and _drow[0]:
@@ -5900,20 +5926,6 @@ class ControllerBuilder(L5xElementBuilder):
             )
             aoi_names = {row[0] for row in self._cur.fetchall()}
 
-        # Short-header datatype own-description uniqueness gate: count comment_id
-        # occurrences across ALL comps records (comment_id is the u16 at record
-        # offset 12 in every header family, readable even on source-protected
-        # records whose ext-attr tail is encrypted) so DataTypeBuilder can drop a
-        # datatype whose bare-comment_id key collides with a tag that shares it.
-        cid_counts: Dict[int, int] = {}
-        if self._short_header:
-            self._cur.execute("SELECT record FROM comps")
-            for (_crec,) in self._cur.fetchall():
-                _crec = bytes(_crec)
-                if len(_crec) >= 14:
-                    _c = struct.unpack_from("<H", _crec, 12)[0]
-                    cid_counts[_c] = cid_counts.get(_c, 0) + 1
-
         data_types: List[DataType] = []
         # all_data_types_map includes ProductDefined types (excluded from L5X output but
         # needed for generating Decorated XML for tags that reference those types).
@@ -5921,8 +5933,7 @@ class ControllerBuilder(L5xElementBuilder):
         for result in results:
             _data_type_object_id = result[1]
             dt = DataTypeBuilder(
-                self._cur, _data_type_object_id, _short_header=self._short_header,
-                _cid_counts=cid_counts,
+                self._cur, _data_type_object_id, _short_header=self._short_header
             ).build()
             all_data_types_map[dt.name.upper()] = dt
             if self._short_header:
