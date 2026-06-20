@@ -2075,6 +2075,7 @@ class AOI(L5xElement):
 @dataclass
 class Program(L5xElement):
     name: str
+    cls: Union[str, None]  # "Safety"/"Standard" on safety controllers; None omits @Class
     test_edits: str
     main_routine_name: Union[str, None]  # None if absent (omitted from XML)
     fault_routine_name: Union[str, None]  # None if absent (omitted from XML)
@@ -2117,6 +2118,7 @@ class EventInfo(L5xElement):
 @dataclass
 class Task(L5xElement):
     name: str
+    cls: Union[str, None]  # "Safety"/"Standard" on safety controllers; None omits @Class
     type: str
     rate: Union[str, None]  # None for CONTINUOUS tasks (omitted from XML)
     priority: str
@@ -6300,9 +6302,23 @@ class ProgramBuilder(L5xElementBuilder):
             if _prow and _prow[0]:
                 program_description = _prow[0]
 
-        return Program(name, name, "false", main_routine_name, fault_routine_name,
-                       disabled, sync_redundancy, use_as_folder, tags, routines,
-                       _description=program_description)
+        # Class: a safety controller marks each program Safety/Standard with a byte
+        # at record offset 0x173 (short layout) / 0xE5 (long); standard controllers
+        # omit @Class.
+        prog_cls: Union[str, None] = None
+        if self._cur.execute(
+                "SELECT 1 FROM comps WHERE comp_name='SafetyController' "
+                "AND record_type=256 LIMIT 1").fetchone():
+            if len(prog_record) < 2000:
+                prog_cls = ("Safety" if (len(prog_record) > 0x173
+                            and prog_record[0x173] == 6) else "Standard")
+            else:
+                prog_cls = ("Safety" if (len(prog_record) > 0xE5
+                            and prog_record[0xE5] == 6) else "Standard")
+
+        return Program(name, name, prog_cls, "false", main_routine_name,
+                       fault_routine_name, disabled, sync_redundancy, use_as_folder,
+                       tags, routines, _description=program_description)
 
 
 _TASK_TYPE_MAP = {1: "EVENT", 2: "PERIODIC", 4: "CONTINUOUS"}
@@ -6371,6 +6387,16 @@ class TaskBuilder(L5xElementBuilder):
                 e01 = CompsRecord.read_ext_attrs_from_record(record).get(0x01, b"")
             except Exception:
                 e01 = b""
+
+        # Class: a safety controller marks each task Safety/Standard with a byte at
+        # ext[0x01] offset len-0x38 (6 = Safety); standard controllers omit @Class.
+        task_cls: Union[str, None] = None
+        if self._cur.execute(
+                "SELECT 1 FROM comps WHERE comp_name='SafetyController' "
+                "AND record_type=256 LIMIT 1").fetchone():
+            task_cls = ("Safety" if (len(e01) >= 0x38 and e01[len(e01) - 0x38] == 6)
+                        else "Standard")
+
         cfg = _read_task_config(e01)
         if cfg is not None:
             task_type = cfg["type"]
@@ -6431,6 +6457,7 @@ class TaskBuilder(L5xElementBuilder):
         return Task(
             name,
             name,
+            task_cls,
             task_type,
             rate_str,
             priority_str,
