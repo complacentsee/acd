@@ -5638,21 +5638,36 @@ class AoiBuilder(L5xElementBuilder):
             _r_aoi = r
             exts: Dict[int, bytes] = {e.attribute_id: bytes(e.value) for e in r.extended_records}
             e01 = exts.get(0x01, b"")
-            rev_major = struct.unpack_from("<H", e01, 0x1A)[0] if len(e01) > 0x1B else 1
-            rev_minor = struct.unpack_from("<H", e01, 0x1C)[0] if len(e01) > 0x1D else 0
         except Exception:
-            rev_major, rev_minor = 1, 0
             # Source-protected AOI: recover comment_id/cip_type from the plaintext
             # main record so the own-description lookup below still runs (the
-            # description text is decrypted in the comments table). The revision
-            # lives in the encrypted ext[0x01], so it keeps the 1.0 default. Decrypt
-            # the ext tail so the execute flags below are still recovered.
+            # description text is decrypted in the comments table), and decrypt the
+            # ext tail so the revision + execute flags below are still recovered.
             _r_aoi = _rxgeneric_plaintext_main(aoi_record)
             try:
                 e01 = CompsRecord.read_ext_attrs_from_record(aoi_record).get(0x01, b"")
             except Exception:
                 e01 = b""
-        revision = f"{rev_major}.{rev_minor}"
+
+        # --- Revision (major.minor) ---
+        # The major/minor u16 pair sits at a length-discriminated offset in ext[0x01]:
+        # 0x9C/0x9E on the long (>= 0x160 byte) blob, 0x1A/0x1C on the shorter blobs --
+        # the blob length, not the file's header family, selects the layout. The few
+        # AOIs with no ext[0x01] carry the revision inline at the second "20 24"
+        # marker. Never emit "0.0"; fall back to the 1.0 default.
+        rev_major = rev_minor = 0
+        if e01:
+            _moff, _noff = (0x9C, 0x9E) if len(e01) >= 0x160 else (0x1A, 0x1C)
+            if len(e01) > _noff + 1:
+                rev_major = struct.unpack_from("<H", e01, _moff)[0]
+                rev_minor = struct.unpack_from("<H", e01, _noff)[0]
+        else:
+            _offs = [i for i in range(len(aoi_record) - 1)
+                     if aoi_record[i] == 0x20 and aoi_record[i + 1] == 0x24]
+            if len(_offs) >= 2 and _offs[1] + 26 <= len(aoi_record):
+                rev_major = struct.unpack_from("<H", aoi_record, _offs[1] + 22)[0]
+                rev_minor = struct.unpack_from("<H", aoi_record, _offs[1] + 24)[0]
+        revision = f"{rev_major}.{rev_minor}" if (rev_major or rev_minor) else "1.0"
 
         # --- Execute flags from ext[0x01] byte 0x02 ---
         # bit 0 = ExecuteEnableInFalse, bit 4 = ExecutePrescan (both present in the
