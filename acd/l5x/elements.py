@@ -1903,6 +1903,7 @@ class Routine(L5xElement):
     rungs: List[str]
     _rung_ids: List[int] = field(default_factory=list)
     _rung_comments: Dict[int, str] = field(default_factory=dict)
+    _description: Union[str, None] = field(default=None)
 
     def to_xml(self) -> str:
         rll_content = ""
@@ -1924,7 +1925,15 @@ class Routine(L5xElement):
                 )
             if rung_xmls:
                 rll_content = f'<RLLContent>{"".join(rung_xmls)}</RLLContent>'
-        return f'<Routine Name="{html.escape(self.name, quote=True)}" Type="{self.type}">{rll_content}</Routine>'
+        # A routine's own Description is the first child, before RLLContent.
+        desc_xml = (
+            f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
+            if self._description else ""
+        )
+        return (
+            f'<Routine Name="{html.escape(self.name, quote=True)}" Type="{self.type}">'
+            f'{desc_xml}{rll_content}</Routine>'
+        )
 
 
 @dataclass
@@ -4627,6 +4636,8 @@ def routine_type_enum(idx: int) -> str:
 
 @dataclass
 class RoutineBuilder(L5xElementBuilder):
+    _short_header: bool = field(default=False)
+
     def build(self) -> Routine:
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
@@ -4751,7 +4762,40 @@ class RoutineBuilder(L5xElementBuilder):
         except Exception:
             pass
 
-        return Routine(name, name, routine_type, rungs, rung_ids, rung_comments)
+        # --- Routine own Description ---
+        # A routine's own description is stored in the comments table under the
+        # same own-description key scheme used for tags/datatypes. Long-header
+        # (V24+): parent == comment_id*0x10000 + cip_type, keyed by the member_ref
+        # at record[14:18]; the own description carries object_id==1 (scratch /
+        # operand rows that share the key carry a different object_id) and an empty
+        # tag_reference. Excluding nonzero rung_content avoids any rung-comment
+        # collision under a shared key. Short-header own-description recovery is not
+        # attempted here (its bare-comment_id key collides across routines of a
+        # program — the per-routine member_ref discriminator is not globally
+        # unique), so those routines keep no description rather than risk a wrong
+        # one. Wrapped so any failure degrades to no description.
+        description: Union[str, None] = None
+        if not self._short_header:
+            try:
+                parent_key = (r.comment_id * 0x10000) + r.cip_type
+                member_ref = (
+                    struct.unpack_from("<I", record, 14)[0]
+                    if len(record) >= 18 else 0
+                )
+                self._cur.execute(
+                    "SELECT record_string, tag_reference FROM comments "
+                    "WHERE parent=? AND member_ref=? AND object_id=1 "
+                    "AND (rung_content IS NULL OR rung_content=0) LIMIT 1",
+                    (parent_key, member_ref),
+                )
+                drow = self._cur.fetchone()
+                if drow and drow[0] and not drow[1]:
+                    description = drow[0]
+            except Exception:
+                description = None
+
+        return Routine(name, name, routine_type, rungs, rung_ids, rung_comments,
+                       description)
 
 
 def _parse_fffeff(data: bytes, offset: int):
@@ -5077,7 +5121,9 @@ class AoiBuilder(L5xElementBuilder):
             )
             for (child_oid,) in self._cur.fetchall():
                 try:
-                    routines.append(RoutineBuilder(self._cur, child_oid).build())
+                    routines.append(RoutineBuilder(
+                        self._cur, child_oid,
+                        _short_header=self._short_header).build())
                 except Exception:
                     pass
 
@@ -5376,7 +5422,8 @@ class ProgramBuilder(L5xElementBuilder):
 
         routines = []
         for child in routine_results:
-            routines.append(RoutineBuilder(self._cur, child[1]).build())
+            routines.append(RoutineBuilder(
+                self._cur, child[1], _short_header=self._short_header).build())
 
         # Get the Program Scoped Tags
         self._cur.execute(
