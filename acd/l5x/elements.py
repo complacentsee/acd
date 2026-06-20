@@ -1696,6 +1696,8 @@ class Module(L5xElement):
     # used to decide a <RackConnection>'s InAliasTag / OutAliasTag presence.
     _rack_has_input: bool = field(default=False)
     _rack_has_output: bool = field(default=False)
+    # True when the module owns a safety connection -> emit SafetyEnabled="true".
+    _safety_enabled: bool = field(default=False)
     # <ConfigData>/<ConfigScript> for a module with a config image but no controller
     # :C tag (mutually exclusive with the ConfigTag above). Each is (hex_data, size)
     # or None. The raw <Data> is masked by the comparator; the size attribute is the
@@ -1710,6 +1712,9 @@ class Module(L5xElement):
     def to_xml(self) -> str:
         # Hash-named drive peripherals have no Name attribute in Logix-exported L5X.
         name_attr = "" if self.name == "?" else f'Name="{self.name}" '
+        # The reference writes SafetyEnabled="true" on a safety module (one that
+        # owns a safety connection); it omits the attribute on non-safety modules.
+        safety_attr = ' SafetyEnabled="true"' if self._safety_enabled else ''
         attrs = (
             f'{name_attr}'
             f'CatalogNumber="{self.catalog_number}" '
@@ -1722,6 +1727,7 @@ class Module(L5xElement):
             f'ParentModPortId="{self.parent_mod_port_id}" '
             f'Inhibited="{self.inhibited}" '
             f'MajorFault="{self.major_fault}"'
+            f'{safety_attr}'
         )
 
         # Optional <Description>
@@ -3698,6 +3704,17 @@ class ModuleBuilder(L5xElementBuilder):
         if not is_root:
             ports_override = self._ports_from_data_collection(data_link)
 
+        # SafetyEnabled="true" iff the module owns a safety connection (a
+        # SafetyInput/SafetyOutput/*Safety* connection record under its
+        # RxMapConnectionCollection). Non-safety modules omit the attribute.
+        self._cur.execute(
+            "SELECT 1 FROM comps coll JOIN comps o ON o.parent_id = coll.object_id "
+            "WHERE coll.parent_id = ? AND coll.comp_name = 'RxMapConnectionCollection' "
+            "AND o.comp_name LIKE '%Safety%' LIMIT 1",
+            (self._object_id,),
+        )
+        safety_enabled = self._cur.fetchone() is not None
+
         return Module(
             name,           # L5xElement._name (private)
             name,           # Module.name
@@ -3730,6 +3747,7 @@ class ModuleBuilder(L5xElementBuilder):
             _status_inner=status_inner,
             _rack_has_input=rack_has_input,
             _rack_has_output=rack_has_output,
+            _safety_enabled=safety_enabled,
             _config_data=configdata,
             _config_script=configscript,
         )
