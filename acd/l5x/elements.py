@@ -233,9 +233,10 @@ _ATOMIC_TAG_TYPES: frozenset = frozenset({
 # types whose width is known appear here. A base whose element type is absent
 # (e.g. a module connection image) is left undecoded (no AliasFor emitted).
 _ALIAS_ELEM_BITS: Dict[str, int] = {
-    "BOOL": 1, "BIT": 1, "SINT": 8, "USINT": 8,
-    "INT": 16, "UINT": 16, "DINT": 32, "UDINT": 32, "REAL": 32,
-    "LINT": 64, "ULINT": 64, "LREAL": 64,
+    "BOOL": 1, "BIT": 1, "SINT": 8, "USINT": 8, "BYTE": 8,
+    "INT": 16, "UINT": 16, "WORD": 16,
+    "DINT": 32, "UDINT": 32, "DWORD": 32, "REAL": 32,
+    "LINT": 64, "ULINT": 64, "LWORD": 64, "LREAL": 64,
     "TIMER": 96, "COUNTER": 96, "CONTROL": 96,
 }
 
@@ -3872,6 +3873,209 @@ class TagBuilder(L5xElementBuilder):
         except Exception:
             return False
 
+    def _alias_elem_width(self, dtname: "Union[str, None]") -> "Union[int, None]":
+        """Bit width of an alias base/member element type, or None if unknown.
+
+        Atomic/legacy-struct types come from the static table; a user/module
+        datatype's width is its TagInfo @size@ (bytes) * 8.
+        """
+        if dtname is None:
+            return None
+        u = dtname.upper()
+        if u in _ALIAS_ELEM_BITS:
+            return _ALIAS_ELEM_BITS[u]
+        sz = self._taginfo_layout.get("@size@" + u)
+        return sz * 8 if sz else None
+
+    def _alias_walk_members(self, dtname: str, target_bit: int,
+                            alias_is_bool: bool, prefix: str = ""
+                            ) -> "Union[str, None]":
+        """Return the member-path string locating target_bit inside dtname, or
+        None. Walks the TagInfo member layout: a BOOL alias first matches an
+        explicit named bit-member at the exact bit (so AxisStatus.1 wins over a
+        wider word at the same offset), then the containing member (array element,
+        atomic word + .bit for a BOOL, whole member for an element-aligned
+        non-BOOL, or recursion into a nested struct).
+        """
+        mem = self._taginfo_layout.get((dtname or "").upper())
+        if mem is None:
+            return None
+        if alias_is_bool:
+            for (mname, mdt, off, bit, hidden, dims) in mem:
+                if dims:
+                    continue
+                if (bit is not None and (off * 8 + bit) == target_bit
+                        and mdt.upper() in ("BOOL", "BIT")):
+                    return prefix + mname
+        for (mname, mdt, off, bit, hidden, dims) in mem:
+            mbits = self._alias_elem_width(mdt)
+            base_bit = off * 8 + (bit or 0)
+            if dims:
+                if mbits is None:
+                    continue
+                total = mbits * (dims[0] if dims else 1)
+                if base_bit <= target_bit < base_bit + total:
+                    rel = target_bit - base_bit
+                    idx = rel // mbits
+                    inner = rel % mbits
+                    seg = "%s%s[%d]" % (prefix, mname, idx)
+                    if (alias_is_bool and inner != 0) or (
+                            mdt.upper() in _ALIAS_ELEM_BITS
+                            and _ALIAS_ELEM_BITS.get(mdt.upper(), 0) > 1
+                            and alias_is_bool):
+                        return seg + ".%d" % inner
+                    if alias_is_bool and mdt.upper() in ("BOOL", "BIT"):
+                        return seg
+                    if not alias_is_bool and inner == 0:
+                        return seg
+                    if mdt.upper() not in _ALIAS_ELEM_BITS:
+                        sub = self._alias_walk_members(mdt, inner, alias_is_bool, "")
+                        if sub is not None:
+                            return seg + "." + sub
+                    if alias_is_bool:
+                        return seg + ".%d" % inner
+                    return None
+            else:
+                if mbits is None:
+                    continue
+                if bit is not None:
+                    if base_bit == target_bit and alias_is_bool:
+                        return prefix + mname
+                    continue
+                if base_bit <= target_bit < base_bit + mbits:
+                    if mdt.upper() in _ALIAS_ELEM_BITS:
+                        inner = target_bit - base_bit
+                        if alias_is_bool:
+                            return (prefix + mname) if inner == 0 and mbits == 1 \
+                                else (prefix + mname + ".%d" % inner)
+                        if inner == 0:
+                            return prefix + mname
+                        return None
+                    sub = self._alias_walk_members(
+                        mdt, target_bit - base_bit, alias_is_bool, "")
+                    if sub is not None:
+                        return prefix + mname + "." + sub
+                    return None
+        return None
+
+    def _layout_alias_for(self, raw_rec: bytes) -> "Union[str, None]":
+        """Layout-driven @AliasFor for a long-header alias tag, byte-exact.
+
+        Generalises the module-I/O and internal resolvers below: the bit offset
+        at raw_rec[0x26] is mapped to a member PATH inside the base symbol by
+        walking the base datatype's TagInfo member layout. Covers module-I/O
+        channel members (Local:2:I.Ch0Data), internal UDT members
+        (SomeUDT.Faults.Transducer), array-of-struct elements, nested structs /
+        bit members, and whole-element aliases. Fail-closed: returns None on any
+        parse failure, a source-protected/undecodable base, or a walk that does
+        not land on a real member, so the caller keeps the tag Base rather than
+        emit a wrong (schema-invalid) Alias.
+        """
+        try:
+            r = self._parse_rec_tolerant(raw_rec)
+            if r is None or r.cip_type not in (0x6B, 0x68):
+                return None
+            dti = r.main_record.data_table_instance
+            if not dti or len(raw_rec) < 0x2A:
+                return None
+            row = self._cur.execute(
+                "SELECT comp_name, record FROM comps WHERE object_id=" + str(dti)
+            ).fetchone()
+            if not row or not row[0]:
+                return None
+            base = row[0]
+            if base.startswith("$"):
+                return None
+            bitoff = struct.unpack_from("<I", raw_rec, 0x26)[0]
+            alias_dt = None
+            if r.main_record.data_type:
+                ar = self._cur.execute(
+                    "SELECT comp_name FROM comps WHERE object_id="
+                    + str(r.main_record.data_type)
+                ).fetchone()
+                alias_dt = ar[0] if ar else None
+            alias_is_bool = (alias_dt or "").upper() in ("BOOL", "BIT")
+            base_dt = None
+            base_is_array = False
+            if row[1] is not None:
+                try:
+                    br = RxGeneric.from_bytes(bytes(row[1]))
+                    if br.main_record.data_type:
+                        bdr = self._cur.execute(
+                            "SELECT comp_name FROM comps WHERE object_id="
+                            + str(br.main_record.data_type)
+                        ).fetchone()
+                        base_dt = bdr[0] if bdr else None
+                    base_is_array = bool(getattr(br.main_record, "dimension_1", 0))
+                except Exception:
+                    base_dt = None
+            if base_dt is None:
+                return None
+            bdu = base_dt.upper()
+
+            if base.startswith("&"):
+                m = re.match(r"^&([0-9a-fA-F]+)(:.*)$", base)
+                if not m:
+                    return None
+                mr = self._cur.execute(
+                    "SELECT comp_name FROM comps WHERE object_id="
+                    + str(int(m.group(1), 16))
+                ).fetchone()
+                if not mr or not mr[0]:
+                    return None
+                full = mr[0] + m.group(2)
+                if bdu in _ALIAS_ELEM_BITS:
+                    ms = re.match(r"^(.+):(\d+):([IO])$", full)
+                    if not ms:
+                        return None
+                    slot = int(ms.group(2))
+                    width = _ALIAS_ELEM_BITS[bdu]
+                    bit = bitoff - (64 + slot * 8)
+                    if not (0 <= bit < width):
+                        return None
+                    if (not alias_is_bool and (alias_dt or "").upper() == bdu
+                            and bit == 0):
+                        return full
+                    if not alias_is_bool:
+                        return None
+                    return "%s.%d" % (full, bit)
+                if bitoff == 0 and (alias_dt or "").upper() == bdu:
+                    return full
+                path = self._alias_walk_members(base_dt, bitoff, alias_is_bool)
+                return (full + "." + path) if path else None
+
+            # internal tag base (not a module &hex: element)
+            if alias_dt and alias_dt == base_dt and bitoff == 0 and not base_is_array:
+                return base
+            if bdu in _ALIAS_ELEM_BITS:
+                w = _ALIAS_ELEM_BITS[bdu]
+                idx = bitoff // w
+                bit = bitoff % w
+                if alias_is_bool:
+                    if base_is_array:
+                        return "%s[%d].%d" % (base, idx, bit)
+                    return ("%s.%d" % (base, bit)) if idx == 0 \
+                        else ("%s[%d].%d" % (base, idx, bit))
+                if base_is_array:
+                    return "%s[%d]" % (base, idx)
+                return base if idx == 0 else "%s[%d]" % (base, idx)
+            if base_is_array:
+                stride = self._taginfo_layout.get("@size@" + bdu)
+                if not stride:
+                    return None
+                sbits = stride * 8
+                idx = bitoff // sbits
+                inner = bitoff % sbits
+                seg = "%s[%d]" % (base, idx)
+                if inner == 0 and (alias_dt or "").upper() == bdu:
+                    return seg
+                sub = self._alias_walk_members(base_dt, inner, alias_is_bool)
+                return (seg + "." + sub) if sub else None
+            path = self._alias_walk_members(base_dt, bitoff, alias_is_bool)
+            return (base + "." + path) if path else None
+        except Exception:
+            return None
+
     def _long_header_alias_for(self, raw_rec: bytes) -> Union[str, None]:
         """Build a V24+ long-header alias tag's @AliasFor target, byte-exact.
 
@@ -4181,6 +4385,20 @@ class TagBuilder(L5xElementBuilder):
                 constant = "false"
 
         # --- V24+ long-header @AliasFor / TagType="Alias" ---
+        # The layout-driven resolver handles every long-header alias shape
+        # (module-I/O channel members, internal UDT member paths, array-of-struct,
+        # nested structs/bit members, whole-element) by walking the base
+        # datatype's TagInfo layout. It is fail-closed (None -> keep Base), so the
+        # narrower resolvers below remain as a fallback for the rare base whose
+        # datatype layout is unavailable.
+        if not self._short_header and not is_io and not alias_for:
+            try:
+                _vaf = self._layout_alias_for(raw_rec)
+            except Exception:
+                _vaf = None
+            if _vaf:
+                alias_for = _vaf
+                constant = None
         # When the alias detector fires AND we can build the AliasFor target
         # byte-exactly (the cracked embedded-IO "Local:" sub-case), emit the tag
         # as an Alias: TagType="Alias", AliasFor=<module>:<slot>:<type>.Data.<bit>,
@@ -5796,8 +6014,12 @@ class ProgramBuilder(L5xElementBuilder):
                 if self._short_header and len(prog_record) >= 14 else 0
             )
             for result in self._cur.fetchall():
-                tag = TagBuilder(self._cur, result[1], _short_header=self._short_header,
-                                 _acd_major=self._acd_major, _program_cid=_prog_cid).build()
+                _tb = TagBuilder(self._cur, result[1], _short_header=self._short_header,
+                                 _acd_major=self._acd_major, _program_cid=_prog_cid)
+                # The alias resolver in build() needs the datatype layout, so set it
+                # on the builder before build() (not only on the finished tag below).
+                _tb._taginfo_layout = self._taginfo_layout
+                tag = _tb.build()
                 tag._data_types_map = self._data_types_map
                 tag._taginfo_layout = self._taginfo_layout
                 tag._alarm_xml = self._alarm_map.get(result[1], "")
@@ -6301,8 +6523,11 @@ class ControllerBuilder(L5xElementBuilder):
             short_routine_desc = {}
         for result in results:
             _tag_object_id = result[1]
-            tag = TagBuilder(self._cur, _tag_object_id, _short_header=self._short_header,
-                             _acd_major=self._acd_major).build()
+            _tb = TagBuilder(self._cur, _tag_object_id, _short_header=self._short_header,
+                             _acd_major=self._acd_major)
+            # build()'s alias resolver needs the datatype layout available up front.
+            _tb._taginfo_layout = self._taginfo_layout
+            tag = _tb.build()
             tag._alarm_xml = alarm_map.get(_tag_object_id, "")
             tag._data_types_map = data_types_map
             tag._taginfo_layout = self._taginfo_layout
