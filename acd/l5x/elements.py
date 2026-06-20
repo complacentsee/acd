@@ -2034,6 +2034,7 @@ class Routine(L5xElement):
 @dataclass
 class AOI(L5xElement):
     name: str
+    cls: Union[str, None]  # "Standard" on safety-controller AOIs; None omits @Class
     revision: str
     revision_extension: Union[str, None]  # None if absent (omitted from XML)
     vendor: Union[str, None]  # None if absent (omitted from XML)
@@ -5836,8 +5837,25 @@ class AoiBuilder(L5xElementBuilder):
             except Exception:
                 pass
 
+        # Class="Standard" on every AOI of a safety controller; omitted otherwise.
+        # A safety project carries a 'SafetyController' comp under the controller
+        # collection; the reference never classifies an AOI "Safety" in this corpus,
+        # so a uniform "Standard" is always correct (a future safety-scoped AOI would
+        # need a per-AOI discriminator that is not present here).
+        aoi_class: Union[str, None] = None
+        try:
+            _rcc = self._cur.execute(
+                "SELECT object_id FROM comps WHERE comp_name='RxControllerCollection' "
+                "LIMIT 1").fetchone()
+            if _rcc and self._cur.execute(
+                    "SELECT 1 FROM comps WHERE parent_id=? AND comp_name="
+                    "'SafetyController' LIMIT 1", (_rcc[0],)).fetchone():
+                aoi_class = "Standard"
+        except Exception:
+            aoi_class = None
+
         return AOI(
-            name, name, revision,
+            name, name, aoi_class, revision,
             meta["revision_extension"],
             vendor,
             execute_prescan, "false", execute_enable_in_false,
