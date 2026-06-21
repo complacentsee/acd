@@ -1,4 +1,5 @@
 import html
+import math
 import os
 import re
 import shutil
@@ -955,6 +956,96 @@ _CONN_OCXN_OFF = 20         # u16 OutputCxnPoint
 _CONN_OSIZE_OFF = 26        # u16 OutputSize
 _CONN_EVENT_OFF = 298       # u8 EventID
 _CONN_TRANSPORT_OFF = 323   # u8 transport type (2 == unicast, else multicast)
+# Modern (data-driven / safety) connection attributes, recovered from the same
+# param blob (validated byte-exact pool-wide against the OEM <Connection>):
+_CONN_IPT_OFF = 302         # u8 InputProductionTrigger (0=Cyclic, 2=Application)
+_CONN_MOND_OFF = 314        # u16 MaxObservedNetworkDelay raw (count * 0.128 us)
+_CONN_TMULT_OFF = 316       # u8 TimeoutMultiplier
+_CONN_NDMULT_OFF = 317      # u16 NetworkDelayMultiplier
+_CONN_PRIORITY_OFF = 357    # u8 Priority (1=High, 2=Scheduled)
+_CONN_ICT_OFF = 366         # u8 InputConnectionType (2=Unicast, 1=Multicast)
+_CONN_CPATH_WC_OFF = 370    # u8 ConnectionPath length in 16-bit words; path @ +1
+_CONN_DATADRIVEN_FMTS = frozenset({48, 49, 50})
+_CONN_SAFETY_FMTS = frozenset({28, 29, 50, 49})
+_CONN_PRIORITY_MAP = {1: "High", 2: "Scheduled"}
+_CONN_ICT_MAP = {2: "Unicast", 1: "Multicast"}
+_CONN_IPT_MAP = {0: "Cyclic", 2: "Application"}
+_CONN_SAFETY_ASM_INSTANCES = frozenset({0x66, 0x0360})
+
+
+def _conn_num(x: float) -> str:
+    """Render a connection timing value: whole numbers bare, else 3 decimals."""
+    return str(int(round(x))) if abs(x - round(x)) < 1e-9 else "%.3f" % x
+
+
+def _conn_path_from_blob(blob: bytes):
+    """The verbatim CIP ConnectionPath EPATH ('20 04 24 ..') or None.
+
+    Stored literally in the param blob: a u8 word-count at _CONN_CPATH_WC_OFF
+    then word_count*2 path bytes; rendered as space-separated lowercase hex.
+    """
+    if len(blob) <= _CONN_CPATH_WC_OFF:
+        return None
+    wc = blob[_CONN_CPATH_WC_OFF]
+    n = wc * 2
+    start = _CONN_CPATH_WC_OFF + 1
+    if wc == 0 or start + n > len(blob):
+        return None
+    return " ".join("%02x" % x for x in blob[start:start + n])
+
+
+def _conn_first_instance(blob: bytes):
+    """First Assembly logical-segment instance of the embedded EPATH, or None."""
+    if len(blob) <= _CONN_CPATH_WC_OFF:
+        return None
+    wc = blob[_CONN_CPATH_WC_OFF]
+    start = _CONN_CPATH_WC_OFF + 1
+    p = blob[start:start + wc * 2]
+    if len(p) < 4 or p[0] != 0x20 or p[1] != 0x04:
+        return None
+    if p[2] == 0x24:
+        return p[3]
+    if p[2] == 0x25 and len(p) >= 6:
+        return struct.unpack_from("<H", p, 4)[0]
+    return None
+
+
+def _conn_modern_attrs(blob: bytes, fmt: int) -> dict:
+    """Recover the data-driven / safety <Connection> attributes from the blob."""
+    out: dict = {}
+    if fmt in _CONN_DATADRIVEN_FMTS:
+        if len(blob) > _CONN_PRIORITY_OFF:
+            out["Priority"] = _CONN_PRIORITY_MAP.get(blob[_CONN_PRIORITY_OFF])
+        if len(blob) > _CONN_ICT_OFF:
+            out["InputConnectionType"] = _CONN_ICT_MAP.get(blob[_CONN_ICT_OFF])
+        if len(blob) > _CONN_IPT_OFF:
+            out["InputProductionTrigger"] = _CONN_IPT_MAP.get(blob[_CONN_IPT_OFF])
+        cp = _conn_path_from_blob(blob)
+        if cp is not None:
+            out["ConnectionPath"] = cp
+        inst = _conn_first_instance(blob)
+        if inst is not None:
+            safe = inst in _CONN_SAFETY_ASM_INSTANCES
+            if fmt in (48, 49):  # has an input side
+                out["InputTagSuffix"] = "I1" if inst == 1 else ("SI" if safe else "I")
+            if fmt in (48, 50):  # has an output side
+                out["OutputTagSuffix"] = "O1" if inst == 1 else ("SO" if safe else "O")
+    if fmt in _CONN_SAFETY_FMTS:
+        if len(blob) > _CONN_TMULT_OFF:
+            out["TimeoutMultiplier"] = str(blob[_CONN_TMULT_OFF])
+        if len(blob) >= _CONN_NDMULT_OFF + 2:
+            out["NetworkDelayMultiplier"] = str(
+                struct.unpack_from("<H", blob, _CONN_NDMULT_OFF)[0])
+        if len(blob) >= _CONN_MOND_OFF + 2:
+            out["MaxObservedNetworkDelay"] = _conn_num(
+                struct.unpack_from("<H", blob, _CONN_MOND_OFF)[0] * 0.128)
+        rpi_us = struct.unpack_from("<I", blob, _CONN_RPI_OFF)[0] / 1000.0
+        if fmt in (28, 49):  # input
+            out["ReactionTimeLimit"] = _conn_num(
+                math.ceil(4 * rpi_us / 0.128) * 0.128)
+        else:                # output (29, 50)
+            out["ReactionTimeLimit"] = _conn_num(3 * rpi_us)
+    return {k: v for k, v in out.items() if v is not None}
 # Data-driven connection formats always carry the connection size; the plain
 # Output format carries size AND connection points, but only for generic/drive
 # modules (see ModuleBuilder).
@@ -1024,10 +1115,18 @@ def _build_connection_map(cur, short_header: bool) -> Dict[int, dict]:
             fmt = struct.unpack_from("<H", blob, _CONN_FMT_OFF)[0]
             if fmt not in _CONN_TYPE_BY_FMT:
                 continue
-            out[oid] = {
+            entry = {
                 "fmt": fmt,
                 "Type": _CONN_TYPE_BY_FMT[fmt],
                 "RPI": str(struct.unpack_from("<I", blob, _CONN_RPI_OFF)[0]),
+                # Unicast PRESENCE is a per-module property not encoded here:
+                # safety connections always carry it, plain Input/Output carry it
+                # only when point-to-point (transport==2); every other connection
+                # type omits it. The value, when present, is transport==2.
+                "_unicast_present": (
+                    fmt in (28, 29)
+                    or (fmt in (5, 6) and blob[_CONN_TRANSPORT_OFF] == 2)
+                ),
                 "Unicast": "true" if blob[_CONN_TRANSPORT_OFF] == 2 else "false",
                 "EventID": str(blob[_CONN_EVENT_OFF]),
                 "InputCxnPoint": struct.unpack_from("<H", blob, _CONN_ICXN_OFF)[0],
@@ -1035,6 +1134,8 @@ def _build_connection_map(cur, short_header: bool) -> Dict[int, dict]:
                 "OutputCxnPoint": struct.unpack_from("<H", blob, _CONN_OCXN_OFF)[0],
                 "OutputSize": struct.unpack_from("<H", blob, _CONN_OSIZE_OFF)[0],
             }
+            entry.update(_conn_modern_attrs(blob, fmt))
+            out[oid] = entry
     except Exception:
         return out
     return out
@@ -2152,11 +2253,26 @@ class Module(L5xElement):
                     for a in ("InputCxnPoint", "OutputCxnPoint", "OutputSize", "InputSize")
                     if a in c
                 )
+                # Safety timing attributes (SafetyInput/Output + Safety*DataDriven),
+                # then the data-driven block (Priority, InputConnectionType,
+                # InputProductionTrigger, ConnectionPath, tag suffixes) -- each
+                # emitted only when decoded for this connection.
+                modern = "".join(
+                    f' {a}="{c[a]}"'
+                    for a in ("TimeoutMultiplier", "NetworkDelayMultiplier",
+                              "ReactionTimeLimit", "MaxObservedNetworkDelay",
+                              "Priority", "InputConnectionType", "InputProductionTrigger",
+                              "ConnectionPath", "InputTagSuffix", "OutputTagSuffix")
+                    if a in c
+                )
+                # Unicast is rendered only on connection types that carry it
+                # (safety always; plain Input/Output only when point-to-point).
+                uni = f' Unicast="{c["unicast"]}"' if c.get("unicast_present", True) else ""
                 conn_parts.append(
                     f'<Connection Name="{safe_name}" RPI="{c["rpi"]}" Type="{c["type"]}"'
                     f'{extra}'
                     f' EventID="{c["event_id"]}" ProgrammaticallySendEventTrigger="false"'
-                    f' Unicast="{c["unicast"]}">'
+                    f'{modern}{uni}>'
                     f'{tag_stubs}'
                     f'</Connection>'
                 )
@@ -3919,7 +4035,21 @@ class ModuleBuilder(L5xElementBuilder):
                 # does carry IO tags, so match the three exact types only.
                 "is_motion": dec["Type"] in (
                     "MotionAsync", "MotionEvent", "MotionSync"),
+                # Whether Unicast is rendered at all (per-connection-nature).
+                "unicast_present": dec.get("_unicast_present", True),
             }
+            # Modern data-driven / safety connection attributes (Priority,
+            # InputConnectionType, InputProductionTrigger, ConnectionPath, tag
+            # suffixes, and the safety timing set). Auto-named raw connections
+            # (comp_name "_<pathhex>", which carry a Format attribute instead)
+            # never render these, so skip them.
+            if not conn_name.startswith("_"):
+                for _k in ("Priority", "InputConnectionType", "InputProductionTrigger",
+                           "ConnectionPath", "InputTagSuffix", "OutputTagSuffix",
+                           "TimeoutMultiplier", "NetworkDelayMultiplier",
+                           "MaxObservedNetworkDelay", "ReactionTimeLimit"):
+                    if _k in dec:
+                        c[_k] = dec[_k]
             fmt = dec["fmt"]
             direct = fmt == _CONN_FMT_OUTPUT and generic_drive
             if fmt in (48, 49) or direct:
