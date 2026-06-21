@@ -1709,6 +1709,13 @@ class Module(L5xElement):
     # scored value. Emitted before <Connections> (ConfigData first, then ConfigScript).
     _config_data: "Union[Tuple[str, int], None]" = field(default=None)
     _config_script: "Union[Tuple[str, int], None]" = field(default=None)
+    # Drive ADC (PowerFlex etc.), Safety Network Number, and per-module safety
+    # signature; each None omits its attribute.
+    _drives_adc_enabled: Union[str, None] = field(default=None)
+    _drives_adc_mode: Union[str, None] = field(default=None)
+    _safety_network: Union[str, None] = field(default=None)
+    _safety_signature: Union[str, None] = field(default=None)
+    _safety_signature_timestamp: Union[str, None] = field(default=None)
 
     def __post_init__(self):
         super().__post_init__()
@@ -1720,6 +1727,15 @@ class Module(L5xElement):
         # The reference writes SafetyEnabled="true" on a safety module (one that
         # owns a safety connection); it omits the attribute on non-safety modules.
         safety_attr = ' SafetyEnabled="true"' if self._safety_enabled else ''
+        if self._safety_network is not None:
+            safety_attr += f' SafetyNetwork="{self._safety_network}"'
+        if self._safety_signature is not None:
+            safety_attr += f' SafetySignature="{self._safety_signature}"'
+        if self._safety_signature_timestamp is not None:
+            safety_attr += f' SafetySignatureTimestamp="{html.escape(self._safety_signature_timestamp, quote=True)}"'
+        if self._drives_adc_enabled is not None:
+            safety_attr += (f' DrivesADCEnabled="{self._drives_adc_enabled}"'
+                            f' DrivesADCMode="{self._drives_adc_mode}"')
         attrs = (
             f'{name_attr}'
             f'CatalogNumber="{self.catalog_number}" '
@@ -3741,6 +3757,65 @@ class ModuleBuilder(L5xElementBuilder):
         )
         safety_enabled = self._cur.fetchone() is not None
 
+        # Drive ADC + Safety Network Number live in the FULL identity ext-attr 0x001
+        # (read from comps_full; the record copy can be truncated before these
+        # offsets). A drive module's 0x001 starts with the class word 0x0200; the
+        # ADC bits are the u32 before its lone 0xFFFFFFFF sentinel (bit 6 = Enabled,
+        # bit 1 = Mode). The 6-byte little-endian Safety Network Number is at offset
+        # 305, present (high byte nonzero) only on a safety module.
+        drives_adc_enabled = drives_adc_mode = safety_network = None
+        safety_signature = safety_signature_timestamp = None
+        try:
+            _cf = self._cur.execute(
+                "SELECT record FROM comps_full WHERE object_id=?",
+                (self._object_id,)).fetchone()
+            _fe1 = b""
+            if _cf and _cf[0]:
+                _fe1 = CompsRecord.read_value_attrs(
+                    bytes(_cf[0]), self._short_header, full=True).get(0x001, b"")
+            if len(_fe1) >= 2 and struct.unpack_from("<H", _fe1, 0)[0] in (0x0200, 0x0201):
+                _p = _fe1.find(b"\xff\xff\xff\xff")
+                _v = struct.unpack_from("<I", _fe1, _p - 4)[0] if _p >= 4 else 0
+                drives_adc_enabled = "true" if (_v & 0x40) else "false"
+                drives_adc_mode = "true" if (_v & 0x02) else "false"
+            if len(_fe1) >= 311 and _fe1[310] != 0:
+                _be = _fe1[305:311][::-1].hex()
+                safety_network = f"16#0000_{_be[0:4]}_{_be[4:8]}_{_be[8:12]}"
+        except Exception:
+            pass
+        # SafetySignature: join the GSS side table by the module's object type /
+        # comment id; a signed controller's Local module carries the all-zero hash.
+        try:
+            _mrow = self._cur.execute(
+                "SELECT record FROM comps WHERE object_id=?",
+                (self._object_id,)).fetchone()
+            if _mrow and _mrow[0] is not None and len(bytes(_mrow[0])) >= 16:
+                _mr = bytes(_mrow[0])
+                _key = (struct.unpack_from("<H", _mr, 0x0A)[0],
+                        struct.unpack_from("<I", _mr, 0x0C)[0])
+                _sr = self._cur.execute(
+                    "SELECT signature, timestamp FROM safety_signatures "
+                    "WHERE otype=? AND cid=?", _key).fetchone()
+                if _sr and _sr[0]:
+                    safety_signature = _sr[0]
+                    safety_signature_timestamp = _sr[1]
+                elif name == "Local":
+                    _sc = self._cur.execute(
+                        "SELECT record FROM comps WHERE comp_name='SafetyController' "
+                        "AND record_type=256 LIMIT 1").fetchone()
+                    if _sc and _sc[0] is not None and len(bytes(_sc[0])) >= 16:
+                        _scr = bytes(_sc[0])
+                        _ck = (struct.unpack_from("<H", _scr, 0x0A)[0],
+                               struct.unpack_from("<I", _scr, 0x0C)[0])
+                        _csr = self._cur.execute(
+                            "SELECT timestamp FROM safety_signatures WHERE otype=? AND "
+                            "cid=? AND signature IS NOT NULL", _ck).fetchone()
+                        if _csr:
+                            safety_signature = " - ".join(["00000000"] * 8)
+                            safety_signature_timestamp = _csr[0]
+        except Exception:
+            pass
+
         return Module(
             name,           # L5xElement._name (private)
             name,           # Module.name
@@ -3776,6 +3851,11 @@ class ModuleBuilder(L5xElementBuilder):
             _safety_enabled=safety_enabled,
             _config_data=configdata,
             _config_script=configscript,
+            _drives_adc_enabled=drives_adc_enabled,
+            _drives_adc_mode=drives_adc_mode,
+            _safety_network=safety_network,
+            _safety_signature=safety_signature,
+            _safety_signature_timestamp=safety_signature_timestamp,
         )
 
 
