@@ -2108,6 +2108,7 @@ class ScheduledProgram(L5xElement):
 @dataclass
 class EventInfo(L5xElement):
     event_trigger: str
+    event_tag: Union[str, None]  # None omits @EventTag (e.g. EVENT-instruction tasks)
     enable_timeout: str
 
     def __post_init__(self):
@@ -6365,8 +6366,91 @@ def _read_task_config(e01: bytes):
     }
 
 
+_EVENT_TRIGGER_MAP = {
+    1: "Motion Group Execution",
+    10: "Module Input Data State Change",
+    15: "EVENT Instruction Only",
+}
+
+
+def _task_ref_list(record: bytes) -> Dict[int, bytes]:
+    """Parse the task record's inline reference list at offset 0x4A: a u32 marker,
+    a u32 entry count, then [u32 key][u32 length][length bytes] entries through the
+    key==1 payload. Returns {key: value_bytes}. On a short-header / source-protected
+    task the key==1 entry holds the same payload that ext-attr 0x01 carries on a
+    normally-parsed task (it begins at record offset 0x8A, so the scheduled-program
+    read is identical whether taken from here or the raw record)."""
+    off = 0x4A
+    if off + 8 > len(record):
+        return {}
+    count = struct.unpack_from("<I", record, off + 4)[0]
+    off += 8
+    refs: Dict[int, bytes] = {}
+    for _ in range(count + 2):
+        if off + 8 > len(record):
+            break
+        key = struct.unpack_from("<I", record, off)[0]
+        length = struct.unpack_from("<I", record, off + 4)[0]
+        refs[key] = record[off + 8:off + 8 + length]
+        off += 8 + length
+        if key == 1:
+            break
+    return refs
+
+
 @dataclass
 class TaskBuilder(L5xElementBuilder):
+    def _build_event_info(self, e01: bytes, record: bytes) -> Union[EventInfo, None]:
+        """Build the <EventInfo> for an EVENT task from its ext-attr 0x01 payload.
+
+        EventTrigger is the enum at payload offset (type_off+2); EnableTimeout is
+        bit 0 at payload offset len-0x44. EventTag is the motion group (motion
+        trigger) or the module input tag (module-input trigger), resolved from the
+        comps graph; an EVENT-instruction task has no tag.
+        """
+        L = len(e01)
+        if L < 0x64:
+            return None
+        t_off = 0x28C if L < 2000 else 0x109C
+        if t_off + 4 > L or struct.unpack_from("<H", e01, t_off)[0] != 1:
+            return None
+        trig = struct.unpack_from("<H", e01, t_off + 2)[0]
+        trigger = _EVENT_TRIGGER_MAP.get(trig)
+        if trigger is None:
+            return None
+        enable_timeout = "true" if (e01[L - 0x44] & 1) else "false"
+        event_tag: Union[str, None] = None
+        if trig == 1:
+            # Motion Group Execution: the motion-group tag (the record_type=256 comp
+            # whose record references the MOTION_GROUP datatype comp).
+            mg = self._cur.execute(
+                "SELECT object_id FROM comps WHERE comp_name='MOTION_GROUP'").fetchone()
+            if mg:
+                needle = struct.pack("<I", mg[0])
+                for cn, cr in self._cur.execute(
+                        "SELECT comp_name, record FROM comps WHERE record_type=256").fetchall():
+                    if cn and needle in bytes(cr):
+                        event_tag = cn
+                        break
+        elif trig == 10:
+            # Module Input Data State Change: the input tag, ref-list key 0x68 ->
+            # object_id -> '&<modid>:<slot>:I' rewritten to '<Module>:<slot>:I'.
+            v = _task_ref_list(record).get(0x68)
+            if v and len(v) == 4:
+                row = self._cur.execute(
+                    "SELECT comp_name FROM comps WHERE object_id=?",
+                    (int.from_bytes(v, "little"),)).fetchone()
+                if row and row[0]:
+                    m = re.match(r"^&([0-9a-fA-F]+)(:.*)$", row[0])
+                    if m:
+                        mod = self._cur.execute(
+                            "SELECT comp_name FROM comps WHERE object_id=?",
+                            (int(m.group(1), 16),)).fetchone()
+                        event_tag = (mod[0] + m.group(2)) if mod and mod[0] else row[0]
+                    else:
+                        event_tag = row[0]
+        return EventInfo("EventInfo", trigger, event_tag, enable_timeout)
+
     def build(self, comment_id_to_program: Dict[int, str]) -> Task:
         self._cur.execute(
             "SELECT comp_name, record FROM comps WHERE object_id=" + str(self._object_id)
@@ -6387,6 +6471,11 @@ class TaskBuilder(L5xElementBuilder):
                 e01 = CompsRecord.read_ext_attrs_from_record(record).get(0x01, b"")
             except Exception:
                 e01 = b""
+        if not e01:
+            # Short-header / source-protected tasks carry the same payload inline as
+            # the ref-list key==1 entry (RxGeneric drops ext 0x01 on them); use it so
+            # config + EventInfo resolve identically to a normally-parsed task.
+            e01 = _task_ref_list(record).get(0x01, b"")
 
         # Class: a safety controller marks each task Safety/Standard with a byte at
         # ext[0x01] offset len-0x38 (6 = Safety); standard controllers omit @Class.
@@ -6452,7 +6541,7 @@ class TaskBuilder(L5xElementBuilder):
 
         event_info = None
         if task_type == "EVENT":
-            event_info = EventInfo("EventInfo", "EVENT Instruction Only", "false")
+            event_info = self._build_event_info(e01, record)
 
         return Task(
             name,
