@@ -1343,10 +1343,9 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count, modu
     """Return the ``<Data Format="Message">`` block for a MESSAGE tag, or None.
 
     None is returned for every configuration not decoded with full confidence
-    (a non-354-byte/safety config, an unresolved or ambiguous ConnectionPath, an
-    unresolved member reference, or -- for now -- the SLC/PLC5 families whose
-    RemoteElement is a PLC data address), so the tag keeps its prior no-<Data>
-    output and nothing wrong is ever emitted.
+    (a non-354-byte/safety config, an unresolved or ambiguous ConnectionPath, or
+    an unresolved member reference), so the tag keeps its prior no-<Data> output
+    and nothing wrong is ever emitted.
     """
     try:
         if not dti:
@@ -1379,10 +1378,6 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count, modu
         else:
             mt = None
         if mt is None:
-            return None
-        # SLC/PLC5 RemoteElement is a PLC data address (e.g. N20:0), decoded
-        # separately; skip them here to avoid emitting an incomplete block.
-        if mt.startswith("SLC") or mt.startswith("PLC5"):
             return None
         req = struct.unpack_from("<H", a1, 139)[0]
         cf = a1[143]
@@ -1432,6 +1427,19 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count, modu
             P += [("CommTypeCode", "0"), ("LocalIndex", "0"), ("LocalElement", le)]
             if cf == 1:
                 P.append(("CacheConnections", "TRUE"))
+        elif mt in ("SLC Typed Read", "SLC Typed Write",
+                    "PLC5 Word Range Write", "PLC5 Word Range Read", "PLC5 Typed Read"):
+            # RemoteElement is a PLC data address (e.g. N20:0); LocalElement a tag.
+            # These families render no ConnectedFlag. SLC carries CacheConnections
+            # only on a connected (cf==1) message and its value is not derivable
+            # from a single pool sample, so that lone case is skipped (safe).
+            if re_el is None or le is None:
+                return None
+            if mt.startswith("SLC") and cf == 1:
+                return None
+            P += [("RemoteElement", re_el), ("RequestedLength", str(req))]
+            add_cp()
+            P += [("CommTypeCode", "0"), ("LocalIndex", "0"), ("LocalElement", le)]
         elif mt == "Module Reconfigure":
             P += [("RequestedLength", str(req))]
             add_cp()
