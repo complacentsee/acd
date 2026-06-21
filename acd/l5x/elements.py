@@ -2084,6 +2084,9 @@ class Program(L5xElement):
     use_as_folder: Union[str, None]  # None -> omit attr (V10..V20 projects)
     tags: List[Tag]        # Tags section before Routines (matches L5X export order)
     routines: List[Routine]
+    # Safety program signature/timestamp (None omits the attributes).
+    safety_signature: Union[str, None] = field(default=None)
+    safety_signature_timestamp: Union[str, None] = field(default=None)
     _description: Union[str, None] = field(default=None)
 
     def to_xml(self) -> str:
@@ -2128,6 +2131,9 @@ class Task(L5xElement):
     inhibit_task: str
     event_info: Union[EventInfo, None]  # None for non-EVENT tasks
     scheduled_programs: List[ScheduledProgram]
+    # Safety task signature/timestamp (None omits the attributes).
+    safety_signature: Union[str, None] = field(default=None)
+    safety_signature_timestamp: Union[str, None] = field(default=None)
 
 
 @dataclass
@@ -6317,9 +6323,23 @@ class ProgramBuilder(L5xElementBuilder):
                 prog_cls = ("Safety" if (len(prog_record) > 0xE5
                             and prog_record[0xE5] == 6) else "Standard")
 
+        # Safety signature: a signed safety program joins the side table by its
+        # object type (record[0x0A]) and comment id (record[0x0C]).
+        prog_sig = prog_sig_ts = None
+        if len(prog_record) >= 16:
+            _srow = self._cur.execute(
+                "SELECT signature, timestamp FROM safety_signatures "
+                "WHERE otype=? AND cid=?",
+                (struct.unpack_from("<H", prog_record, 0x0A)[0],
+                 struct.unpack_from("<I", prog_record, 0x0C)[0])).fetchone()
+            if _srow:
+                prog_sig, prog_sig_ts = _srow[0], _srow[1]
+
         return Program(name, name, prog_cls, "false", main_routine_name,
                        fault_routine_name, disabled, sync_redundancy, use_as_folder,
-                       tags, routines, _description=program_description)
+                       tags, routines, safety_signature=prog_sig,
+                       safety_signature_timestamp=prog_sig_ts,
+                       _description=program_description)
 
 
 _TASK_TYPE_MAP = {1: "EVENT", 2: "PERIODIC", 4: "CONTINUOUS"}
@@ -6486,6 +6506,18 @@ class TaskBuilder(L5xElementBuilder):
             task_cls = ("Safety" if (len(e01) >= 0x38 and e01[len(e01) - 0x38] == 6)
                         else "Standard")
 
+        # Safety signature: a signed safety task joins the side table by its object
+        # type (record[0x0A]) and comment id (record[0x0C]).
+        task_sig = task_sig_ts = None
+        if len(record) >= 16:
+            _srow = self._cur.execute(
+                "SELECT signature, timestamp FROM safety_signatures "
+                "WHERE otype=? AND cid=?",
+                (struct.unpack_from("<H", record, 0x0A)[0],
+                 struct.unpack_from("<I", record, 0x0C)[0])).fetchone()
+            if _srow:
+                task_sig, task_sig_ts = _srow[0], _srow[1]
+
         cfg = _read_task_config(e01)
         if cfg is not None:
             task_type = cfg["type"]
@@ -6555,6 +6587,8 @@ class TaskBuilder(L5xElementBuilder):
             inhibit_str,
             event_info,
             scheduled_programs,
+            safety_signature=task_sig,
+            safety_signature_timestamp=task_sig_ts,
         )
 
 

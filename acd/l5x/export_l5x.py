@@ -307,6 +307,42 @@ class ExportL5x:
         self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?)", comment_tuples)
         self._db.commit()
 
+        # Generated-Safety-Signature records (record_type 0x10) are dropped by the
+        # comment parser; pull the per-object 256-bit signature hash and timestamp
+        # straight from the raw buffers into a side table keyed by (object_type,
+        # comment_id), which each signed Task/Program joins to. The two markers are
+        # UTF-16-LE; the hash is eight big-endian u32 groups 14 bytes after its
+        # marker, the timestamp ASCII 12 bytes after its marker.
+        self._cur.execute(
+            "CREATE TABLE safety_signatures(otype int, cid int, signature text, timestamp text)"
+        )
+        _sig_needle = "SignatureID\x11GSS\x00".encode("utf-16-le")
+        _ts_needle = "Timestamp\x11GSS\x00".encode("utf-16-le")
+        _gss: Dict[tuple, list] = {}
+        for _rec in comments_db.records.record:
+            _buf = bytes(_rec.record.record_buffer)
+            if len(_buf) < 16:
+                continue
+            _key = (struct.unpack_from("<H", _buf, 10)[0],
+                    struct.unpack_from("<I", _buf, 12)[0])
+            _si = _buf.find(_sig_needle)
+            if _si >= 0:
+                _h = _buf[_si + len(_sig_needle) + 14:_si + len(_sig_needle) + 46]
+                if len(_h) == 32 and any(_h):
+                    _gss.setdefault(_key, [None, None])[0] = " - ".join(
+                        "%08X" % struct.unpack_from(">I", _h, _i * 4)[0] for _i in range(8))
+            _ti = _buf.find(_ts_needle)
+            if _ti >= 0:
+                _txt = _buf[_ti + len(_ts_needle) + 12:].split(b"\x00")[0]
+                try:
+                    _gss.setdefault(_key, [None, None])[1] = _txt.decode("ascii")
+                except UnicodeDecodeError:
+                    pass
+        self._cur.executemany(
+            "INSERT INTO safety_signatures VALUES (?,?,?,?)",
+            [(k[0], k[1], v[0], v[1]) for k, v in _gss.items() if v[0]])
+        self._db.commit()
+
         log.info(
             "Getting records from ACD Nameless file and storing in sqllite database"
         )
