@@ -6190,15 +6190,12 @@ class ProgramBuilder(L5xElementBuilder):
             if _fo and _fo != 0xFFFFFFFF and _fo in routs:
                 fault_routine_name = routs[_fo]
 
-        # --- Disabled flag from ext[0x01] at offset 0x24 ---
-        # A u32 of 0xFFFFFFFF means the program is disabled; 0x00000000 means enabled.
+        # --- Disabled flag: the single byte at ext[0x01] offset 0x24 ---
+        # 0xFF = disabled, 0x00 = enabled. Only this byte is the flag; the three
+        # bytes above it are an unrelated field that the old u32 read mistook for a
+        # set flag (false positives) on the long program layout.
         ext01 = exts.get(0x01, b"")
-        disabled_flag = (
-            struct.unpack_from("<I", ext01, 0x24)[0] != 0
-            if len(ext01) >= 0x28
-            else False
-        )
-        disabled = "true" if disabled_flag else "false"
+        disabled = "true" if (len(ext01) > 0x24 and ext01[0x24] != 0) else "false"
 
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
@@ -6376,11 +6373,18 @@ def _read_task_config(e01: bytes):
     rate = None
     if task_type != "CONTINUOUS" and r_off + 4 <= L:
         rate = _ms(struct.unpack_from("<I", e01, r_off)[0])
+    # Watchdog is normally at the fixed tail offset len-0x64; a rare inline-payload
+    # length variant shifts the tail so that lands on filler (an implausibly large
+    # microsecond value) -- fall back to the fixed position relative to the type
+    # word in that case.
+    watchdog_us = struct.unpack_from("<I", e01, L - 0x64)[0]
+    if watchdog_us > 600_000_000 and t_off + 0x18 <= L:
+        watchdog_us = struct.unpack_from("<I", e01, t_off + 0x14)[0]
     return {
         "type": task_type,
         "rate": rate,
         "priority": priority,
-        "watchdog": _ms(struct.unpack_from("<I", e01, L - 0x64)[0]),
+        "watchdog": _ms(watchdog_us),
         "disable": "true" if (e01[L - 0x40] & 1) else "false",
         "inhibit": "true" if (e01[L - 0x3C] & 1) else "false",
     }
