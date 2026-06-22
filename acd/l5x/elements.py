@@ -6016,7 +6016,18 @@ class RoutineBuilder(L5xElementBuilder):
             "LEFT JOIN rungs r ON r.object_id = rm.object_id "
             "WHERE rm.parent_id=" + str(self._object_id) + " ORDER BY rm.unknown"
         )
-        rows = [(row[0], row[1]) for row in self._cur.fetchall() if row[1] is not None]
+        # The region map can carry a redundant duplicate entry for a rung (an
+        # identical (object_id, unknown, seq) row repeated, or the rungs join
+        # multiplying it); the reference emits each rung once, so keep the first
+        # occurrence of each rung object_id. Without this the duplicate rung shifts
+        # every following rung's Number, mismatching the rung text from there on.
+        rows = []
+        _seen_rung: set = set()
+        for row in self._cur.fetchall():
+            if row[1] is None or row[0] in _seen_rung:
+                continue
+            _seen_rung.add(row[0])
+            rows.append((row[0], row[1]))
         rung_ids = [row[0] for row in rows]
         rungs = [row[1] for row in rows]
 
