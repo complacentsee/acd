@@ -7658,6 +7658,27 @@ class ControllerBuilder(L5xElementBuilder):
                         force_pool[_foid] = _frec[410:410 + _flen]
         except Exception:
             force_pool = {}
+        # Installed I/O forces are exported only by legacy-save-format controllers:
+        # the controller-properties ext-attr 0x1 is 62 (V10-V20) or 70 (V24) bytes,
+        # whereas newer Studio appends a trailing block (len 71+) and never exports
+        # installed forces. This file-level flag gates the source-protected force
+        # recovery below. It is required because a relocated-value holder on an
+        # UNFORCED tag is byte-identical in structure to a real force holder; without
+        # the gate, a non-force project whose I/O values happen to be relocated would
+        # over-emit one <ForceData> per such tag. (The plaintext short-read path above
+        # self-gates via force_pool and so needs no flag.)
+        _forces_installed = False
+        try:
+            self._cur.execute(
+                "SELECT record FROM comps_full WHERE object_id=?", (self._object_id,)
+            )
+            _cr = self._cur.fetchone()
+            if _cr:
+                _ca = CompsRecord.read_value_attrs(
+                    bytes(_cr[0]), self._short_header, full=True)
+                _forces_installed = len(_ca.get(0x1, b"")) in (62, 70)
+        except Exception:
+            _forces_installed = False
         # Per-tag <AlarmConditions> blocks (V33+), keyed by owning tag object id.
         try:
             alarm_map = _build_alarm_conditions(self._cur, self._short_header)
@@ -7736,6 +7757,44 @@ class ControllerBuilder(L5xElementBuilder):
                             _fimg = force_pool.get(struct.unpack("<I", _fv)[0])
                             if _fimg and len(_fimg) == 3 * len(tag._value_bytes):
                                 tag._force_data = _tag_value.render_hex(_fimg)
+                        elif _fv is None and _forces_installed:
+                            # Source-protected backing: the short read cannot reach the
+                            # force pointer (0x6b sits past the encrypted 0x66), and the
+                            # design value is relocated (ext-0x66 is a 4-byte self-id
+                            # sentinel, not the real image), so force_pool's 3x-value
+                            # guard cannot apply. Recover from the FULL decrypt instead:
+                            # 0x6b -> a holder whose 0x1 declares [data_size][3] and
+                            # whose 0x66 is exactly 3x data_size (the mask/value/state
+                            # image). The holder is self-describing, so the size guard
+                            # comes from the holder itself, not the (sentinel) value.
+                            # Gated by _forces_installed so an unforced relocated holder
+                            # -- structurally identical -- never over-emits.
+                            try:
+                                _fp = CompsRecord.read_value_attrs(
+                                    _frb, self._short_header, full=True).get(0x6B)
+                            except Exception:
+                                _fp = None
+                            if _fp and len(_fp) == 4:
+                                self._cur.execute(
+                                    "SELECT record FROM comps_full WHERE object_id=?",
+                                    (struct.unpack("<I", _fp)[0],),
+                                )
+                                _hr = self._cur.fetchone()
+                                if _hr:
+                                    try:
+                                        _ha = CompsRecord.read_value_attrs(
+                                            bytes(_hr[0]), self._short_header, full=True)
+                                    except Exception:
+                                        _ha = {}
+                                    _h1 = _ha.get(0x1, b"")
+                                    _h66 = _ha.get(0x66)
+                                    if _h66 is not None and len(_h1) >= 8:
+                                        _dsz = struct.unpack_from("<I", _h1, 0)[0]
+                                        _mult = struct.unpack_from("<I", _h1, 4)[0]
+                                        if _mult == 3 and _dsz > 0 and \
+                                                len(_h66) == 3 * _dsz:
+                                            tag._force_data = \
+                                                _tag_value.render_hex(_h66)
                 # Capture this module's <Communications> tag content from its config
                 # (:C), input (:I) and output (:O) controller tags. The stored name is
                 # &<hex>:<slot>:X (slotted card) or &<hex>:X (Ethernet device); the hex
