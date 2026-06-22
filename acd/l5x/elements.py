@@ -5010,18 +5010,24 @@ class TagBuilder(L5xElementBuilder):
         return sz * 8 if sz else None
 
     def _alias_walk_members(self, dtname: str, target_bit: int,
-                            alias_is_bool: bool, prefix: str = ""
+                            alias_is_bool: bool, prefix: str = "",
+                            alias_dt: "Union[str, None]" = None
                             ) -> "Union[str, None]":
         """Return the member-path string locating target_bit inside dtname, or
         None. Walks the TagInfo member layout: a BOOL alias first matches an
         explicit named bit-member at the exact bit (so AxisStatus.1 wins over a
         wider word at the same offset), then the containing member (array element,
         atomic word + .bit for a BOOL, whole member for an element-aligned
-        non-BOOL, or recursion into a nested struct).
-        """
+        non-BOOL, or recursion into a nested struct). A BOOL alias onto a
+        BOOL-element array element is the whole element [idx] (1-bit element ->
+        no .bit). alias_dt is the alias tag's own datatype: when it equals a
+        member's datatype at that member's start, the walk stops at the whole
+        member (so e.g. a TIMER-typed alias resolves to the .PRE/.ACC member
+        rather than a raw bit)."""
         mem = self._taginfo_layout.get((dtname or "").upper())
         if mem is None:
             return None
+        adu = (alias_dt or "").upper()
         if alias_is_bool:
             for (mname, mdt, off, bit, hidden, dims) in mem:
                 if dims:
@@ -5041,17 +5047,23 @@ class TagBuilder(L5xElementBuilder):
                     idx = rel // mbits
                     inner = rel % mbits
                     seg = "%s%s[%d]" % (prefix, mname, idx)
+                    # BOOL-element array: alias onto element idx is the whole
+                    # element [idx] (1-bit element -> no .bit suffix).
+                    if mdt.upper() in ("BOOL", "BIT"):
+                        return seg
                     if (alias_is_bool and inner != 0) or (
                             mdt.upper() in _ALIAS_ELEM_BITS
                             and _ALIAS_ELEM_BITS.get(mdt.upper(), 0) > 1
                             and alias_is_bool):
                         return seg + ".%d" % inner
-                    if alias_is_bool and mdt.upper() in ("BOOL", "BIT"):
-                        return seg
                     if not alias_is_bool and inner == 0:
                         return seg
                     if mdt.upper() not in _ALIAS_ELEM_BITS:
-                        sub = self._alias_walk_members(mdt, inner, alias_is_bool, "")
+                        # whole-member stop: alias dt == member dt at element start
+                        if inner == 0 and adu and adu == mdt.upper():
+                            return seg
+                        sub = self._alias_walk_members(mdt, inner, alias_is_bool,
+                                                       "", alias_dt)
                         if sub is not None:
                             return seg + "." + sub
                     if alias_is_bool:
@@ -5073,8 +5085,12 @@ class TagBuilder(L5xElementBuilder):
                         if inner == 0:
                             return prefix + mname
                         return None
-                    sub = self._alias_walk_members(
-                        mdt, target_bit - base_bit, alias_is_bool, "")
+                    # non-atomic struct member: whole-member stop if alias dt matches
+                    inner = target_bit - base_bit
+                    if inner == 0 and adu and adu == mdt.upper():
+                        return prefix + mname
+                    sub = self._alias_walk_members(mdt, inner, alias_is_bool,
+                                                   "", alias_dt)
                     if sub is not None:
                         return prefix + mname + "." + sub
                     return None
@@ -5117,23 +5133,31 @@ class TagBuilder(L5xElementBuilder):
                 ).fetchone()
                 alias_dt = ar[0] if ar else None
             alias_is_bool = (alias_dt or "").upper() in ("BOOL", "BIT")
+            # Base datatype + array-ness, tolerant of source-protected base records
+            # (the plaintext RxGeneric parser throws on an encrypted tail).
             base_dt = None
             base_is_array = False
             if row[1] is not None:
                 try:
-                    br = RxGeneric.from_bytes(bytes(row[1]))
-                    if br.main_record.data_type:
+                    br = self._parse_rec_tolerant(bytes(row[1]))
+                except Exception:
+                    br = None
+                if br is not None and getattr(br, "main_record", None) is not None:
+                    if getattr(br.main_record, "data_type", None):
                         bdr = self._cur.execute(
                             "SELECT comp_name FROM comps WHERE object_id="
                             + str(br.main_record.data_type)
                         ).fetchone()
                         base_dt = bdr[0] if bdr else None
                     base_is_array = bool(getattr(br.main_record, "dimension_1", 0))
-                except Exception:
-                    base_dt = None
             if base_dt is None:
                 return None
             bdu = base_dt.upper()
+            # A base datatype WITH a TagInfo member layout (TIMER/COUNTER/CONTROL and
+            # module-image AB:* types) resolves through the member walker to the OEM
+            # named member; the flat numeric-bit fallback below is only for atomic
+            # bases that have no layout.
+            has_layout = self._taginfo_layout.get(bdu) is not None
 
             if base.startswith("&"):
                 m = re.match(r"^&([0-9a-fA-F]+)(:.*)$", base)
@@ -5146,7 +5170,7 @@ class TagBuilder(L5xElementBuilder):
                 if not mr or not mr[0]:
                     return None
                 full = mr[0] + m.group(2)
-                if bdu in _ALIAS_ELEM_BITS:
+                if bdu in _ALIAS_ELEM_BITS and not has_layout:
                     ms = re.match(r"^(.+):(\d+):([IO])$", full)
                     if not ms:
                         return None
@@ -5163,19 +5187,27 @@ class TagBuilder(L5xElementBuilder):
                     return "%s.%d" % (full, bit)
                 if bitoff == 0 and (alias_dt or "").upper() == bdu:
                     return full
-                path = self._alias_walk_members(base_dt, bitoff, alias_is_bool)
+                path = self._alias_walk_members(base_dt, bitoff, alias_is_bool,
+                                                "", alias_dt)
                 return (full + "." + path) if path else None
 
             # internal tag base (not a module &hex: element)
             if alias_dt and alias_dt == base_dt and bitoff == 0 and not base_is_array:
                 return base
-            if bdu in _ALIAS_ELEM_BITS:
+            if bdu in _ALIAS_ELEM_BITS and not has_layout:
                 w = _ALIAS_ELEM_BITS[bdu]
                 idx = bitoff // w
                 bit = bitoff % w
                 if alias_is_bool:
                     if base_is_array:
+                        # BOOL-element array: whole element [idx], no .bit.
+                        if w == 1:
+                            return "%s[%d]" % (base, idx)
                         return "%s[%d].%d" % (base, idx, bit)
+                    # Scalar 1-bit BOOL base: the alias is the whole base (a nonzero
+                    # bitoff here is an alias-to-alias artifact, not a real bit index).
+                    if w == 1:
+                        return base
                     return ("%s.%d" % (base, bit)) if idx == 0 \
                         else ("%s[%d].%d" % (base, idx, bit))
                 if base_is_array:
@@ -5191,9 +5223,11 @@ class TagBuilder(L5xElementBuilder):
                 seg = "%s[%d]" % (base, idx)
                 if inner == 0 and (alias_dt or "").upper() == bdu:
                     return seg
-                sub = self._alias_walk_members(base_dt, inner, alias_is_bool)
+                sub = self._alias_walk_members(base_dt, inner, alias_is_bool,
+                                               "", alias_dt)
                 return (seg + "." + sub) if sub else None
-            path = self._alias_walk_members(base_dt, bitoff, alias_is_bool)
+            path = self._alias_walk_members(base_dt, bitoff, alias_is_bool,
+                                            "", alias_dt)
             return (base + "." + path) if path else None
         except Exception:
             return None
