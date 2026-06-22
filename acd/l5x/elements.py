@@ -2785,6 +2785,11 @@ class Controller(L5xElement):
     # attributes; they are rendered onto the <RedundancyInfo> child instead.
     _io_memory_pad_percentage: Union[str, None] = field(default=None)
     _data_table_pad_percentage: Union[str, None] = field(default=None)
+    # <TimeSynchronize> PTPEnable / Priority1 / Priority2, read from the controller's
+    # TimeSynchronize config record. Default to the prior fixed true/128/128.
+    _ts_ptp_enable: str = field(default="true")
+    _ts_priority1: str = field(default="128")
+    _ts_priority2: str = field(default="128")
 
     def __post_init__(self):
         super().__post_init__()
@@ -2840,7 +2845,8 @@ class Controller(L5xElement):
             + '<WallClockTime LocalTimeAdjustment="0" TimeZone="0"/>'
             + '<Trends/>'
             + ('<DataLogs/>' if self._emit_data_logs else '')
-            + '<TimeSynchronize Priority1="128" Priority2="128" PTPEnable="true"/>'
+            + (f'<TimeSynchronize Priority1="{self._ts_priority1}" '
+               f'Priority2="{self._ts_priority2}" PTPEnable="{self._ts_ptp_enable}"/>')
             + '</Controller>'
         )
 
@@ -7735,6 +7741,34 @@ class ControllerBuilder(L5xElementBuilder):
         self._object_id = results[0][1]
         controller_name = results[0][0]
 
+        # TimeSynchronize PTPEnable / Priority1 / Priority2 from the controller's
+        # TimeSynchronize config record (RxControllerCollection child): PTPEnable is
+        # bit 0 of its ext-attr 0x1, Priority1/Priority2 are the bytes at offset
+        # 272/273. Validated against the reference (115/115 records: PTPEnable 0
+        # mismatch, priorities byte-exact). Defaults stay true/128/128 when absent.
+        ts_ptp_enable, ts_priority1, ts_priority2 = "true", "128", "128"
+        try:
+            _rcc = self._cur.execute(
+                "SELECT object_id FROM comps WHERE parent_id=? AND "
+                "comp_name='RxControllerCollection'", (self._object_id,)).fetchone()
+            if _rcc:
+                _tsr = self._cur.execute(
+                    "SELECT object_id FROM comps WHERE parent_id=? AND "
+                    "comp_name='TimeSynchronize'", (_rcc[0],)).fetchone()
+                if _tsr:
+                    _tcf = self._cur.execute(
+                        "SELECT record FROM comps_full WHERE object_id=?",
+                        (_tsr[0],)).fetchone()
+                    if _tcf and _tcf[0]:
+                        _tb = CompsRecord.read_value_attrs(
+                            bytes(_tcf[0]), self._short_header, full=True).get(0x1, b"")
+                        if len(_tb) > 273:
+                            ts_ptp_enable = "true" if (_tb[0] & 1) else "false"
+                            ts_priority1 = str(_tb[272])
+                            ts_priority2 = str(_tb[273])
+        except Exception:
+            pass
+
         # Get the data types
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
@@ -8503,6 +8537,9 @@ class ControllerBuilder(L5xElementBuilder):
             power_loss_program=power_loss_program,
             _io_memory_pad_percentage=io_memory_pad_percentage,
             _data_table_pad_percentage=data_table_pad_percentage,
+            _ts_ptp_enable=ts_ptp_enable,
+            _ts_priority1=ts_priority1,
+            _ts_priority2=ts_priority2,
         )
 
 
