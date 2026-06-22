@@ -316,31 +316,48 @@ class ExportL5x:
         self._cur.execute(
             "CREATE TABLE safety_signatures(otype int, cid int, signature text, timestamp text)"
         )
+        # Per-connection signatures use the same GSS records keyed additionally by a
+        # discriminator (u32 @ buf[16]); a module's connections share (otype,cid) but
+        # differ by disc, so the 2-key table alone would collapse them.
+        self._cur.execute(
+            "CREATE TABLE connection_signatures(otype int, cid int, disc int, signature text, timestamp text)"
+        )
         _sig_needle = "SignatureID\x11GSS\x00".encode("utf-16-le")
         _ts_needle = "Timestamp\x11GSS\x00".encode("utf-16-le")
         _gss: Dict[tuple, list] = {}
+        _gss3: Dict[tuple, list] = {}
         for _rec in comments_db.records.record:
             _buf = bytes(_rec.record.record_buffer)
             if len(_buf) < 16:
                 continue
-            _key = (struct.unpack_from("<H", _buf, 10)[0],
-                    struct.unpack_from("<I", _buf, 12)[0])
+            _otype = struct.unpack_from("<H", _buf, 10)[0]
+            _cid = struct.unpack_from("<I", _buf, 12)[0]
+            _key = (_otype, _cid)
+            _key3 = (_otype, _cid,
+                     struct.unpack_from("<I", _buf, 16)[0] if len(_buf) >= 20 else 0)
             _si = _buf.find(_sig_needle)
             if _si >= 0:
                 _h = _buf[_si + len(_sig_needle) + 14:_si + len(_sig_needle) + 46]
                 if len(_h) == 32 and any(_h):
-                    _gss.setdefault(_key, [None, None])[0] = " - ".join(
+                    _sig = " - ".join(
                         "%08X" % struct.unpack_from(">I", _h, _i * 4)[0] for _i in range(8))
+                    _gss.setdefault(_key, [None, None])[0] = _sig
+                    _gss3.setdefault(_key3, [None, None])[0] = _sig
             _ti = _buf.find(_ts_needle)
             if _ti >= 0:
                 _txt = _buf[_ti + len(_ts_needle) + 12:].split(b"\x00")[0]
                 try:
-                    _gss.setdefault(_key, [None, None])[1] = _txt.decode("ascii")
+                    _ts = _txt.decode("ascii")
+                    _gss.setdefault(_key, [None, None])[1] = _ts
+                    _gss3.setdefault(_key3, [None, None])[1] = _ts
                 except UnicodeDecodeError:
                     pass
         self._cur.executemany(
             "INSERT INTO safety_signatures VALUES (?,?,?,?)",
             [(k[0], k[1], v[0], v[1]) for k, v in _gss.items() if v[0]])
+        self._cur.executemany(
+            "INSERT INTO connection_signatures VALUES (?,?,?,?,?)",
+            [(k[0], k[1], k[2], v[0], v[1]) for k, v in _gss3.items() if v[0]])
         self._db.commit()
 
         log.info(
