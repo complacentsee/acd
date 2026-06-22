@@ -4095,7 +4095,17 @@ class ModuleBuilder(L5xElementBuilder):
         # modules (ExactMatch -- almost exclusively the root CPU -- needs a further
         # discriminator and is left as a follow-on). Validated on V20/V36 vs OEM;
         # the prior e1[0]&0x04 rule mis-keyed Disabled modules as CompatibleModule.
-        ekey_state  = "Disabled" if (len(e1) > 0x0a and e1[0x0a] == 0) else "CompatibleModule"
+        # No keying (mask 0) -> Disabled. Otherwise the keyed state is ExactMatch
+        # when bit 7 of the major byte e1[0x08] is clear, else CompatibleModule -- the
+        # same flag bit stripped to read the firmware major. Validated against the
+        # reference over keyed modules: 117 ExactMatch / 1313 CompatibleModule, the
+        # byte value splits the two sets with no overlap (0 false-positive/negative).
+        if len(e1) > 0x0a and e1[0x0a] == 0:
+            ekey_state = "Disabled"
+        elif len(e1) > 0x08 and not (e1[0x08] & 0x80):
+            ekey_state = "ExactMatch"
+        else:
+            ekey_state = "CompatibleModule"
 
         # IP address: stored at e1[0x30] as a u16 length-prefixed ASCII string for modules
         # that connect via Ethernet upstream (parent_port == 2). Local backplane bridge
