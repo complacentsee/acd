@@ -5288,6 +5288,58 @@ class TagBuilder(L5xElementBuilder):
         except Exception:
             return None
 
+    def _resolve_comp_oid(self, oid: int, depth: int = 0) -> Union[str, None]:
+        """Resolve a comps object id to its export name, following the
+        ``&<parentHex><suffix>`` module-reference convention recursively."""
+        if depth > 6:
+            return None
+        row = self._cur.execute(
+            "SELECT comp_name FROM comps WHERE object_id=?", (oid,)).fetchone()
+        if not row or row[0] is None:
+            return None
+        nm = row[0]
+        m = re.match(r"^&([0-9a-fA-F]+)(.*)$", nm)
+        if m:
+            parent = self._resolve_comp_oid(int(m.group(1), 16), depth + 1)
+            return (parent + m.group(2)) if parent is not None else None
+        return nm
+
+    def _sp_alias_for(self) -> Union[str, None]:
+        """Recover an alias target from a source-protected tag record.
+
+        A protected tag's live alias data sits in the AES-encrypted main record, so
+        the offset-based resolvers above cannot read it (the tag falls to Base). The
+        decrypted attribute table still carries ext-attr 0x65: a UTF-16 template of
+        the form ``@<hex>@.@<hex>@<member>`` where each ``@<hex>@`` token is the
+        object id of a comps component. Substitute each token with the component's
+        resolved comp_name to rebuild the AliasFor string.
+
+        Gated on the record actually being source-protected: a NON-protected record
+        can also carry a 0x65 template, but a stale one that disagrees with the live
+        (offset-decoded) target, so it must not be trusted there.
+        """
+        row = self._cur.execute(
+            "SELECT record FROM comps_full WHERE object_id=?",
+            (self._object_id,)).fetchone()
+        if not row or not row[0]:
+            return None
+        rec = bytes(row[0])
+        body_off = CompsRecord.body_offset(self._short_header)
+        if rec[body_off:].find(_SP_MARKER, 74) < 0:
+            return None
+        attrs = CompsRecord.read_value_attrs(rec, self._short_header, full=True)
+        raw = attrs.get(0x65)
+        if not raw or len(raw) < 4:
+            return None
+        s = raw.decode("utf-16-le", errors="replace").split("\x00")[0]
+        at_re = re.compile(r"@([0-9a-fA-F]+)@")
+        if not at_re.search(s):
+            return None
+        out = at_re.sub(
+            lambda m: (self._resolve_comp_oid(int(m.group(1), 16)) or m.group(0)), s)
+        # Only accept a fully-resolved template (every token resolved).
+        return out if "@" not in out else None
+
     def build(self) -> Tag:
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
@@ -5405,6 +5457,18 @@ class TagBuilder(L5xElementBuilder):
                 _iaf = None
             if _iaf:
                 alias_for = _iaf
+                constant = None
+
+        # --- Source-protected alias: the live target sits in the encrypted main
+        # record, so the resolvers above see nothing; recover it from the decrypted
+        # ext-attr 0x65 alias template (validated 0-FP, target-exact pool-wide). ---
+        if not alias_for:
+            try:
+                _spaf = self._sp_alias_for()
+            except Exception:
+                _spaf = None
+            if _spaf:
+                alias_for = _spaf
                 constant = None
 
         # Alias tags export TagType="Alias", carry no Constant (it lives on the
