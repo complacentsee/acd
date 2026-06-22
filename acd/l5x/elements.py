@@ -6672,33 +6672,31 @@ class AoiBuilder(L5xElementBuilder):
         execute_enable_in_false = "true" if (_flag_byte & 0x01) else "false"
         execute_prescan = "true" if (_flag_byte & 0x10) else "false"
 
-        # --- Vendor from comps record ---
-        # The u16 length @0xA6 / UTF-8 @0xA8 layout is V34+; on older records (e.g.
-        # V30) the slot lands on zero bytes, and on a source-protected AOI it lands
-        # on ciphertext. Sanitize the decoded value (drop XML-illegal control bytes)
-        # and treat an empty result as absent so the attribute is omitted rather
-        # than emitting control bytes / an empty Vendor="".
-        # On a source-protected AOI the whole ext-attr tail (which contains this
-        # slot) is ciphertext, so 0xA6 reads a garbage u16 length and 0xA8 reads
-        # ciphertext -- the Vendor value is NOT recoverable for SP AOIs from any
-        # decryptable source (it is not in the comps ext-attrs nor the nameless
-        # body). Fail CLOSED: only accept the slot when it is a clean, fully
-        # in-record, strict-UTF-8 printable string; otherwise emit no Vendor attr
-        # (omit) rather than ciphertext garbage. This suppresses the 49 SP garbage
-        # emissions (17 where the OEM has no Vendor -> now correct; 32 where the
-        # OEM has a real Vendor -> now omitted = false-negative, vs today's wrong
-        # value). NON-SP V34+ records pass through unchanged (slot is clean).
-        vlen = struct.unpack_from("<H", aoi_record, 0xA6)[0] if len(aoi_record) > 0xA8 else 0
+        # --- Vendor from the decrypted ext-attr 0x01 ---
+        # Vendor is a length-prefixed UTF-8 string in ext[0x01]: four zero bytes, a
+        # u16 length, then the string. Locate it structurally (the only such field
+        # carrying a printable ASCII value in the AOI blob) so the read is independent
+        # of the blob layout/version AND works on the decrypted tail of a
+        # source-protected AOI -- the previous read of the truncated record at a fixed
+        # 0xA6/0xA8 slot was wrong on both counts. An AOI with no Vendor stores a zero
+        # length here, so no candidate is found and the attribute is omitted (verified
+        # 0 false-positives pool-wide; the structural candidate is unique and equals
+        # the Vendor on every AOI that carries one).
         vendor: Union[str, None] = None
-        if 0 < vlen and 0xA8 + vlen <= len(aoi_record):
+        for _p in range(6, len(e01) - 1):
+            if e01[_p - 6:_p - 2] != b"\x00\x00\x00\x00":
+                continue
+            _vl = struct.unpack_from("<H", e01, _p - 2)[0]
+            if not (0 < _vl <= 64) or _p + _vl > len(e01):
+                continue
             try:
-                _vendor = aoi_record[0xA8:0xA8 + vlen].decode("utf-8")
+                _vendor = e01[_p:_p + _vl].decode("utf-8")
             except UnicodeDecodeError:
-                _vendor = ""
-            # Reject the slot if it carries any byte XML forbids / any decode
-            # replacement char (a ciphertext slot that happened to decode).
-            if _vendor.strip() and _xml_sane(_vendor) == _vendor and "�" not in _vendor:
+                continue
+            if (_vendor.strip() and all(0x20 <= ord(c) < 0x7F for c in _vendor)
+                    and _xml_sane(_vendor) == _vendor):
                 vendor = _vendor
+                break
 
         # --- Metadata from large nameless record ---
         self._cur.execute(
