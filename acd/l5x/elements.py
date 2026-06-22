@@ -4039,18 +4039,19 @@ class ModuleBuilder(L5xElementBuilder):
         slot          = struct.unpack("<I", e1[0x1C:0x20])[0]
 
         # Genuine drive-peripheral expansion cards are hash-named ("?") AND carry a
-        # PowerFlex drive product_type: 142/143 (PF753/755) export as ProductType=0
-        # ProductCode=28 (RHINOBP-DRIVE-PERIPHERAL-MODULE); 150/127 (PF525 and its
-        # DSI-port variant) export as ProductCode=29 (DSI-DRIVE-PERIPHERAL-MODULE).
-        # CATALOG_NUMBERS maps (vendor,0,28)/(vendor,0,29) so the lookup below
-        # resolves. Across the pool these four product_types account for every
-        # reference drive peripheral (99 RHINOBP + 36 DSI) with no false positives.
-        # Ordinary hash-named modules (unresolved 1756/1769 I/O cards, PT 7/10) keep
-        # their genuine PT/PC and real catalog -- the previous unconditional rewrite
-        # corrupted those into RHINOBP-DRIVE-PERIPHERAL-MODULE.
+        # PowerFlex drive product_type. The RHINOBP families (142/143/123, PF753/755)
+        # export as ProductType=0 ProductCode=28 (RHINOBP-DRIVE-PERIPHERAL-MODULE);
+        # the DSI families (150/127/151, PF525 and its DSI-port variants) export as
+        # ProductCode=29 (DSI-DRIVE-PERIPHERAL-MODULE). CATALOG_NUMBERS maps
+        # (vendor,0,28)/(vendor,0,29) so the lookup below resolves. Validated against
+        # the reference: every hash-named vendor=1 module with one of these six
+        # product types is a peripheral (28 of them carry PT 123/151 and none of those
+        # carry a drive ProductCode), and the count matches the reference peripheral
+        # set exactly -- no false positives. Ordinary hash-named modules (unresolved
+        # 1756/1769 I/O cards, PT 7/10) keep their genuine PT/PC and real catalog.
         ud_vendor = ud_product_type = ud_product_code = ud_major = ud_minor = None
         shutdown_parent_on_fault = None
-        if name == "?" and vendor == 1 and product_type in (142, 143, 150, 127):
+        if name == "?" and vendor == 1 and product_type in (142, 143, 123, 150, 127, 151):
             # The reference re-labels these as a generic drive-peripheral catalog
             # and preserves the peripheral's own identity in the UserDefined*
             # attributes (verified equal to the pre-display identity record fields).
@@ -4062,12 +4063,11 @@ class ModuleBuilder(L5xElementBuilder):
             ud_major = major
             ud_minor = minor
             shutdown_parent_on_fault = "false"
-            product_code = 29 if product_type in (150, 127) else 28
+            product_code = 29 if product_type in (150, 127, 151) else 28
             product_type = 0
             # The reference exports these drive-peripheral modules with a fixed
             # Major/Minor of 1/1 (the peripheral's own firmware revision in the
-            # identity record is not surfaced); verified 135/135 (99 RHINOBP +
-            # 36 DSI) pool-wide.
+            # identity record is not surfaced); verified pool-wide.
             major = 1
             minor = 1
 
