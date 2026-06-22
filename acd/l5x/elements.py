@@ -3784,7 +3784,23 @@ class ModuleBuilder(L5xElementBuilder):
         dropped. Returns None when the blob has no ports.
         """
         import re as _re
-        type_map = {"EN": "Ethernet"}
+        # Port Type is stored as a short code the reference expands to a full name.
+        # Only codes the reference NEVER emits verbatim are expanded here (verified
+        # pool-wide: 0 reference ports carry any of these short codes, and each maps
+        # to exactly one full name). Codes the reference DOES keep verbatim -- e.g.
+        # "PointIO" and "RhinoBP", which are correct on hundreds of ports and only
+        # context-dependently expand elsewhere -- are deliberately NOT mapped so the
+        # already-correct ports are untouched.
+        type_map = {
+            "EN": "Ethernet",
+            "Cpt32EN": "CompactLogixL32Ethernet",
+            "Cpt35EN": "CompactLogixL35Ethernet",
+            "Cpt32E": "CompactLogixL32EController",
+            "Cpt35E": "CompactLogixL35Controller",
+            "CptVA": "CompactVirtualAdapter",
+            "DN": "DeviceNet",
+            "CN": "ControlNet",
+        }
         ports = []
         for m in _re.finditer(r'<Port\b([^>]*?)(/?)>', blob):
             a = dict(_re.findall(r'(\w+)="([^"]*)"', m.group(1)))
