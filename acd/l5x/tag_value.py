@@ -1160,7 +1160,10 @@ def _decorated_member(name: str, mdt: str, off: int, bit, dims,
         if byte >= len(image):
             return None
         v = (image[byte] >> (b % 8)) & 1
-        return f'<DataValueMember Name="{name}" DataType="BOOL" Value="{v}"/>'
+        # A standalone (byte-aligned) BOOL member carries Radix="Decimal"; a BOOL
+        # packed into a backing byte (an explicit bit index) carries no Radix.
+        ra = ' Radix="Decimal"' if bit is None else ""
+        return f'<DataValueMember Name="{name}" DataType="BOOL"{ra} Value="{v}"/>'
 
     # ---- atomic scalar member -------------------------------------------- #
     if mdt in _ATOMIC:

@@ -307,10 +307,12 @@ _BUILTIN_STRUCT_MEMBERS: Dict[str, List[Tuple[str, str]]] = {
 # Decorated tree is a fabrication for them. (MOTION_INSTRUCTION is NOT a motion
 # axis -- it keeps its Decorated <Structure> like any UDT.)
 _SKIP_DECORATED: set = {
-    "ALARM_DIGITAL", "MESSAGE", "PID_ENHANCED",
+    "ALARM_DIGITAL", "MESSAGE",
     "AXIS_SERVO", "AXIS_SERVO_DRIVE", "AXIS_CIP_DRIVE", "AXIS_VIRTUAL",
     "AXIS_GENERIC", "AXIS_CONSUMED", "MOTION_GROUP",
 }
+# PID_ENHANCED is NOT skipped: OEM renders it like any predefined struct, a value
+# block (L5K / raw-hex) plus a Decorated <Structure> of its members.
 
 # A valid L5X tag-comment Operand is a member/bit/index path relative to the tag:
 # it starts with '.' or '[' and contains only identifier/index characters. Module
