@@ -4209,16 +4209,23 @@ class ModuleBuilder(L5xElementBuilder):
             for _k in ("_connections_signature", "_connections_signature_ts"):
                 if _k in dec:
                     c[_k] = dec[_k]
-            # Auto-named raw connections (comp_name "_<pathhex>", which carry a
-            # Format attribute instead) do not render the per-connection attrs.
+            # Per-connection data-driven / safety attributes. Auto-named raw
+            # connections (comp_name "_<pathhex>") carry the same
+            # ConnectionPath/Priority/connection-type/timing attributes in the
+            # reference; only their InputTagSuffix/OutputTagSuffix follow a
+            # per-module backing-tag rule the path decode does not capture (the
+            # path-instance suffix heuristic mis-resolves them), so those two are
+            # withheld for auto-named connections rather than emitted with a wrong
+            # value.
+            _modern_keys = ["Priority", "InputConnectionType", "InputProductionTrigger",
+                            "ConnectionPath", "TimeoutMultiplier", "NetworkDelayMultiplier",
+                            "MaxObservedNetworkDelay", "ReactionTimeLimit",
+                            "SafetySignature", "SafetySignatureTimestamp"]
             if not conn_name.startswith("_"):
-                for _k in ("Priority", "InputConnectionType", "InputProductionTrigger",
-                           "ConnectionPath", "InputTagSuffix", "OutputTagSuffix",
-                           "TimeoutMultiplier", "NetworkDelayMultiplier",
-                           "MaxObservedNetworkDelay", "ReactionTimeLimit",
-                           "SafetySignature", "SafetySignatureTimestamp"):
-                    if _k in dec:
-                        c[_k] = dec[_k]
+                _modern_keys += ["InputTagSuffix", "OutputTagSuffix"]
+            for _k in _modern_keys:
+                if _k in dec:
+                    c[_k] = dec[_k]
             fmt = dec["fmt"]
             direct = fmt == _CONN_FMT_OUTPUT and generic_drive
             if fmt in (48, 49) or direct:
@@ -4296,6 +4303,33 @@ class ModuleBuilder(L5xElementBuilder):
             status_inner = entry.get("S")
             rack_has_input = bool(entry.get("has_I"))
             rack_has_output = bool(entry.get("has_O"))
+
+            # InputTagSuffix / OutputTagSuffix for the module's auto-named data-driven
+            # connections: the path decode cannot resolve them, but the module's own
+            # backing I/O tag suffixes can. The captured tag suffixes, sorted, map 1:1
+            # in connection order to the auto-named data-driven connections (validated
+            # against the reference: on every such module the ordered connection
+            # suffixes equal the sorted backing-tag suffixes). Assigned only when the
+            # counts align, so a partially-captured module under-emits rather than
+            # mislabels.
+            _auto_dd = [cc for cc in connections
+                        if cc["name"].startswith("_") and "ConnectionPath" in cc]
+            if _auto_dd:
+                _in_sfx = sorted(k for k in entry if k in ("I", "I1", "I2"))
+                _out_sfx = sorted(k for k in entry if k in ("O", "O1", "O2"))
+                # Order connections by name (the path hex, which encodes the
+                # ascending assembly connection points) so the I1/I2 numbering lines
+                # up with the reference's, independent of record sequence order.
+                _in_conns = sorted((cc for cc in _auto_dd if cc.get("in_size", 0) > 0),
+                                   key=lambda cc: cc["name"])
+                _out_conns = sorted((cc for cc in _auto_dd if cc.get("out_size", 0) > 0),
+                                    key=lambda cc: cc["name"])
+                if len(_in_conns) == len(_in_sfx):
+                    for cc, sfx in zip(_in_conns, _in_sfx):
+                        cc["InputTagSuffix"] = sfx
+                if len(_out_conns) == len(_out_sfx):
+                    for cc, sfx in zip(_out_conns, _out_sfx):
+                        cc["OutputTagSuffix"] = sfx
 
         # <ConfigData>/<ConfigScript>: a module with a config image but NO controller
         # :C tag (mutually exclusive with ConfigTag) carries the image as a raw
