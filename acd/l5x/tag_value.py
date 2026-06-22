@@ -747,8 +747,6 @@ def _decorated_scalar(dt_base: str, value_text: str,
                       radix: Optional[str] = None) -> str:
     eff = radix if (radix and radix not in ("NullType", "General")) \
         else _RADIX.get(dt_base, "Decimal")
-    if dt_base == "BOOL":
-        return f'<DataValue DataType="BOOL" Radix="Decimal" Value="{value_text}"/>'
     return f'<DataValue DataType="{dt_base}" Radix="{eff}" Value="{value_text}"/>'
 
 
@@ -804,11 +802,8 @@ def render_decorated(dt_base: str, dimensions: Optional[str], image: bytes,
 
     if dt_base in _ATOMIC:
         width, fmt = _ATOMIC[dt_base]
-        if dt_base in ("BOOL", "BIT"):
-            eff = "Decimal"
-        else:
-            eff = radix if (radix and radix not in ("NullType", "General")) \
-                else _RADIX.get(dt_base, "Decimal")
+        eff = radix if (radix and radix not in ("NullType", "General")) \
+            else _RADIX.get(dt_base, "Decimal")
 
         def _val(off: int) -> str:
             if dt_base in ("REAL", "LREAL"):

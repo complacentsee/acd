@@ -530,7 +530,8 @@ def _build_default_data(data_type: Union[str, None],
                         value_bytes: Union[bytes, None],
                         short_header: bool,
                         data_types_map: Dict[str, "DataType"],
-                        taginfo_layout: Dict[str, object]) -> str:
+                        taginfo_layout: Dict[str, object],
+                        radix: Union[str, None] = None) -> str:
     """Build the AOI-scoped <DefaultData> child pair for a Parameter/LocalTag.
 
     OEM emits, on every value-bearing AOI Parameter (Input/Output) and every
@@ -600,13 +601,13 @@ def _build_default_data(data_type: Union[str, None],
                     try:
                         decorated_inner = _tag_value.render_decorated_layout(
                             dt_decorated, dimensions, value_bytes,
-                            taginfo_layout, data_types_map
+                            taginfo_layout, data_types_map, radix=radix
                         )
                     except Exception:
                         decorated_inner = None
                 if decorated_inner is None:
                     decorated_inner = _tag_value.render_decorated(
-                        dt_base, dimensions, value_bytes, data_types_map
+                        dt_base, dimensions, value_bytes, data_types_map, radix=radix
                     )
 
             if short_header:
@@ -649,17 +650,35 @@ def _build_default_data(data_type: Union[str, None],
                     l5k_zero = _PRIMITIVE_L5K_ZERO[dt_base]
                     first = f'<DefaultData Format="L5K">\n<![CDATA[{l5k_zero}]]>\n</DefaultData>'
                 ok_first = True
-                # Scalar primitives: build the matching single DataValue.
-                radix = _PRIMITIVE_RADIX.get(dt_base)
-                zero = _PRIMITIVE_DECORATED_ZERO.get(dt_base)
+                # Scalar primitives: build the matching single DataValue. The owner
+                # Parameter/LocalTag radix (when set to a non-default) overrides the
+                # per-type default, and the zero value is re-formatted to match it
+                # (e.g. Hex -> 16#0000), exactly as Logix renders the DefaultData.
                 if dt_base in ("BOOL", "BIT"):
-                    decorated_inner = '<DataValue DataType="BOOL" Radix="Decimal" Value="0"/>'
-                elif radix is not None and zero is not None:
+                    eff = (radix if (radix and radix not in ("NullType", "General"))
+                           else "Decimal")
                     decorated_inner = (
-                        f'<DataValue DataType="{dt_base}" Radix="{radix}" Value="{zero}"/>'
+                        f'<DataValue DataType="{dt_base}" Radix="{eff}" Value="0"/>'
                     )
                 else:
-                    decorated_inner = None
+                    eff = (radix if (radix and radix not in
+                                     (None, "Decimal", "NullType", "General"))
+                           else _PRIMITIVE_RADIX.get(dt_base))
+                    width = _PRIMITIVE_BYTE_WIDTH.get(dt_base, 0)
+                    if eff is None or width <= 0:
+                        decorated_inner = None
+                    elif eff == "Float":
+                        zero = _PRIMITIVE_DECORATED_ZERO.get(dt_base)
+                        decorated_inner = (
+                            f'<DataValue DataType="{dt_base}" Radix="Float" '
+                            f'Value="{zero}"/>' if zero is not None else None
+                        )
+                    else:
+                        val = _tag_value._format_int_radix(dt_base, 0, width, eff)
+                        decorated_inner = (
+                            f'<DataValue DataType="{dt_base}" Radix="{eff}" '
+                            f'Value="{val}"/>'
+                        )
             else:
                 # Array / struct with NO value image: OEM emits the pair
                 #   <DefaultData Format="L5K"><![CDATA[[0,0,0]]]> + <Decorated>...
@@ -2074,6 +2093,7 @@ class LocalTag(L5xElement):
         dd_xml = _build_default_data(
             self.data_type, self.dimensions, self._value_bytes,
             self._short_header, self._data_types_map, self._taginfo_layout,
+            radix=self.radix,
         )
         if not desc_xml and not dd_xml:
             return base
@@ -2129,6 +2149,7 @@ class Parameter(L5xElement):
             dd_xml = _build_default_data(
                 self.data_type, self.dimensions, self._value_bytes,
                 self._short_header, self._data_types_map, self._taginfo_layout,
+                radix=self.radix,
             )
         if not desc_xml and not dd_xml:
             return base
