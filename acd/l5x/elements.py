@@ -2756,6 +2756,13 @@ class Controller(L5xElement):
     compatibility_mode: Union[str, None] = field(default=None)
     ethernet_ip_mode: Union[str, None] = field(default=None)
     power_loss_program: Union[str, None] = field(default=None)
+    # RedundancyInfo pad percentages, read from the controller-properties blob
+    # (ext-attr 0x001): IOMemoryPadPercentage = u16 @ offset 16, DataTablePadPercentage
+    # = u16 @ offset 18. Both None on the 5x80 generation (which omits the attributes).
+    # Underscore-prefixed so the base to_xml() does not serialise them as <Controller>
+    # attributes; they are rendered onto the <RedundancyInfo> child instead.
+    _io_memory_pad_percentage: Union[str, None] = field(default=None)
+    _data_table_pad_percentage: Union[str, None] = field(default=None)
 
     def __post_init__(self):
         super().__post_init__()
@@ -2788,10 +2795,18 @@ class Controller(L5xElement):
             if self._description else ""
         )
         open_tag = open_tag + desc_xml
-        # RedundancyInfo: Enabled comes from binary; no pad attributes in golden.
+        # RedundancyInfo: Enabled from the binary; the pad percentages are read from
+        # the controller-properties blob and emitted only for the controller
+        # generations that carry them (the 5x80 family omits both).
         redundancy_enabled_str = "true" if self._redundancy_enabled else "false"
+        pad_attrs = ""
+        if self._io_memory_pad_percentage is not None:
+            pad_attrs += f' IOMemoryPadPercentage="{self._io_memory_pad_percentage}"'
+        if self._data_table_pad_percentage is not None:
+            pad_attrs += f' DataTablePadPercentage="{self._data_table_pad_percentage}"'
         redundancy_info = (
-            f'<RedundancyInfo Enabled="{redundancy_enabled_str}" KeepTestEditsOnSwitchOver="false"/>'
+            f'<RedundancyInfo Enabled="{redundancy_enabled_str}" '
+            f'KeepTestEditsOnSwitchOver="false"{pad_attrs}/>'
         )
         return (
             open_tag
@@ -7594,9 +7609,16 @@ class ControllerBuilder(L5xElementBuilder):
         _ctlblob = _ctlattrs.get(0x1, b"")
         # The continuous-task slice is carried by classic controllers, marked by
         # blob[16]==0x5a; 5x80 controllers (blob[16]==0) carry EtherNetIPMode instead.
+        io_memory_pad_percentage = None
+        data_table_pad_percentage = None
         if len(_ctlblob) > 25 and _ctlblob[16] == 0x5A:
             time_slice = str(struct.unpack_from("<H", _ctlblob, 4)[0])
             share_unused_time_slice = str(_ctlblob[25] & 1)
+            # RedundancyInfo pad percentages live just past the classic marker:
+            # IOMemoryPadPercentage = u16 @ 16 (the 0x5A marker reads 90), and
+            # DataTablePadPercentage = u16 @ 18 (a per-controller value, 50 or 0).
+            io_memory_pad_percentage = str(struct.unpack_from("<H", _ctlblob, 16)[0])
+            data_table_pad_percentage = str(struct.unpack_from("<H", _ctlblob, 18)[0])
         # CompatibilityMode "V20.01" marks the pre-V21 classic save format, whose
         # controller-properties blob is exactly 62 bytes.
         if len(_ctlblob) == 62:
@@ -8364,6 +8386,8 @@ class ControllerBuilder(L5xElementBuilder):
             compatibility_mode=compatibility_mode,
             ethernet_ip_mode=ethernet_ip_mode,
             power_loss_program=power_loss_program,
+            _io_memory_pad_percentage=io_memory_pad_percentage,
+            _data_table_pad_percentage=data_table_pad_percentage,
         )
 
 
