@@ -7705,6 +7705,20 @@ class ControllerBuilder(L5xElementBuilder):
                 bytes(_ctlrow[0]), self._short_header, full=True) if _ctlrow else {})
         except Exception:
             _ctlattrs = {}
+        # On a source-protected controller the ext-attr tail is encrypted, so the
+        # kaitai extended_records are empty and the SFC fields above came back blank.
+        # The decrypted attribute table still carries them -- recover from there.
+        def _ct_utf16(key):
+            raw = _ctlattrs.get(key)
+            if not raw or len(raw) < 2:
+                return ""
+            return raw.decode("utf-16-le", errors="replace").rstrip("\x00")
+        if not sfc_execution_control:
+            sfc_execution_control = _ct_utf16(0x6F)
+        if not sfc_restart_position:
+            sfc_restart_position = _ct_utf16(0x70)
+        if not sfc_last_scan:
+            sfc_last_scan = _ct_utf16(0x71)
         _ctlblob = _ctlattrs.get(0x1, b"")
         # The continuous-task slice is carried by classic controllers, marked by
         # blob[16]==0x5a; 5x80 controllers (blob[16]==0) carry EtherNetIPMode instead.
