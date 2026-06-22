@@ -2824,6 +2824,9 @@ class Controller(L5xElement):
     # Pre-rendered attribute string for the <SafetyInfo> open tag (recovered from the
     # SafetyController record); "" on a non-safety project -> empty <SafetyInfo/>.
     _safety_info_attrs: str = field(default="")
+    # Pre-rendered <AlarmDefinitions> element (per-datatype member alarm
+    # definitions); "" when the project defines none.
+    _alarm_definitions: str = field(default="")
 
     def __post_init__(self):
         super().__post_init__()
@@ -2875,6 +2878,7 @@ class Controller(L5xElement):
             + redundancy_info
             + '<Security Code="0" ChangesToDetect="16#ffff_ffff_ffff_ffff"/>'
             + self._safety_info_xml()
+            + self._alarm_definitions
             + f'<CST MasterID="{self._cst_master_id}"/>'
             + '<WallClockTime LocalTimeAdjustment="0" TimeZone="0"/>'
             + '<Trends/>'
@@ -7321,6 +7325,142 @@ def _safety_info_attr_string(cur, short_header):
                    for k in order if k in attrs)
 
 
+def _alarm_definitions_xml(cur, short_header):
+    """The <AlarmDefinitions> element (per-datatype member alarm definitions),
+    recovered from the _AD<hex>_<member> children of the controller's
+    RxAlarmConditionDefinitionCollection; "" when the project defines none (so
+    nothing is emitted -> 0 false-positive). Each member's fixed fields come from
+    the raw comps record; Input (attr 0x6a) and AssocTag1 (attr 0x66) from the
+    decrypted ext-attrs, with embedded @hex@ object_id tokens resolved to names and
+    the owning-datatype prefix stripped. ADM message / ADC alarm-class text join via
+    the comments table (record_type 4, keyed by the record's u32 @ 0x0a)."""
+    row = cur.execute(
+        "SELECT object_id FROM comps WHERE comp_name='RxAlarmConditionDefinitionCollection'"
+    ).fetchone()
+    if not row:
+        return ""
+    coll = row[0]
+    oid2name = {o: n for o, n in cur.execute(
+        "SELECT object_id, comp_name FROM comps").fetchall()}
+
+    def resolve(s):
+        owner = [None]
+        out = []
+        for i, part in enumerate(re.split(r'@([0-9A-Fa-f]+)@', s)):
+            if i % 2 == 1:
+                nm = oid2name.get(int(part, 16), "")
+                if owner[0] is None:
+                    owner[0] = nm
+                out.append(nm)
+            else:
+                out.append(part)
+        return "".join(out), owner[0]
+
+    def f32(rec, o):
+        v = struct.unpack_from("<f", rec, o)[0]
+        return f"{v:.1f}" if v == int(v) else repr(v)
+
+    bydt: Dict[str, list] = {}
+    dt_order: List[str] = []
+    for cname, oid, rec in cur.execute(
+            "SELECT comp_name, object_id, record FROM comps WHERE parent_id=? "
+            "ORDER BY seq_number", (coll,)).fetchall():
+        m = re.match(r'_AD[0-9A-Fa-f]{8}_(.+)$', cname)
+        if not m:
+            continue
+        rec = bytes(rec)
+        nlen = struct.unpack_from("<H", rec, 0x5a)[0]
+        nm = rec[0x5c:0x5c + nlen].decode("ascii", "replace")
+        ctlen = struct.unpack_from("<H", rec, 0x84)[0]
+        ct = rec[0x86:0x86 + ctlen].decode("ascii", "replace")
+        cf = cur.execute(
+            "SELECT record FROM comps_full WHERE object_id=?", (oid,)).fetchone()
+        attrs = (CompsRecord.read_value_attrs(bytes(cf[0]), short_header, full=True)
+                 if cf and cf[0] else {})
+        ins = attrs.get(0x6a, b"").decode("utf-16-le", "ignore").split("\x00")[0]
+        inp, ownn = resolve(ins)
+        if ownn and inp.startswith(ownn):
+            inp = inp[len(ownn):]
+        a66 = attrs.get(0x66, b"").decode("utf-16-le", "ignore").split("\x00")[0]
+        assoc = None
+        if a66:
+            ar, _ = resolve(a66)
+            if ownn and ar.startswith(ownn):
+                ar = ar[len(ownn):]
+            assoc = ar if ar else "."
+        flag_a = struct.unpack_from("<H", rec, 0x18e)[0]
+        flag_b = struct.unpack_from("<H", rec, 0x192)[0]
+        jk = struct.unpack_from("<I", rec, 0x0a)[0]
+        adm = adc = None
+        for tr, rs in cur.execute(
+                "SELECT tag_reference, record_string FROM comments "
+                "WHERE parent=? AND record_type=4", (jk,)).fetchall():
+            txt, _ = resolve(rs)
+            if ownn:
+                txt = txt.replace(ownn, "")
+            if tr == "ADM":
+                adm = txt
+            elif tr == "ADC":
+                adc = txt
+        d = {
+            "Name": nm, "Input": inp, "ConditionType": ct,
+            "Limit": f32(rec, 0x194),
+            "Severity": str(struct.unpack_from("<H", rec, 0x198)[0]),
+            "OnDelay": str(struct.unpack_from("<I", rec, 0x19c)[0]),
+            "OffDelay": str(struct.unpack_from("<I", rec, 0x1a0)[0]),
+            "ShelveDuration": str(struct.unpack_from("<I", rec, 0x1a4)[0]),
+            "MaxShelveDuration": str(struct.unpack_from("<I", rec, 0x1a8)[0]),
+            "Deadband": f32(rec, 0x1ac),
+            "Required": "true" if flag_b & 1 else "false",
+            "AlarmSetOperIncluded": "true" if flag_b & 2 else "false",
+            "AlarmSetRollupIncluded": "true" if flag_b & 4 else "false",
+            "AckRequired": "true" if flag_a & 4 else "false",
+            "Latched": "true" if flag_a & 8 else "false",
+            "AssocTag1": assoc, "_adm": adm, "_adc": adc,
+        }
+        if ownn not in bydt:
+            bydt[ownn] = []
+            dt_order.append(ownn)
+        bydt[ownn].append(d)
+    if not dt_order:
+        return ""
+
+    def esc(v):
+        return html.escape(v, quote=True)
+    parts = ["<AlarmDefinitions>"]
+    for dt in dt_order:
+        parts.append(f'<DatatypeAlarmDefinition Name="{esc(dt)}">')
+        for c in bydt[dt]:
+            a = [f'Name="{esc(c["Name"])}"', f'Input="{esc(c["Input"])}"']
+            for k in ("ConditionType", "Limit", "Severity", "OnDelay", "OffDelay",
+                      "ShelveDuration", "MaxShelveDuration", "Deadband", "Required",
+                      "AlarmSetOperIncluded", "AlarmSetRollupIncluded", "AckRequired",
+                      "Latched"):
+                a.append(f'{k}="{esc(c[k])}"')
+            a.append('EvaluationPeriod="500 millisecond"')
+            a.append('Expression="= 1"')
+            if c["AssocTag1"] is not None:
+                a.append(f'AssocTag1="{esc(c["AssocTag1"])}"')
+            line = "<MemberAlarmDefinition " + " ".join(a)
+            if c["_adm"] is None and c["_adc"] is None:
+                parts.append(line + "/>")
+            else:
+                parts.append(line + ">")
+                parts.append("<AlarmConfig>")
+                if c["_adm"] is not None:
+                    parts.extend(["<Messages>", '<Message Type="ADM">',
+                                  '<Text Lang="en-US">', f'<![CDATA[{c["_adm"]}]]>',
+                                  "</Text>", "</Message>", "</Messages>"])
+                if c["_adc"] is not None:
+                    parts.extend(["<AlarmClass>", f'<![CDATA[{c["_adc"]}]]>',
+                                  "</AlarmClass>"])
+                parts.append("</AlarmConfig>")
+                parts.append("</MemberAlarmDefinition>")
+        parts.append("</DatatypeAlarmDefinition>")
+    parts.append("</AlarmDefinitions>")
+    return "\n".join(parts)
+
+
 @dataclass
 class ProgramBuilder(L5xElementBuilder):
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
@@ -8895,6 +9035,7 @@ class ControllerBuilder(L5xElementBuilder):
         tag_map_sig = _named_sig(112, "TagMap")
         app_rollup_sig = _named_sig(142, "")
         safety_info_attrs = _safety_info_attr_string(self._cur, self._short_header)
+        alarm_definitions = _alarm_definitions_xml(self._cur, self._short_header)
 
         controller = Controller(
             controller_name,
@@ -8949,6 +9090,7 @@ class ControllerBuilder(L5xElementBuilder):
             _tag_map_signature=tag_map_sig,
             _app_rollup_signature=app_rollup_sig,
             _safety_info_attrs=safety_info_attrs,
+            _alarm_definitions=alarm_definitions,
         )
         # Controller-scoped <Tags> safety signature (separate from the AOI-section one).
         if _ctrl_tags_sig:
