@@ -8449,7 +8449,9 @@ class ProjectBuilder:
                 software_revision = "33.01"
 
         target_type = "Controller"
-        contains_context = "false"
+        # Full controller-project exports (TargetType="Controller") always carry the
+        # surrounding context; the reference emits "true" on every such export.
+        contains_context = "true"
         now = datetime.now()
         export_date = now.strftime("%a %b %d %H:%M:%S %Y")
         export_options = (
