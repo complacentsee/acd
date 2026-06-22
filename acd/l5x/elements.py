@@ -8270,7 +8270,15 @@ class ControllerBuilder(L5xElementBuilder):
         # save with an unknown catalog is treated as 5x80 rather than dropping a
         # value the reference keeps.
         _modern_unknown_cpu = processor_type is None and self._acd_major >= 32
-        auto_diags = "false" if (is_5x80 or _modern_unknown_cpu) else None
+        # AutoDiagsEnabled is a real per-controller flag: bit 0 of the final byte
+        # (offset 135) of the 5x80 controller-properties blob. Validated 16 true /
+        # 10 false vs OEM, 0 mismatch. WebServerEnabled is NOT carried in this blob
+        # (no bit tracks it) -- it lives in the embedded Ethernet port config -- so it
+        # stays a conservative "false" until that source is decoded.
+        if is_5x80 or _modern_unknown_cpu:
+            auto_diags = "true" if (len(_ctlblob) > 135 and (_ctlblob[135] & 1)) else "false"
+        else:
+            auto_diags = None
         web_server = "false" if (is_5x80 or _modern_unknown_cpu) else None
 
         # <AddOnInstructionDefinitions> safety signature: a safety-signed project
