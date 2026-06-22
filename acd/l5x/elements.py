@@ -2790,6 +2790,8 @@ class Controller(L5xElement):
     _ts_ptp_enable: str = field(default="true")
     _ts_priority1: str = field(default="128")
     _ts_priority2: str = field(default="128")
+    # <CST MasterID>, read from the controller's CST config record. Default "0".
+    _cst_master_id: str = field(default="0")
 
     def __post_init__(self):
         super().__post_init__()
@@ -2841,7 +2843,7 @@ class Controller(L5xElement):
             + redundancy_info
             + '<Security Code="0" ChangesToDetect="16#ffff_ffff_ffff_ffff"/>'
             + '<SafetyInfo/>'
-            + '<CST MasterID="0"/>'
+            + f'<CST MasterID="{self._cst_master_id}"/>'
             + '<WallClockTime LocalTimeAdjustment="0" TimeZone="0"/>'
             + '<Trends/>'
             + ('<DataLogs/>' if self._emit_data_logs else '')
@@ -7747,25 +7749,35 @@ class ControllerBuilder(L5xElementBuilder):
         # 272/273. Validated against the reference (115/115 records: PTPEnable 0
         # mismatch, priorities byte-exact). Defaults stay true/128/128 when absent.
         ts_ptp_enable, ts_priority1, ts_priority2 = "true", "128", "128"
-        try:
+        cst_master_id = "0"
+
+        def _rcc_attr(child):
             _rcc = self._cur.execute(
                 "SELECT object_id FROM comps WHERE parent_id=? AND "
                 "comp_name='RxControllerCollection'", (self._object_id,)).fetchone()
-            if _rcc:
-                _tsr = self._cur.execute(
-                    "SELECT object_id FROM comps WHERE parent_id=? AND "
-                    "comp_name='TimeSynchronize'", (_rcc[0],)).fetchone()
-                if _tsr:
-                    _tcf = self._cur.execute(
-                        "SELECT record FROM comps_full WHERE object_id=?",
-                        (_tsr[0],)).fetchone()
-                    if _tcf and _tcf[0]:
-                        _tb = CompsRecord.read_value_attrs(
-                            bytes(_tcf[0]), self._short_header, full=True).get(0x1, b"")
-                        if len(_tb) > 273:
-                            ts_ptp_enable = "true" if (_tb[0] & 1) else "false"
-                            ts_priority1 = str(_tb[272])
-                            ts_priority2 = str(_tb[273])
+            if not _rcc:
+                return b""
+            _r = self._cur.execute(
+                "SELECT object_id FROM comps WHERE parent_id=? AND comp_name=?",
+                (_rcc[0], child)).fetchone()
+            if not _r:
+                return b""
+            _cf = self._cur.execute(
+                "SELECT record FROM comps_full WHERE object_id=?", (_r[0],)).fetchone()
+            if not _cf or not _cf[0]:
+                return b""
+            return CompsRecord.read_value_attrs(
+                bytes(_cf[0]), self._short_header, full=True).get(0x1, b"")
+        try:
+            _tb = _rcc_attr("TimeSynchronize")
+            if len(_tb) > 273:
+                ts_ptp_enable = "true" if (_tb[0] & 1) else "false"
+                ts_priority1 = str(_tb[272])
+                ts_priority2 = str(_tb[273])
+            # CST MasterID = u16 @ offset 14 of the CST record's 0x1 attribute.
+            _cb = _rcc_attr("CST")
+            if len(_cb) >= 16:
+                cst_master_id = str(struct.unpack_from("<H", _cb, 14)[0])
         except Exception:
             pass
 
@@ -8540,6 +8552,7 @@ class ControllerBuilder(L5xElementBuilder):
             _ts_ptp_enable=ts_ptp_enable,
             _ts_priority1=ts_priority1,
             _ts_priority2=ts_priority2,
+            _cst_master_id=cst_master_id,
         )
 
 
