@@ -3737,20 +3737,39 @@ class ModuleBuilder(L5xElementBuilder):
         coll_oids = [r[0] for r in self._cur.fetchall()]
         for coll_oid in coll_oids:
             self._cur.execute(
-                "SELECT record FROM comps WHERE parent_id=?", (coll_oid,)
+                "SELECT object_id, record FROM comps WHERE parent_id=?", (coll_oid,)
             )
-            for (raw,) in self._cur.fetchall():
+            for (child_oid, raw) in self._cur.fetchall():
                 raw = bytes(raw)
                 if len(raw) < 14:
                     continue
                 if int.from_bytes(raw[12:14], "little") != want:
                     continue
                 xml_start = raw.find(b'<')
-                if xml_start < 0:
-                    continue
-                xml_text = raw[xml_start:].decode("latin-1", errors="replace")
+                xml_text = (raw[xml_start:].decode("latin-1", errors="replace")
+                            if xml_start >= 0 else "")
                 pub_start = xml_text.find("<public>")
                 if pub_start < 0:
+                    # Source-protected modules store the <public> block only in the
+                    # DECRYPTED ext-attr 0x66 image (the raw record body is ciphertext,
+                    # so the plaintext scan above finds nothing). Same decrypt path the
+                    # UserDefinedCatalogNumber recovery uses for these records.
+                    cf = self._cur.execute(
+                        "SELECT record FROM comps_full WHERE object_id=?",
+                        (child_oid,)).fetchone()
+                    if cf and cf[0]:
+                        try:
+                            img = CompsRecord.read_value_attrs(
+                                bytes(cf[0]), self._short_header, full=True).get(0x66, b"")
+                        except Exception:
+                            img = b""
+                        ds = img.find(b'<public>')
+                        if ds >= 0:
+                            after = img[ds + len(b'<public>'):]
+                            mm = _re.search(rb'</pub', after)
+                            return (after[:mm.start()] if mm
+                                    else after.rstrip(b'\x00 \r\n')).decode(
+                                        "latin-1", errors="replace")
                     continue
                 after_pub = xml_text[pub_start + len("<public>"):]
                 end_tag_m = _re.search(r'</pub', after_pub)
