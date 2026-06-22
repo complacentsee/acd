@@ -3380,8 +3380,15 @@ class DataTypeBuilder(L5xElementBuilder):
         if len(member_results) == 1:
             member_collection_id = member_results[0][1]
 
+            # Real datatype members are record_type 256. A re-saved long-header
+            # project can inject phantom record_type 512 records (stray rung-logic
+            # operand fragments) into a member-collection; left in, they shift the
+            # member<->descriptor (BitNumber/DataType/Radix) alignment by one. Filter
+            # them out -- short-header collections carry no such records.
             self._cur.execute(
-                f"SELECT comp_name, object_id, parent_id, seq_number, record FROM comps WHERE parent_id={member_collection_id} ORDER BY seq_number"
+                "SELECT comp_name, object_id, parent_id, seq_number, record FROM comps "
+                f"WHERE parent_id={member_collection_id} AND record_type=256 "
+                "ORDER BY seq_number"
             )
             children_results = self._cur.fetchall()
 
