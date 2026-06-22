@@ -822,6 +822,21 @@ def render_decorated(dt_base: str, dimensions: Optional[str], image: bytes,
             if len(image) < width:
                 return None
             return _decorated_scalar(dt_base, _val(0), eff)
+        # BOOL/BIT array: bit-packed (one bit per element), NOT one byte each, so
+        # a 32-element array occupies 4 bytes. Element i = bit (i & 7) of byte i>>3,
+        # LSB-first; Radix is always Decimal.
+        if dt_base in ("BOOL", "BIT"):
+            need = (total + 7) // 8
+            if len(image) < need:
+                return None
+            belems = [
+                f'<Element Index="{_index_str(i, dim_parts)}" '
+                f'Value="{(image[i >> 3] >> (i & 7)) & 1}"/>'
+                for i in range(total)
+            ]
+            dim_str = ",".join(str(d) for d in dim_parts)
+            return (f'<Array DataType="{dt_base}" Dimensions="{dim_str}" '
+                    f'Radix="Decimal">{"".join(belems)}</Array>')
         # atomic array
         elems = []
         for i in range(total):
