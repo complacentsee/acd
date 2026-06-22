@@ -8329,15 +8329,26 @@ class ControllerBuilder(L5xElementBuilder):
             major_rev = "0"
             minor_rev = "0"
 
-        # CommPath: combine the stored path prefix (ends with "\") with the controller
-        # module's backplane slot number (e.g. "EthernetModule\192.168.1.10\Backplane\4").
+        # CommPath: the complete path string is stored in ext-attr 0x06A and already
+        # includes the trailing backplane slot / address segment. Read the
+        # untruncated value from the decrypted attribute table and use it verbatim --
+        # the kaitai / last-attribute reads above drop its final character (then the
+        # slot was appended back, which only matched when the dropped character
+        # happened to equal the slot). Fall back to the old prefix+slot form when the
+        # full attribute is unavailable.
         comm_path: Union[str, None] = None
         if _comm_path_prefix is not None:
             _ctrl_slot = next(
                 (m._slot for m in modules if m._is_root), None
             )
             if _ctrl_slot is not None:
-                comm_path = _comm_path_prefix + str(_ctrl_slot)
+                # Same presence as before (a stored prefix + a root slot); only the
+                # value source changes to the untruncated 0x06A attribute.
+                _cp_full = _ctlattrs.get(0x06A)
+                comm_path = (
+                    _cp_full.decode("utf-16-le", errors="replace").rstrip("\x00")
+                    if _cp_full else _comm_path_prefix + str(_ctrl_slot)
+                )
 
         # Controller project settings that Studio only writes for certain
         # controller generations / save versions. Emitting them unconditionally
