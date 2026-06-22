@@ -384,7 +384,10 @@ def _atomic_value_decorated(dt: str, image: bytes, offset: int) -> Optional[str]
 def _dims_total(dimensions: Optional[str]) -> Tuple[int, List[int]]:
     if not dimensions:
         return 0, []
-    parts = [int(d) for d in dimensions.split(",") if d.strip().lstrip("-").isdigit()]
+    # The Dimensions string may be space-separated (tag attribute form) or
+    # comma-separated (AOI param/local form); accept either.
+    parts = [int(d) for d in dimensions.replace(",", " ").split()
+             if d.lstrip("-").isdigit()]
     total = 1
     for d in parts:
         total *= d

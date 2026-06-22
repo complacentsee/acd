@@ -460,8 +460,11 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
             return ""
         body = f'<Structure DataType="{dt_base}">{inner}</Structure>'
     else:
-        # Array tag: parse dimensions (up to 3D, comma-separated)
-        dim_parts = [int(d) for d in dimensions.split(",") if d.strip().isdigit()]
+        # Array tag: parse dimensions (up to 3D). The tag-level Dimensions attribute
+        # is space-separated (Logix convention) while AOI param/local dims may still
+        # arrive comma-separated, so accept either separator.
+        dim_parts = [int(d) for d in re.split(r"[,\s]+", dimensions.strip())
+                     if d.strip().isdigit()]
         if not dim_parts:
             return ""
 
@@ -5920,7 +5923,8 @@ class TagBuilder(L5xElementBuilder):
                 dim_parts.append(str(r.main_record.dimension_2))
             if r.main_record.dimension_3 != 0:
                 dim_parts.append(str(r.main_record.dimension_3))
-            dimensions = ",".join(dim_parts) if dim_parts else None
+            # The Dimensions attribute is space-separated (Logix convention).
+            dimensions = " ".join(dim_parts) if dim_parts else None
             value_bytes, value_type_code = (
                 (None, 0) if (alias_for or suppress_value)
                 else self._read_tag_value(r.main_record.data_table_instance)
@@ -5955,7 +5959,8 @@ class TagBuilder(L5xElementBuilder):
             dim_parts.append(str(r.main_record.dimension_2))
         if r.main_record.dimension_3 != 0:
             dim_parts.append(str(r.main_record.dimension_3))
-        dimensions = ",".join(dim_parts) if dim_parts else None
+        # The Dimensions attribute is space-separated (Logix convention).
+        dimensions = " ".join(dim_parts) if dim_parts else None
         value_bytes, value_type_code = (
             (None, 0) if (alias_for or suppress_value)
             else self._read_tag_value(r.main_record.data_table_instance)
