@@ -284,6 +284,17 @@ class ExportL5x:
                 rung_name_lookup = {**name_lookup, **v21_map}
                 log.info("Built V21 rung name map: {} entries", len(v21_map))
 
+        # A device-map tag is stored under RxTagCollection with a "__Map:" prefix
+        # (an internal mirror of an RxMapDeviceCollection entry). A rung references
+        # such a tag by object id, but the reference renders the bare name -- the
+        # "__Map:" prefix never appears in reference output -- so strip it from the
+        # rung name resolution.
+        rung_name_lookup = {
+            oid: (nm[len("__Map:"):] if isinstance(nm, str)
+                  and nm.startswith("__Map:") else nm)
+            for oid, nm in rung_name_lookup.items()
+        }
+
         log.info(
             "Getting records from ACD SbRegion file and storing in sqllite database"
         )
