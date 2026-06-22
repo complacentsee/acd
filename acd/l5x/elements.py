@@ -2805,6 +2805,13 @@ class Controller(L5xElement):
     _ts_priority2: str = field(default="128")
     # <CST MasterID>, read from the controller's CST config record. Default "0".
     _cst_master_id: str = field(default="0")
+    # The controller-level safety signatures rendered as <SafetyInfo> children, each a
+    # (signature, timestamp) pair or None. Populated only on safety-signed projects;
+    # all None -> <SafetyInfo/> is emitted as before.
+    _root_signature: Union[tuple, None] = field(default=None)
+    _ctrl_attr_signature: Union[tuple, None] = field(default=None)
+    _tag_map_signature: Union[tuple, None] = field(default=None)
+    _app_rollup_signature: Union[tuple, None] = field(default=None)
 
     def __post_init__(self):
         super().__post_init__()
@@ -2855,7 +2862,7 @@ class Controller(L5xElement):
             + inner
             + redundancy_info
             + '<Security Code="0" ChangesToDetect="16#ffff_ffff_ffff_ffff"/>'
-            + '<SafetyInfo/>'
+            + self._safety_info_xml()
             + f'<CST MasterID="{self._cst_master_id}"/>'
             + '<WallClockTime LocalTimeAdjustment="0" TimeZone="0"/>'
             + '<Trends/>'
@@ -2864,6 +2871,23 @@ class Controller(L5xElement):
                f'Priority2="{self._ts_priority2}" PTPEnable="{self._ts_ptp_enable}"/>')
             + '</Controller>'
         )
+
+    def _safety_info_xml(self) -> str:
+        """The <SafetyInfo> element. Renders the controller-level safety-signature
+        children on a safety-signed project, in the reference's sibling order; an
+        unsigned project keeps the empty self-closing form."""
+        children = ""
+        for tag, pair in (
+            ("RootSignature", self._root_signature),
+            ("ControllerAttributesSignature", self._ctrl_attr_signature),
+            ("SafetyTagMapSignature", self._tag_map_signature),
+            ("ApplicationRollupSignature", self._app_rollup_signature),
+        ):
+            if pair and pair[0]:
+                ts = (f' Timestamp="{html.escape(pair[1], quote=True)}"'
+                      if pair[1] else "")
+                children += f'<{tag} Signature="{pair[0]}"{ts}/>'
+        return f'<SafetyInfo>{children}</SafetyInfo>' if children else '<SafetyInfo/>'
 
 
 # Matches an emitted tag-value Format="L5K" <Data> block: group 1 = the open tag
@@ -8698,6 +8722,26 @@ class ControllerBuilder(L5xElementBuilder):
         except Exception:
             pass
 
+        # Controller-level <SafetyInfo> signature children (safety-signed projects
+        # only). The named_safety_signatures table is keyed by (otype, embedded name);
+        # it is empty on unsigned projects, so the lookups return None and nothing is
+        # emitted (0 false-positive). RootSignature and ControllerAttributesSignature
+        # share otype 820 and are split by the name ("OverallSignature" vs none).
+        def _named_sig(_ot, _nm):
+            try:
+                _r = self._cur.execute(
+                    "SELECT signature, timestamp FROM named_safety_signatures "
+                    "WHERE otype=? AND name=?", (_ot, _nm)).fetchone()
+                if _r and _r[0]:
+                    return (_r[0], _r[1])
+            except Exception:
+                pass
+            return None
+        root_sig = _named_sig(820, "OverallSignature")
+        ctrl_attr_sig = _named_sig(820, "")
+        tag_map_sig = _named_sig(112, "TagMap")
+        app_rollup_sig = _named_sig(142, "")
+
         controller = Controller(
             controller_name,
             "Target",
@@ -8746,6 +8790,10 @@ class ControllerBuilder(L5xElementBuilder):
             _ts_priority1=ts_priority1,
             _ts_priority2=ts_priority2,
             _cst_master_id=cst_master_id,
+            _root_signature=root_sig,
+            _ctrl_attr_signature=ctrl_attr_sig,
+            _tag_map_signature=tag_map_sig,
+            _app_rollup_signature=app_rollup_sig,
         )
         # Controller-scoped <Tags> safety signature (separate from the AOI-section one).
         if _ctrl_tags_sig:

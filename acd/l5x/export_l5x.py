@@ -333,10 +333,40 @@ class ExportL5x:
         self._cur.execute(
             "CREATE TABLE connection_signatures(otype int, cid int, disc int, signature text, timestamp text)"
         )
+        # The five controller-level safety signatures (<SafetyInfo> children) use the
+        # SAME GSS records but at controller scope (cid 0/1) and some carry an embedded
+        # NAME after the "GSS" marker (0x13 + NUL-terminated UTF-16): "OverallSignature"
+        # -> RootSignature, "TagMap" -> SafetyTagMapSignature; the no-name ones are
+        # ControllerAttributesSignature (otype 820) and ApplicationRollupSignature
+        # (otype 142). Keyed by (otype, name) so the otype-820 collision between
+        # RootSignature and ControllerAttributesSignature is resolved by the name.
+        self._cur.execute(
+            "CREATE TABLE named_safety_signatures(otype int, name text, signature text, timestamp text)"
+        )
         _sig_needle = "SignatureID\x11GSS\x00".encode("utf-16-le")
         _ts_needle = "Timestamp\x11GSS\x00".encode("utf-16-le")
+        # Same markers without the trailing NUL, so they also match the NAMED
+        # controller-level records (where a 0x13-introduced name follows "GSS").
+        _sig_mark = "SignatureID\x11GSS".encode("utf-16-le")
+        _ts_mark = "Timestamp\x11GSS".encode("utf-16-le")
+        _ts_re = re.compile(rb"\d\d/\d\d/\d{4}, \d\d:\d\d:\d\d\.\d{3} [AP]M")
+
+        def _gss_name(b, p):
+            """Optional 0x13-introduced NUL-terminated UTF-16-LE name at b[p:]; ''
+            if absent. Scan the terminator on a 2-byte boundary."""
+            if b[p:p + 2] != b"\x13\x00":
+                return ""
+            q = i = p + 2
+            while i + 1 < len(b) and b[i:i + 2] != b"\x00\x00":
+                i += 2
+            try:
+                return b[q:i].decode("utf-16-le")
+            except Exception:
+                return ""
+
         _gss: Dict[tuple, list] = {}
         _gss3: Dict[tuple, list] = {}
+        _named: Dict[tuple, list] = {}
         for _rec in comments_db.records.record:
             _buf = bytes(_rec.record.record_buffer)
             if len(_buf) < 16:
@@ -363,12 +393,32 @@ class ExportL5x:
                     _gss3.setdefault(_key3, [None, None])[1] = _ts
                 except UnicodeDecodeError:
                     pass
+            # Controller-level (cid 0/1) signatures, keyed by (otype, name). The hash
+            # is the last 32 bytes (robust whether or not an embedded name shifts the
+            # body); the timestamp is the paired record's ASCII stamp.
+            if _cid in (0, 1) and len(_buf) >= 33:
+                _smi = _buf.find(_sig_mark)
+                if _smi >= 0:
+                    _nm = _gss_name(_buf, _smi + len(_sig_mark))
+                    _hh = _buf[len(_buf) - 33:len(_buf) - 1]
+                    if any(_hh):
+                        _named.setdefault((_otype, _nm), [None, None])[0] = " - ".join(
+                            "%08X" % struct.unpack_from(">I", _hh, _i * 4)[0] for _i in range(8))
+                _tmi = _buf.find(_ts_mark)
+                if _tmi >= 0:
+                    _nm = _gss_name(_buf, _tmi + len(_ts_mark))
+                    _m = _ts_re.search(_buf)
+                    if _m:
+                        _named.setdefault((_otype, _nm), [None, None])[1] = _m.group().decode("ascii")
         self._cur.executemany(
             "INSERT INTO safety_signatures VALUES (?,?,?,?)",
             [(k[0], k[1], v[0], v[1]) for k, v in _gss.items() if v[0]])
         self._cur.executemany(
             "INSERT INTO connection_signatures VALUES (?,?,?,?,?)",
             [(k[0], k[1], k[2], v[0], v[1]) for k, v in _gss3.items() if v[0]])
+        self._cur.executemany(
+            "INSERT INTO named_safety_signatures VALUES (?,?,?,?)",
+            [(k[0], k[1], v[0], v[1]) for k, v in _named.items() if v[0]])
         self._db.commit()
 
         log.info(
