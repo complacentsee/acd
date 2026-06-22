@@ -1858,29 +1858,31 @@ class Tag(L5xElement):
         # short-header STRING value image is not reliably decoded yet, so keep the
         # prior behaviour there (no <Data> for dt_base=="STRING"), avoiding wrong
         # empty/array output.
-        if not is_alias and self._value_bytes is not None and dt_base not in _SKIP_DECORATED \
-                and not (self._short_header and dt_base == "STRING"):
+        if not is_alias and self._value_bytes is not None and dt_base not in _SKIP_DECORATED:
             try:
-                # A SCALAR STRING tag emits a Format="String" Length=N block in
-                # place of the Decorated <Structure> (Logix renders STRING specially).
-                # Detect by datatype name OR by the resolved TagInfo layout being the
-                # Logix STRING shape (LEN u32 + DATA SINT[]) -- the latter catches
-                # custom string types (String50, PF525FaultDesc, ...). STRING ARRAYS
-                # keep the Decorated path (render_decorated_layout -> <Array>).
-                # Long header only (see above): short-header detection mislabels some
-                # atomics and yields empty text.
-                is_string = False
-                if not self._short_header:
-                    is_string = (dt_base == "STRING") and self.dimensions is None
-                    if not is_string and self.dimensions is None and self._taginfo_layout:
-                        try:
-                            _lay = _tag_value._resolve_layout(
-                                dt_base, self._taginfo_layout, self._data_types_map
-                            )
-                            if _lay is not None and _tag_value._is_string_layout(_lay):
-                                is_string = True
-                        except Exception:
-                            pass
+                # A STRING tag emits a Format="String" Length=N block in place of the
+                # Decorated <Structure>/<Array> (Logix renders STRING specially).
+                # Detect by datatype name (STRING, incl. arrays -- OEM emits a single
+                # String block of element[0]) OR by the resolved TagInfo layout being
+                # the Logix STRING shape (LEN u32 + DATA SINT[]) -- the latter catches
+                # custom string types (String50, PF525FaultDesc, CustomStr...). The
+                # short-header value image decodes the same LEN+DATA shape, so this
+                # runs on both header families (verified byte-exact pool-wide).
+                # STRING renders as a Format="String" block when scalar (either
+                # header) and also for short-header ARRAYS (Logix emits a single
+                # String of element[0] there); a long-header STRING ARRAY keeps the
+                # Decorated <Array> form.
+                is_string = (dt_base == "STRING") and (
+                    self.dimensions is None or self._short_header)
+                if not is_string and self.dimensions is None and self._taginfo_layout:
+                    try:
+                        _lay = _tag_value._resolve_layout(
+                            dt_base, self._taginfo_layout, self._data_types_map
+                        )
+                        if _lay is not None and _tag_value._is_string_layout(_lay):
+                            is_string = True
+                    except Exception:
+                        pass
                 # Step 6d: layout-driven decode (full member fidelity) first;
                 # fall back to the simpler render_decorated on None/any failure.
                 decorated_inner = None
