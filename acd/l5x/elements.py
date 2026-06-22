@@ -7512,6 +7512,12 @@ class ControllerBuilder(L5xElementBuilder):
     # ACD save-version major (e.g. 21, 36). 0 if unknown. Used to gate
     # version-specific attribute emission (e.g. Program/@UseAsFolder).
     _acd_major: int = field(default=0)
+    # Controller firmware revision from the project's QuickInfo DeviceIdentity (the
+    # firmware the controller runs -- distinct from the Studio application SWVersion
+    # used for SoftwareRevision). None -> fall back to the Local module's identity
+    # record revision.
+    _device_major: Union[int, None] = field(default=None)
+    _device_minor: Union[int, None] = field(default=None)
 
     def build(self) -> Controller:
         # The root controller is the named FAFA component at parent_id=0 /
@@ -8305,13 +8311,18 @@ class ControllerBuilder(L5xElementBuilder):
             None,
         )
 
-        # MajorRev and MinorRev come from the firmware version of the Local (backplane
-        # controller) module, stored in its ext[0x01] bytes [0x08] and [0x09].
+        # MajorRev/MinorRev are the controller firmware revision. The project's
+        # QuickInfo DeviceIdentity carries it directly; prefer that. Fall back to the
+        # Local (backplane controller) module's identity record (ext[0x01] bytes
+        # [0x08]/[0x09]) when DeviceIdentity is unavailable.
         local_module = next(
             (m for m in modules if m.name == "Local"),
             next((m for m in modules if m.parent_module == m.name), None),
         )
-        if local_module is not None:
+        if self._device_major is not None and self._device_minor is not None:
+            major_rev = str(self._device_major)
+            minor_rev = str(self._device_minor)
+        elif local_module is not None:
             major_rev = str(local_module.major)
             minor_rev = str(local_module.minor)
         else:

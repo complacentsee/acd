@@ -472,11 +472,26 @@ class ExportL5x:
                 _major = int(_m.group(1)) if _m else 0
             except Exception:
                 _major = 0
+            # Controller firmware revision (MajorRev/MinorRev) from the project's
+            # QuickInfo DeviceIdentity, distinct from the Studio app SWVersion.
+            _dev_major = _dev_minor = None
+            try:
+                import xml.etree.ElementTree as ET
+                _qi = os.path.join(self._temp_dir, "QuickInfo.XML")
+                if os.path.exists(_qi):
+                    _di = ET.parse(_qi).find("DeviceIdentity")
+                    if _di is not None:
+                        _dev_major = int(_di.attrib["MajorRevision"])
+                        _dev_minor = int(_di.attrib["MinorRevision"])
+            except Exception:
+                _dev_major = _dev_minor = None
             self._controller = ControllerBuilder(
                 self._cur,
                 _short_header=self._comps_short_header,
                 _taginfo_layout=getattr(self, "_taginfo_layout", {}),
                 _acd_major=_major,
+                _device_major=_dev_major,
+                _device_minor=_dev_minor,
             ).build()
         return self._controller
 
