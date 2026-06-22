@@ -8043,6 +8043,17 @@ class ControllerBuilder(L5xElementBuilder):
                             if mk >= 0 and len(raw_mr) - (mk + 4) >= 0x30:
                                 e1o = raw_mr[mk + 4:]
                                 modid_to_oid[struct.unpack("<I", e1o[0x2C:0x30])[0]] = mod_oid
+                                # Map modid->name too (previously only the oid was
+                                # mapped here): a child module behind this marker
+                                # references its parent by this modid, so without the
+                                # name entry it fell back to ParentModule="Local". Key
+                                # it the way children reference it (e1[0x2C], or the
+                                # record comment_id when that is 0) and never overwrite
+                                # a name a normally-parsed record already provided.
+                                _mk_modid = (struct.unpack("<I", e1o[0x2C:0x30])[0]
+                                             or r.comment_id)
+                                if _mk_modid and _mk_modid not in modid_to_name:
+                                    modid_to_name[_mk_modid] = display_name
                             else:
                                 # Long-header module whose truncated record omits the
                                 # 0x001 identity: recover the modid from comps_full so
