@@ -1026,9 +1026,18 @@ def _conn_modern_attrs(blob: bytes, fmt: int) -> dict:
         inst = _conn_first_instance(blob)
         if inst is not None:
             safe = inst in _CONN_SAFETY_ASM_INSTANCES
-            if fmt in (48, 49):  # has an input side
+            # A suffix names that direction's I/O tag, so it is emitted only when
+            # the connection actually carries that direction (size > 0). A plain
+            # StandardDataDriven (fmt 48) input-only module has out_size 0 and the
+            # reference omits OutputTagSuffix there; gating each side on its size
+            # matches the reference (no suffix ever appears without its tag).
+            in_size = (struct.unpack_from("<H", blob, _CONN_ISIZE_OFF)[0]
+                       if len(blob) >= _CONN_ISIZE_OFF + 2 else 0)
+            out_size = (struct.unpack_from("<H", blob, _CONN_OSIZE_OFF)[0]
+                        if len(blob) >= _CONN_OSIZE_OFF + 2 else 0)
+            if fmt in (48, 49) and in_size:   # has an input side
                 out["InputTagSuffix"] = "I1" if inst == 1 else ("SI" if safe else "I")
-            if fmt in (48, 50):  # has an output side
+            if fmt in (48, 50) and out_size:  # has an output side
                 out["OutputTagSuffix"] = "O1" if inst == 1 else ("SO" if safe else "O")
     if fmt in _CONN_SAFETY_FMTS:
         if len(blob) > _CONN_TMULT_OFF:
@@ -1072,6 +1081,7 @@ _RACK_COMM_METHOD = "1073741824"
 _RAW_DATA_BLOCK_RE = re.compile(
     r'<Data\b(?![^>]*Format="(?:Decorated|String)")[^>]*>.*?</Data>', re.S)
 _ALARM_BLOCK_RE = re.compile(r'<AlarmConditions\b.*?</AlarmConditions>', re.S)
+_DESC_BLOCK_RE = re.compile(r'<Description\b.*?</Description>\s*', re.S)
 
 
 def _strip_input_tag_inner(inner: str) -> str:
@@ -1135,6 +1145,33 @@ def _build_connection_map(cur, short_header: bool) -> Dict[int, dict]:
                 "OutputSize": struct.unpack_from("<H", blob, _CONN_OSIZE_OFF)[0],
             }
             entry.update(_conn_modern_attrs(blob, fmt))
+            # Safety connections carry a per-connection SafetySignature: the GSS
+            # record keyed (otype 105, cid=u32@rec[12], disc=u32@rec[16]).
+            if fmt in (28, 29, 49, 50) and len(rec) >= 20:
+                try:
+                    srow = cur.execute(
+                        "SELECT signature, timestamp FROM connection_signatures "
+                        "WHERE otype=105 AND cid=? AND disc=?",
+                        (struct.unpack_from("<I", rec, 12)[0],
+                         struct.unpack_from("<I", rec, 16)[0])).fetchone()
+                except Exception:
+                    srow = None
+                if srow and srow[0]:
+                    entry["SafetySignature"] = srow[0]
+                    if srow[1]:
+                        entry["SafetySignatureTimestamp"] = srow[1]
+                # The module's combined signature (rendered on the <Connections>
+                # container) is the same GSS family at disc 0 for this cid.
+                try:
+                    crow = cur.execute(
+                        "SELECT signature, timestamp FROM connection_signatures "
+                        "WHERE otype=105 AND cid=? AND disc=0",
+                        (struct.unpack_from("<I", rec, 12)[0],)).fetchone()
+                except Exception:
+                    crow = None
+                if crow and crow[0]:
+                    entry["_connections_signature"] = crow[0]
+                    entry["_connections_signature_ts"] = crow[1]
             out[oid] = entry
     except Exception:
         return out
@@ -1146,6 +1183,9 @@ def _build_connection_map(cur, short_header: bool) -> Dict[int, dict]:
 # a hash-named child of RxDataCollection; the module points at it by object id.
 _CONFIG_IMG_MAX = 65536          # sanity bound on a derived ConfigSize/Size
 _CONFIG_MARK = b"\x44\x02\x00\x00"
+# PowerFlex 753-NET-E drive: its config image is a parameter-download script the
+# reference renders only as <ConfigScript>, never <ConfigData>.
+_CONFIGSCRIPT_ONLY_PT = 123
 _CONFIG_IMG_VALUE = 0x66          # ext-attr holding the config/script image
 
 
@@ -2114,6 +2154,14 @@ class Module(L5xElement):
     # Communications / ExtendedProperties / Description (optional)
     _description: str = field(default="")
     _comm_method: Union[str, None] = field(default=None)
+    # Module identity class word (u16 @ ext-attr 0x001[0:2]); drives the
+    # <Communications> emit gate. -1 when unknown (truncated/fallback module).
+    _class_word: int = field(default=-1)
+    # CIP product type (u16 @ ext-attr 0x001[4:6]) and the module's own modid
+    # (u32 @ ext-attr 0x001[0x2C:]); used to zero an axis-less motion drive's
+    # MotionSync RPI. 0 when unknown.
+    _product_type: int = field(default=0)
+    _modid: int = field(default=0)
     # Each entry: (name, rpi_str, conn_type_str)
     # Each connection is a dict with keys: name, type, rpi, unicast, event_id,
     # stub_output (bool, drives the InputTag/OutputTag stubs), and the optional
@@ -2204,9 +2252,28 @@ class Module(L5xElement):
         ekey = f'<EKey State="{self._ekey_state}"/>'
         ports = self._build_ports_xml()
 
-        # <Communications> section — only emitted when a CommMethod is known.
+        # <Communications> section. A module emits one when its identity class word
+        # is not a structural/bus class that never carries Communications, gated by
+        # its content for the few mixed classes. Validated 0-false-positive pool-wide
+        # (the class word distinguishes ports/buses/controllers, which omit it, from
+        # devices, which emit it; CIP/ControlNet bridges with only a config image but
+        # no I/O are the one mixed case that must NOT emit). When emitted, the
+        # CommMethod attribute is present only when one was recovered.
         comm_xml = ""
-        if self._comm_method is not None:
+        _has_config = (self._config_inner is not None
+                       or self._config_data is not None
+                       or self._config_script is not None)
+        _nconn = len(self._connections)
+        _cw = self._class_word
+        if _cw in (0x106, 0x609, 0x60A, 0x900):
+            _emit_comm = False
+        elif _cw in (0x104, 0x109):
+            _emit_comm = _nconn > 0 or self._comm_method is not None
+        elif _cw == 0x800:
+            _emit_comm = _nconn > 0 or _has_config or self._comm_method is not None
+        else:
+            _emit_comm = True
+        if _emit_comm:
             # InputTag/OutputTag carry the module's I/O data image, sourced from its
             # controller :I / :O tags. The data is placed only when the module has a
             # single connection of that tag type, so the module->tag mapping is
@@ -2258,11 +2325,12 @@ class Module(L5xElement):
                 # InputProductionTrigger, ConnectionPath, tag suffixes) -- each
                 # emitted only when decoded for this connection.
                 modern = "".join(
-                    f' {a}="{c[a]}"'
+                    f' {a}="{html.escape(str(c[a]), quote=True)}"'
                     for a in ("TimeoutMultiplier", "NetworkDelayMultiplier",
                               "ReactionTimeLimit", "MaxObservedNetworkDelay",
                               "Priority", "InputConnectionType", "InputProductionTrigger",
-                              "ConnectionPath", "InputTagSuffix", "OutputTagSuffix")
+                              "ConnectionPath", "InputTagSuffix", "OutputTagSuffix",
+                              "SafetySignature", "SafetySignatureTimestamp")
                     if a in c
                 )
                 # Unicast is rendered only on connection types that carry it
@@ -2295,7 +2363,25 @@ class Module(L5xElement):
                 )
             else:
                 joined = "".join(conn_parts)
-                connections_xml = f'<Connections>{joined}</Connections>' if joined else '<Connections/>'
+                # A safety module's combined signature rides on the <Connections>
+                # container (distinct from each connection's own SafetySignature).
+                _csig = next((c.get("_connections_signature")
+                              for c in self._connections
+                              if c.get("_connections_signature")), None)
+                _csig_attr = ""
+                if _csig:
+                    _csig_attr = f' SafetySignature="{html.escape(_csig, quote=True)}"'
+                    _cts = next((c.get("_connections_signature_ts")
+                                 for c in self._connections
+                                 if c.get("_connections_signature")), None)
+                    if _cts:
+                        _csig_attr += (' SafetySignatureTimestamp="'
+                                       f'{html.escape(str(_cts), quote=True)}"')
+                if joined:
+                    connections_xml = f'<Connections{_csig_attr}>{joined}</Connections>'
+                else:
+                    connections_xml = (f'<Connections{_csig_attr}/>' if _csig_attr
+                                       else '<Connections/>')
             # <ConfigTag> — the module's config assembly image, emitted as the first
             # child of <Communications> (before <Connections>). The content is the
             # module's controller :C tag <Data> blocks (captured verbatim); a module
@@ -2324,9 +2410,12 @@ class Module(L5xElement):
             script_xml = ""
             if self._config_script is not None:
                 cs_hex, cs_size = self._config_script
+                # A safety module renders the script blob as <SafetyScript>; a
+                # standard module as <ConfigScript> (same image + Size, different tag).
+                _stag = "SafetyScript" if self._safety_enabled else "ConfigScript"
                 script_xml = (
-                    f'<ConfigScript Size="{cs_size}">'
-                    f'<Data>{cs_hex}</Data></ConfigScript>'
+                    f'<{_stag} Size="{cs_size}">'
+                    f'<Data>{cs_hex}</Data></{_stag}>'
                 )
             # PrimCxn*/SecCxn* connection-size attributes on <Communications>.
             # A generic-profile module (Rockwell vendor, ProductType 0), a DeviceNet
@@ -2360,8 +2449,10 @@ class Module(L5xElement):
                     )
                     if sec is not None:
                         primcxn_attrs += f' SecCxnInputSize="{sec["in_size"]}"'
+            cm_attr = (f' CommMethod="{self._comm_method}"'
+                       if self._comm_method is not None else '')
             comm_xml = (
-                f'<Communications CommMethod="{self._comm_method}"{primcxn_attrs}>'
+                f'<Communications{cm_attr}{primcxn_attrs}>'
                 f'{config_xml}{script_xml}{connections_xml}'
                 f'</Communications>'
             )
@@ -3592,21 +3683,39 @@ class ModuleBuilder(L5xElementBuilder):
         coll_oids = [r[0] for r in self._cur.fetchall()]
         for coll_oid in coll_oids:
             self._cur.execute(
-                "SELECT record FROM comps WHERE parent_id=?", (coll_oid,)
+                "SELECT object_id, record FROM comps WHERE parent_id=?", (coll_oid,)
             )
-            for (raw,) in self._cur.fetchall():
+            for (child_oid, raw) in self._cur.fetchall():
                 raw = bytes(raw)
                 if len(raw) < 14:
                     continue
                 if int.from_bytes(raw[12:14], "little") != want:
                     continue
                 xml_start = raw.find(b'<')
-                if xml_start < 0:
-                    continue
-                xml_text = raw[xml_start:].decode("latin-1", errors="replace")
-                cf_m = _re.search(r'<CF>(\d+)</CF>', xml_text)
-                if cf_m:
-                    return cf_m.group(1)
+                if xml_start >= 0:
+                    xml_text = raw[xml_start:].decode("latin-1", errors="replace")
+                    cf_m = _re.search(r'<CF>(\d+)</CF>', xml_text)
+                    if cf_m:
+                        return cf_m.group(1)
+                # Source-protected child: the <CF> is in the decrypted ext-attr image
+                # (0x66, else 0x65/0x64), not the plaintext body.
+                row = self._cur.execute(
+                    "SELECT record FROM comps_full WHERE object_id=?", (child_oid,)
+                ).fetchone()
+                if row and row[0] is not None:
+                    try:
+                        attrs = CompsRecord.read_value_attrs(
+                            bytes(row[0]), self._short_header, full=True)
+                    except Exception:
+                        attrs = {}
+                    for _aid in (0x66, 0x65, 0x64):
+                        img = attrs.get(_aid)
+                        if not img:
+                            continue
+                        cf_m = _re.search(
+                            rb'<CF>(\d+)</CF>', bytes(img))
+                        if cf_m:
+                            return cf_m.group(1).decode()
         return None
 
     def _ports_from_data_collection(self, data_link: int) -> "Union[str, None]":
@@ -3854,6 +3963,7 @@ class ModuleBuilder(L5xElementBuilder):
             return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false", major_fault,
                           _is_root=(name == "Local"))
 
+        class_word    = struct.unpack("<H", e1[0x00:0x02])[0] if len(e1) >= 2 else -1
         vendor        = struct.unpack("<H", e1[0x02:0x04])[0]
         product_type  = struct.unpack("<H", e1[0x04:0x06])[0]
         product_code  = struct.unpack("<H", e1[0x06:0x08])[0]
@@ -4040,14 +4150,19 @@ class ModuleBuilder(L5xElementBuilder):
             }
             # Modern data-driven / safety connection attributes (Priority,
             # InputConnectionType, InputProductionTrigger, ConnectionPath, tag
-            # suffixes, and the safety timing set). Auto-named raw connections
-            # (comp_name "_<pathhex>", which carry a Format attribute instead)
-            # never render these, so skip them.
+            # suffixes, and the safety timing set). The combined-signature keys ride
+            # on every connection so the <Connections> container can find one.
+            for _k in ("_connections_signature", "_connections_signature_ts"):
+                if _k in dec:
+                    c[_k] = dec[_k]
+            # Auto-named raw connections (comp_name "_<pathhex>", which carry a
+            # Format attribute instead) do not render the per-connection attrs.
             if not conn_name.startswith("_"):
                 for _k in ("Priority", "InputConnectionType", "InputProductionTrigger",
                            "ConnectionPath", "InputTagSuffix", "OutputTagSuffix",
                            "TimeoutMultiplier", "NetworkDelayMultiplier",
-                           "MaxObservedNetworkDelay", "ReactionTimeLimit"):
+                           "MaxObservedNetworkDelay", "ReactionTimeLimit",
+                           "SafetySignature", "SafetySignatureTimestamp"):
                     if _k in dec:
                         c[_k] = dec[_k]
             fmt = dec["fmt"]
@@ -4095,16 +4210,35 @@ class ModuleBuilder(L5xElementBuilder):
         rack_has_input = False
         rack_has_output = False
         entry = self._io_map.get((self._object_id, None))
+        parent_oid = None
         if entry is None:
             parent_oid = self._modid_to_oid.get(parent_modid)
             if parent_oid is not None:
                 entry = self._io_map.get((parent_oid, slot))
+        if entry is None and parent_oid is None and parent_name:
+            # Fallback: the &<parentOid>:<slot>:C/I/O tags are keyed by the parent
+            # module's comps object_id. When parent_modid does not resolve through
+            # modid_to_oid at all, resolve the friendly parent name to its object_id
+            # and try that (oid, slot). This is only safe when the parent was NOT
+            # resolved: if parent_modid DID resolve to a real parent that simply owns
+            # no :C for this slot (a DeviceNet bridge / sub-chassis device, or a
+            # module named "Local" that is itself a bridge), the module genuinely has
+            # no ConfigTag -- grabbing a same-slot :C from a different module named
+            # "Local" would fabricate one.
+            prow = self._cur.execute(
+                "SELECT object_id FROM comps WHERE comp_name=? AND record_type=256",
+                (parent_name,)).fetchone()
+            if prow is not None and prow[0] != self._object_id:
+                entry = self._io_map.get((prow[0], slot))
         if entry is not None:
             cfg = entry.get("C")
             if cfg is not None:
                 config_inner, config_size = cfg
-            input_inner = entry.get("I")
-            output_inner = entry.get("O")
+            # A module owns one input family: plain :I, safety :SI, or IO-Link :I1
+            # (never mixed). The safety output :SO carries no data so output is only
+            # ever plain :O or :O1.
+            input_inner = entry.get("I") or entry.get("SI") or entry.get("I1")
+            output_inner = entry.get("O") or entry.get("O1")
             status_inner = entry.get("S")
             rack_has_input = bool(entry.get("has_I"))
             rack_has_output = bool(entry.get("has_O"))
@@ -4135,7 +4269,12 @@ class ModuleBuilder(L5xElementBuilder):
                         cd_oid = cand
             elif len(e1) >= 0x24:
                 cd_oid = self._cfg_by_mr28.get(struct.unpack_from("<I", e1, 0x20)[0])
-            if cd_oid is not None:
+            # A PowerFlex 753-NET-E drive (product_type 123) carries a config image
+            # the reference renders ONLY as <ConfigScript> (a parameter-download
+            # script), never as <ConfigData> -- so resolve its script below but skip
+            # ConfigData. Verified pool-wide: every product_type 123 module is
+            # ConfigScript-only, and 123 is the only type that is uniformly so.
+            if cd_oid is not None and product_type != _CONFIGSCRIPT_ONLY_PT:
                 img = _config_holder_image(self._cur, cd_oid, self._short_header)
                 if img is not None and len(img) >= 4:
                     csize = struct.unpack_from("<I", img, 0)[0] - 4
@@ -4156,7 +4295,11 @@ class ModuleBuilder(L5xElementBuilder):
         # `20 6a` TLV resolves to a holder via the same cid index. Both read the holder
         # image via its ext-attr 0x66. Only run when no ConfigTag was found (mutually
         # exclusive) and the primary rule left the slot unresolved.
-        if config_inner is None and (configdata is None or configscript is None):
+        # The ConfigScript `20 6a` resolution runs regardless of config_inner so a
+        # module that ALSO owns a ConfigTag still recovers its script (ConfigScript
+        # and the script are not mutually exclusive); the ConfigData fallback stays
+        # gated on config_inner (mutually exclusive with ConfigTag).
+        if configscript is None or (config_inner is None and configdata is None):
             self._cur.execute(
                 "SELECT record FROM comps_full WHERE object_id=?", (self._object_id,))
             _mr = self._cur.fetchone()
@@ -4172,7 +4315,8 @@ class ModuleBuilder(L5xElementBuilder):
                 # primary there means "no config", so do not speculate -- the 0x13e
                 # ext-attr on these resolves to a generic image the reference does
                 # not render as <ConfigData>.
-                if configdata is None and product_type != 12:
+                if (config_inner is None and configdata is None
+                        and product_type not in (12, _CONFIGSCRIPT_ONLY_PT)):
                     _ref = _ma.get(0x13E)
                     if _ref and len(_ref) == 4:
                         img = _config_holder_image(
@@ -4304,6 +4448,9 @@ class ModuleBuilder(L5xElementBuilder):
             "false",        # Inhibited: always false in practice; no known bit
             major_fault,
             _is_root=is_root,
+            _class_word=class_word,
+            _product_type=product_type,
+            _modid=(struct.unpack("<I", e1[0x2C:0x30])[0] if len(e1) >= 0x30 else 0),
             _ekey_state=ekey_state,
             _slot=slot,
             _ip_address=ip_address,
@@ -7597,7 +7744,16 @@ class ControllerBuilder(L5xElementBuilder):
                 # an OutputTag keeps the inner verbatim; an InputTag (and the status :S
                 # tag) keeps it minus the raw value block and any <AlarmConditions>.
                 if tag._io and tag._value_bytes:
-                    cm = re.match(r"^&([0-9a-fA-F]+)(?::(\d+))?:([CIOS])$", result[0])
+                    # Suffix may be a plain C/I/O/S, a safety input :SI / config :SC,
+                    # or an IO-Link numbered I1/O1/I2/O2 (a module owns one family);
+                    # all route to the same config/input/output slots downstream. The
+                    # safety OUTPUT :SO is deliberately excluded: an OEM safety
+                    # OutputTag carries no Decorated <Data> (only operand <Comments>),
+                    # so reusing the backing tag's data block over-emits a wrong
+                    # <Structure>. Safety inputs and configs DO carry Decorated data.
+                    cm = re.match(
+                        r"^&([0-9a-fA-F]+)(?::(\d+))?:(SI|SC|I1|I2|O1|O2|[CIOS])$",
+                        result[0])
                     if cm:
                         ref_oid = int(cm.group(1), 16)
                         ref_slot = int(cm.group(2)) if cm.group(2) is not None else None
@@ -7608,14 +7764,23 @@ class ControllerBuilder(L5xElementBuilder):
                         if inner.endswith("</Tag>"):
                             inner = inner[:-len("</Tag>")]
                         slot_entry = io_data_map.setdefault((ref_oid, ref_slot), {})
-                        if io_type == "C" and inner and len(tag._value_bytes) >= 4:
+                        if io_type in ("C", "SC") and inner and len(tag._value_bytes) >= 4:
                             # ConfigSize = first u32 of the config image minus 4.
                             size = int.from_bytes(tag._value_bytes[0:4], "little") - 4
                             slot_entry["C"] = (inner, size)
-                        elif io_type == "O" and inner:
-                            slot_entry["O"] = inner
-                        elif io_type in ("I", "S") and inner:
-                            slot_entry[io_type] = _strip_input_tag_inner(inner)
+                        elif io_type[0] == "O" and inner:
+                            slot_entry[io_type] = inner
+                        elif inner:  # I*/S* input/status tags: strip the raw value block
+                            si = _strip_input_tag_inner(inner)
+                            # An OEM safety InputTag carries no <Description> (a safety
+                            # I/O tag's description is not rendered inside the connection
+                            # tag -- verified: every safety connection InputTag in the
+                            # reference is description-less); a standard input tag keeps
+                            # its Description. The safety backing tag may use a plain :I
+                            # suffix, so key off the tag's Safety class, not the suffix.
+                            if getattr(tag, "_class_attr", None) == "Safety":
+                                si = _DESC_BLOCK_RE.sub("", si)
+                            slot_entry[io_type] = si
 
         # Get the Program Collection and get the programs
         self._cur.execute(
@@ -7777,6 +7942,55 @@ class ControllerBuilder(L5xElementBuilder):
                 except Exception:
                     pass
 
+            # Supplement modid_to_oid with the owners of slotted :C config tags. A
+            # &<ownerOid>:<slot>:C config tag is owned by the parent module that holds
+            # that slot's card; map the owner's OWN modid -> its object_id so a child
+            # card resolves its real parent through the PRIMARY (parent_modid, slot)
+            # path. The device-collection pass above misses chassis/bridge parents
+            # that are not entered under a recognised modid (a remote DeviceNet/EN
+            # chassis, or the local controller whose implicit modid 1 no record
+            # carries), which is why those cards previously fell through to the
+            # "Local"-named fallback and grabbed a same-slot :C from the wrong module.
+            # Collision-safe: never overwrite a modid already mapped above.
+            _c_owners = {oid for (oid, _s) in io_data_map
+                         if io_data_map.get((oid, _s), {}).get("C") is not None}
+            for _owner in _c_owners:
+                _omodid = None
+                _orow = self._cur.execute(
+                    "SELECT record FROM comps WHERE object_id=?", (_owner,)).fetchone()
+                if _orow:
+                    try:
+                        _or = _RxG.from_bytes(bytes(_orow[0]))
+                        if _or.cip_type == 0x69:
+                            _oe1 = {er.attribute_id: bytes(er.value)
+                                    for er in _or.extended_records}.get(0x001, b"")
+                            if len(_oe1) >= 0x30:
+                                _omodid = struct.unpack("<I", _oe1[0x2C:0x30])[0] or _or.comment_id
+                    except Exception:
+                        _omodid = None
+                # A remote DeviceNet/EN chassis whose truncated comps record omits the
+                # identity surfaces its modid only in comps_full (same recovery the
+                # module-build pass uses), so read it there when the plain record did
+                # not yield one.
+                if _omodid is None:
+                    _ocf = self._cur.execute(
+                        "SELECT record FROM comps_full WHERE object_id=?", (_owner,)).fetchone()
+                    if _ocf and _ocf[0]:
+                        _ofull = bytes(_ocf[0])
+                        _obo = CompsRecord.body_offset(self._short_header)
+                        try:
+                            if (len(_ofull) >= _obo + 14 and struct.unpack_from(
+                                    "<H", _ofull, _obo + 10)[0] == 0x69):
+                                _oe1 = CompsRecord.read_value_attrs(
+                                    _ofull, self._short_header, full=True).get(0x001, b"")
+                                if len(_oe1) >= 0x30:
+                                    _ocid = struct.unpack_from("<H", _ofull, _obo + 12)[0]
+                                    _omodid = struct.unpack("<I", _oe1[0x2C:0x30])[0] or _ocid
+                        except Exception:
+                            _omodid = None
+                if _omodid and _omodid not in modid_to_oid:
+                    modid_to_oid[_omodid] = _owner
+
             # Second pass: build Module objects. The connection decode map (RPI/
             # Unicast/EventID per connection record) and the ConfigData/ConfigScript
             # holder indexes are built once and shared.
@@ -7901,6 +8115,42 @@ class ControllerBuilder(L5xElementBuilder):
                     _mt._message_data_xml = _render_message_data(
                         self._cur, self._short_header, _mt._data_table_instance,
                         _msg_oid2name, _msg_nr, _msg_rc, _msg_ips)
+        except Exception:
+            pass
+
+        # CIP Motion: a 2094-family integrated-motion drive (ProductType 37) that
+        # has no axis assigned to it exports its MotionSync connection with RPI 0
+        # (the connection is present but unscheduled). The axis->module association
+        # is the module's modid at offset 250 of the AXIS_CIP_DRIVE tag's data-table
+        # record (the long-header drive layout). Only act when EVERY axis resolves to
+        # a known module modid -- that confirms the offset/layout for this project, so
+        # a drive that actually owns an axis is never zeroed. Long-header only.
+        try:
+            if not self._short_header:
+                _axis_tags = [t for t in tags if (t.data_type or "") == "AXIS_CIP_DRIVE"]
+                for _prog in programs:
+                    _axis_tags += [t for t in _prog.tags
+                                   if (t.data_type or "") == "AXIS_CIP_DRIVE"]
+                _known = {m._modid for m in modules if m._modid}
+                _resolved = set()
+                _complete = bool(_axis_tags)
+                for _at in _axis_tags:
+                    _arow = self._cur.execute(
+                        "SELECT record FROM comps_full WHERE object_id=?",
+                        (_at._data_table_instance,)).fetchone()
+                    _buf = bytes(_arow[0]) if _arow and _arow[0] else b""
+                    _cand = (struct.unpack_from("<I", _buf, 250)[0]
+                             if len(_buf) >= 254 else None)
+                    if _cand in _known:
+                        _resolved.add(_cand)
+                    else:
+                        _complete = False
+                if _complete:
+                    for _m in modules:
+                        if _m._product_type == 37 and _m._modid and _m._modid not in _resolved:
+                            for _c in _m._connections:
+                                if _c.get("type") == "MotionSync":
+                                    _c["rpi"] = "0"
         except Exception:
             pass
 
