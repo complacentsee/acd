@@ -2209,6 +2209,15 @@ class Module(L5xElement):
     _safety_network: Union[str, None] = field(default=None)
     _safety_signature: Union[str, None] = field(default=None)
     _safety_signature_timestamp: Union[str, None] = field(default=None)
+    # Drive-peripheral modules carry their own (pre-display) identity in the
+    # UserDefined* attributes plus ShutdownParentOnFault. All None on ordinary
+    # modules (the attributes are then omitted).
+    _ud_vendor: Union[int, None] = field(default=None)
+    _ud_product_type: Union[int, None] = field(default=None)
+    _ud_product_code: Union[int, None] = field(default=None)
+    _ud_major: Union[int, None] = field(default=None)
+    _ud_minor: Union[int, None] = field(default=None)
+    _shutdown_parent_on_fault: Union[str, None] = field(default=None)
 
     def __post_init__(self):
         super().__post_init__()
@@ -2229,6 +2238,19 @@ class Module(L5xElement):
         if self._drives_adc_enabled is not None:
             safety_attr += (f' DrivesADCEnabled="{self._drives_adc_enabled}"'
                             f' DrivesADCMode="{self._drives_adc_mode}"')
+        # Drive-peripheral modules carry the peripheral's own identity in
+        # UserDefined* attributes (between Minor and ParentModule in the reference).
+        ud_attr = ""
+        if self._ud_vendor is not None:
+            ud_attr = (
+                f' UserDefinedVendor="{self._ud_vendor}"'
+                f' UserDefinedProductType="{self._ud_product_type}"'
+                f' UserDefinedProductCode="{self._ud_product_code}"'
+                f' UserDefinedMajor="{self._ud_major}"'
+                f' UserDefinedMinor="{self._ud_minor}"'
+            )
+        shutdown_attr = (f' ShutdownParentOnFault="{self._shutdown_parent_on_fault}"'
+                         if self._shutdown_parent_on_fault is not None else "")
         attrs = (
             f'{name_attr}'
             f'CatalogNumber="{self.catalog_number}" '
@@ -2236,11 +2258,11 @@ class Module(L5xElement):
             f'ProductType="{self.product_type}" '
             f'ProductCode="{self.product_code}" '
             f'Major="{self.major}" '
-            f'Minor="{self.minor}" '
+            f'Minor="{self.minor}"{ud_attr} '
             f'ParentModule="{self.parent_module}" '
             f'ParentModPortId="{self.parent_mod_port_id}" '
             f'Inhibited="{self.inhibited}" '
-            f'MajorFault="{self.major_fault}"'
+            f'MajorFault="{self.major_fault}"{shutdown_attr}'
             f'{safety_attr}'
         )
 
@@ -4026,7 +4048,20 @@ class ModuleBuilder(L5xElementBuilder):
         # Ordinary hash-named modules (unresolved 1756/1769 I/O cards, PT 7/10) keep
         # their genuine PT/PC and real catalog -- the previous unconditional rewrite
         # corrupted those into RHINOBP-DRIVE-PERIPHERAL-MODULE.
+        ud_vendor = ud_product_type = ud_product_code = ud_major = ud_minor = None
+        shutdown_parent_on_fault = None
         if name == "?" and vendor == 1 and product_type in (142, 143, 150, 127):
+            # The reference re-labels these as a generic drive-peripheral catalog
+            # and preserves the peripheral's own identity in the UserDefined*
+            # attributes (verified equal to the pre-display identity record fields).
+            # ShutdownParentOnFault is exported on every drive-peripheral module and
+            # is false across the reference pool (135/135).
+            ud_vendor = vendor
+            ud_product_type = product_type
+            ud_product_code = product_code
+            ud_major = major
+            ud_minor = minor
+            shutdown_parent_on_fault = "false"
             product_code = 29 if product_type in (150, 127) else 28
             product_type = 0
             # The reference exports these drive-peripheral modules with a fixed
@@ -4568,6 +4603,12 @@ class ModuleBuilder(L5xElementBuilder):
             _safety_network=safety_network,
             _safety_signature=safety_signature,
             _safety_signature_timestamp=safety_signature_timestamp,
+            _ud_vendor=ud_vendor,
+            _ud_product_type=ud_product_type,
+            _ud_product_code=ud_product_code,
+            _ud_major=ud_major,
+            _ud_minor=ud_minor,
+            _shutdown_parent_on_fault=shutdown_parent_on_fault,
         )
 
 
