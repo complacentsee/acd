@@ -2597,6 +2597,9 @@ class Routine(L5xElement):
     _rung_ids: List[int] = field(default_factory=list)
     _rung_comments: Dict[int, str] = field(default_factory=dict)
     _description: Union[str, None] = field(default=None)
+    # Safety routines carry a generated signature + timestamp; None omits them.
+    _safety_signature: Union[str, None] = field(default=None)
+    _safety_signature_timestamp: Union[str, None] = field(default=None)
 
     def to_xml(self) -> str:
         rll_content = ""
@@ -2623,8 +2626,14 @@ class Routine(L5xElement):
             f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
             if self._description else ""
         )
+        sig_attr = ""
+        if self._safety_signature is not None:
+            sig_attr = f' SafetySignature="{self._safety_signature}"'
+            if self._safety_signature_timestamp is not None:
+                sig_attr += (' SafetySignatureTimestamp="'
+                             f'{html.escape(self._safety_signature_timestamp, quote=True)}"')
         return (
-            f'<Routine Name="{html.escape(self.name, quote=True)}" Type="{self.type}">'
+            f'<Routine Name="{html.escape(self.name, quote=True)}" Type="{self.type}"{sig_attr}>'
             f'{desc_xml}{rll_content}</Routine>'
         )
 
@@ -6387,8 +6396,35 @@ class RoutineBuilder(L5xElementBuilder):
             except Exception:
                 description = None
 
+        # Safety routines carry a generated signature. The routine's decrypted
+        # comps_full record embeds an (otype, cid, disc) triple at body+10/+12/+16;
+        # the 3-key connection_signatures side table holds every GSS signature
+        # (routines of one collection share (otype, cid) and differ only by disc, so
+        # the 2-key safety_signatures table overwrites all but one -- use the 3-key
+        # table). The lookup returns nothing for an unsigned routine (0 false-pos).
+        safety_sig = safety_sig_ts = None
+        try:
+            _cf = self._cur.execute(
+                "SELECT record FROM comps_full WHERE object_id=?",
+                (self._object_id,)).fetchone()
+            if _cf and _cf[0]:
+                _rb = bytes(_cf[0])
+                _bo = CompsRecord.body_offset(self._short_header)
+                if len(_rb) >= _bo + 20:
+                    _sr = self._cur.execute(
+                        "SELECT signature, timestamp FROM connection_signatures "
+                        "WHERE otype=? AND cid=? AND disc=?",
+                        (struct.unpack_from("<H", _rb, _bo + 10)[0],
+                         struct.unpack_from("<I", _rb, _bo + 12)[0],
+                         struct.unpack_from("<I", _rb, _bo + 16)[0])).fetchone()
+                    if _sr and _sr[0]:
+                        safety_sig, safety_sig_ts = _sr[0], _sr[1]
+        except Exception:
+            pass
+
         return Routine(name, name, routine_type, rungs, rung_ids, rung_comments,
-                       description)
+                       description, _safety_signature=safety_sig,
+                       _safety_signature_timestamp=safety_sig_ts)
 
 
 def _parse_fffeff(data: bytes, offset: int):
@@ -7079,6 +7115,35 @@ def _render_alarm_conditions(conds):
     return "".join(parts)
 
 
+def _tagcoll_sig_attrs(cur, oid, short_header):
+    """Rendered SafetySignature/SafetySignatureTimestamp attribute string for a
+    <Tags> collection, or "" when unsigned. The collection's decrypted comps_full
+    record embeds an (otype, cid, disc) triple at body+10/+12/+16 that keys the
+    connection_signatures side table (which holds every GSS signature)."""
+    try:
+        cf = cur.execute("SELECT record FROM comps_full WHERE object_id=?", (oid,)).fetchone()
+        if not cf or not cf[0]:
+            return ""
+        rb = bytes(cf[0])
+        bo = CompsRecord.body_offset(short_header)
+        if len(rb) < bo + 20:
+            return ""
+        sr = cur.execute(
+            "SELECT signature, timestamp FROM connection_signatures "
+            "WHERE otype=? AND cid=? AND disc=?",
+            (struct.unpack_from("<H", rb, bo + 10)[0],
+             struct.unpack_from("<I", rb, bo + 12)[0],
+             struct.unpack_from("<I", rb, bo + 16)[0])).fetchone()
+        if sr and sr[0]:
+            a = f' SafetySignature="{sr[0]}"'
+            if sr[1]:
+                a += f' SafetySignatureTimestamp="{html.escape(sr[1], quote=True)}"'
+            return a
+    except Exception:
+        pass
+    return ""
+
+
 @dataclass
 class ProgramBuilder(L5xElementBuilder):
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
@@ -7298,11 +7363,19 @@ class ProgramBuilder(L5xElementBuilder):
             if _srow:
                 prog_sig, prog_sig_ts = _srow[0], _srow[1]
 
-        return Program(name, name, prog_cls, "false", main_routine_name,
+        prog = Program(name, name, prog_cls, "false", main_routine_name,
                        fault_routine_name, disabled, sync_redundancy, use_as_folder,
                        tags, routines, safety_signature=prog_sig,
                        safety_signature_timestamp=prog_sig_ts,
                        _description=program_description)
+        # The program-scoped <Tags> collection carries its own safety signature,
+        # distinct from the program's. Render it on the <Tags> wrapper. Program has no
+        # _section_attrs by default (the base to_xml reads it via getattr), so create it.
+        if results:
+            _ta = _tagcoll_sig_attrs(self._cur, results[0][1], self._short_header)
+            if _ta:
+                prog._section_attrs = {"tags": _ta}
+        return prog
 
 
 _TASK_TYPE_MAP = {1: "EVENT", 2: "PERIODIC", 4: "CONTINUOUS"}
@@ -7977,6 +8050,8 @@ class ControllerBuilder(L5xElementBuilder):
         if len(results) > 1:
             raise Exception("Contains more than one controller tag collection")
         _tag_collection_object_id = results[0][1]
+        _ctrl_tags_sig = _tagcoll_sig_attrs(
+            self._cur, _tag_collection_object_id, self._short_header)
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
             + str(_tag_collection_object_id)
@@ -8623,7 +8698,7 @@ class ControllerBuilder(L5xElementBuilder):
         except Exception:
             pass
 
-        return Controller(
+        controller = Controller(
             controller_name,
             "Target",
             controller_name,
@@ -8672,6 +8747,10 @@ class ControllerBuilder(L5xElementBuilder):
             _ts_priority2=ts_priority2,
             _cst_master_id=cst_master_id,
         )
+        # Controller-scoped <Tags> safety signature (separate from the AOI-section one).
+        if _ctrl_tags_sig:
+            controller._section_attrs["tags"] = _ctrl_tags_sig
+        return controller
 
 
 @dataclass
