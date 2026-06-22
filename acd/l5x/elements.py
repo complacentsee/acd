@@ -2221,6 +2221,10 @@ class Module(L5xElement):
     # that tag type (an unambiguous mapping; see to_xml).
     _input_inner: Union[str, None] = field(default=None)
     _output_inner: Union[str, None] = field(default=None)
+    # The module's safety output (:SO) tag inner, used by a SafetyOutput*
+    # connection's <OutputTag> (a standard Output connection uses _output_inner /
+    # the :O tag). Kept verbatim like _output_inner.
+    _safety_output_inner: Union[str, None] = field(default=None)
     # The module's status (:S) tag inner, used by a Status/MotionDiagnostics
     # connection's <InputTag> (the others use _input_inner / the :I tag).
     _status_inner: Union[str, None] = field(default=None)
@@ -2373,7 +2377,17 @@ class Module(L5xElement):
                                  else self._input_inner)
                         tag_stubs += _io_tag("InputTag", inner)
                     if c.get("has_output", True):
-                        tag_stubs += _io_tag("OutputTag", self._output_inner)
+                        # A safety output connection's <OutputTag> reuses the
+                        # module's safety output (:SO) backing tag when the module
+                        # owns one (motion-drive safety, e.g. CIP_Motion_Device_
+                        # Safety2); a point-safety module instead carries its safety
+                        # output image in the plain :O tag, so fall back to that
+                        # (and a standard output always uses :O).
+                        out_inner = self._output_inner
+                        if ("Safety" in c.get("type", "")
+                                and self._safety_output_inner is not None):
+                            out_inner = self._safety_output_inner
+                        tag_stubs += _io_tag("OutputTag", out_inner)
                 # Connection point / size attributes, present only when OEM emits
                 # them (a generic/drive Output connection, or a data-driven one).
                 extra = "".join(
@@ -4487,6 +4501,7 @@ class ModuleBuilder(L5xElementBuilder):
         config_size = None
         input_inner = None
         output_inner = None
+        safety_output_inner = None
         status_inner = None
         rack_has_input = False
         rack_has_output = False
@@ -4516,10 +4531,11 @@ class ModuleBuilder(L5xElementBuilder):
             if cfg is not None:
                 config_inner, config_size = cfg
             # A module owns one input family: plain :I, safety :SI, or IO-Link :I1
-            # (never mixed). The safety output :SO carries no data so output is only
-            # ever plain :O or :O1.
+            # (never mixed). A standard output uses :O/:O1; a safety output uses the
+            # separate :SO tag (chosen per-connection in Module.to_xml by type).
             input_inner = entry.get("I") or entry.get("SI") or entry.get("I1")
             output_inner = entry.get("O") or entry.get("O1")
+            safety_output_inner = entry.get("SO")
             status_inner = entry.get("S")
             rack_has_input = bool(entry.get("has_I"))
             rack_has_output = bool(entry.get("has_O"))
@@ -4777,6 +4793,7 @@ class ModuleBuilder(L5xElementBuilder):
             _config_size=config_size,
             _input_inner=input_inner,
             _output_inner=output_inner,
+            _safety_output_inner=safety_output_inner,
             _status_inner=status_inner,
             _rack_has_input=rack_has_input,
             _rack_has_output=rack_has_output,
@@ -8640,14 +8657,13 @@ class ControllerBuilder(L5xElementBuilder):
                 # tag) keeps it minus the raw value block and any <AlarmConditions>.
                 if tag._io and tag._value_bytes:
                     # Suffix may be a plain C/I/O/S, a safety input :SI / config :SC,
-                    # or an IO-Link numbered I1/O1/I2/O2 (a module owns one family);
-                    # all route to the same config/input/output slots downstream. The
-                    # safety OUTPUT :SO is deliberately excluded: an OEM safety
-                    # OutputTag carries no Decorated <Data> (only operand <Comments>),
-                    # so reusing the backing tag's data block over-emits a wrong
-                    # <Structure>. Safety inputs and configs DO carry Decorated data.
+                    # safety output :SO, or an IO-Link numbered I1/O1/I2/O2 (a module
+                    # owns one input family but may own a :SO alongside a standard :O).
+                    # The safety OUTPUT :SO is kept verbatim like a standard output:
+                    # every OEM safety OutputTag in the pool carries the same Decorated
+                    # <Data> structure the backing tag renders (validated 139/139).
                     cm = re.match(
-                        r"^&([0-9a-fA-F]+)(?::(\d+))?:(SI|SC|I1|I2|O1|O2|[CIOS])$",
+                        r"^&([0-9a-fA-F]+)(?::(\d+))?:(SI|SC|SO|I1|I2|O1|O2|[CIOS])$",
                         result[0])
                     if cm:
                         ref_oid = int(cm.group(1), 16)
@@ -8663,7 +8679,8 @@ class ControllerBuilder(L5xElementBuilder):
                             # ConfigSize = first u32 of the config image minus 4.
                             size = int.from_bytes(tag._value_bytes[0:4], "little") - 4
                             slot_entry["C"] = (inner, size)
-                        elif io_type[0] == "O" and inner:
+                        elif io_type in ("O", "O1", "O2", "SO") and inner:
+                            # Output tags (standard and safety) keep the inner verbatim.
                             slot_entry[io_type] = inner
                         elif inner:  # I*/S* input/status tags: strip the raw value block
                             si = _strip_input_tag_inner(inner)
