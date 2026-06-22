@@ -147,6 +147,10 @@ class DataType(L5xElement):
     # short-header DataTypeBuilder path; defaults False so the V24+/V36 long
     # path keeps its exact prior behaviour.
     _emit_predefined: bool = field(default=False)
+    # Verbatim <CustomProperties> provider block (library raC_*/STR* UDTs only),
+    # recovered from Comments.Dat; None for ordinary datatypes. Rendered as the
+    # first child (before Description/Members), matching the reference order.
+    _custom_properties: Union[str, None] = field(default=None)
 
     def __post_init__(self):
         super().__post_init__()
@@ -167,11 +171,15 @@ class DataType(L5xElement):
         # untouched.
         if self._emit_predefined and not self.members:
             base = base.replace("<Members></Members>", "").replace("<Members/>", "")
-        if not self._description:
+        # CustomProperties is the first child (before Description), then Description.
+        prefix = self._custom_properties or ""
+        if self._description:
+            prefix += (f'<Description>\n<![CDATA[{_xml_sane(self._description)}]]>\n'
+                       f'</Description>')
+        if not prefix:
             return base
-        desc_xml = f'<Description>\n<![CDATA[{_xml_sane(self._description)}]]>\n</Description>'
         idx = base.index(">")
-        return base[:idx + 1] + desc_xml + base[idx + 1:]
+        return base[:idx + 1] + prefix + base[idx + 1:]
 
 
 # Maps primitive DataType names to their L5K zero-default value string.
@@ -3577,7 +3585,27 @@ class DataTypeBuilder(L5xElementBuilder):
             if desc_row and desc_row[0]:
                 description = desc_row[0]
 
-        dt = DataType(name, name, string_family, class_type, children, description)
+        # Library raC_*/STR* UDTs carry a verbatim <CustomProperties> provider block
+        # captured into the custom_properties table, keyed by this datatype's
+        # comment_id (only datatypes whose record cip_type is 108 own one).
+        custom_props = None
+        try:
+            if getattr(r, "cip_type", None) == 108:
+                cp_rows = self._cur.execute(
+                    "SELECT provider_id, ext, blob FROM custom_properties WHERE cid=?",
+                    (r.comment_id,)).fetchall()
+                if cp_rows:
+                    cp_rows.sort(key=lambda t: int(t[1])
+                                 if str(t[1]).lstrip('-').isdigit() else 0)
+                    inner = "\n".join(
+                        f'<Provider ID="{pid}" Ext="{ext}">\n{blob}\n</Provider>'
+                        for pid, ext, blob in cp_rows)
+                    custom_props = f'<CustomProperties>\n{inner}\n</CustomProperties>'
+        except Exception:
+            custom_props = None
+
+        dt = DataType(name, name, string_family, class_type, children, description,
+                      _custom_properties=custom_props)
         dt._emit_predefined = self._short_header
         return dt
 

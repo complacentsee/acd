@@ -343,6 +343,12 @@ class ExportL5x:
         self._cur.execute(
             "CREATE TABLE named_safety_signatures(otype int, name text, signature text, timestamp text)"
         )
+        # Library DataTypes (Rockwell raC_*/STR* UDTs) carry a verbatim
+        # <CustomProperties> <Provider> block that the comment parser drops; capture
+        # each provider record (otype 108) keyed by the owning DataType's comment_id.
+        self._cur.execute(
+            "CREATE TABLE custom_properties(cid int, ext text, provider_id text, blob text)"
+        )
         _sig_needle = "SignatureID\x11GSS\x00".encode("utf-16-le")
         _ts_needle = "Timestamp\x11GSS\x00".encode("utf-16-le")
         # Same markers without the trailing NUL, so they also match the NAMED
@@ -367,12 +373,26 @@ class ExportL5x:
         _gss: Dict[tuple, list] = {}
         _gss3: Dict[tuple, list] = {}
         _named: Dict[tuple, list] = {}
+        _cp: List[tuple] = []
         for _rec in comments_db.records.record:
             _buf = bytes(_rec.record.record_buffer)
             if len(_buf) < 16:
                 continue
             _otype = struct.unpack_from("<H", _buf, 10)[0]
             _cid = struct.unpack_from("<I", _buf, 12)[0]
+            # <CustomProperties> provider record: otype 108, ID terminated by 0x11,
+            # Ext terminated by 0x12, then the verbatim inner XML to the trailing NUL.
+            if _otype == 108 and len(_buf) >= 32 and (b'<Header' in _buf or b'<Data' in _buf):
+                _sep = _buf.find(b'\x11\x00', 26)
+                _m12 = _buf.find(b'\x12\x00', _sep + 2) if _sep >= 0 else -1
+                _lt = _buf.find(b'<', _m12) if _m12 >= 0 else -1
+                if _sep >= 0 and _m12 >= 0 and _lt >= 0:
+                    _cp.append((
+                        _cid,
+                        _buf[_sep + 2:_m12].decode("utf-16-le", "replace"),
+                        _buf[30:_sep].decode("utf-16-le", "replace"),
+                        _buf[_lt:].rstrip(b"\x00").decode("latin-1", "replace"),
+                    ))
             _key = (_otype, _cid)
             _key3 = (_otype, _cid,
                      struct.unpack_from("<I", _buf, 16)[0] if len(_buf) >= 20 else 0)
@@ -419,6 +439,8 @@ class ExportL5x:
         self._cur.executemany(
             "INSERT INTO named_safety_signatures VALUES (?,?,?,?)",
             [(k[0], k[1], v[0], v[1]) for k, v in _named.items() if v[0]])
+        self._cur.executemany(
+            "INSERT INTO custom_properties VALUES (?,?,?,?)", _cp)
         self._db.commit()
 
         log.info(
