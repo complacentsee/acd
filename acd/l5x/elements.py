@@ -1,3 +1,4 @@
+import base64
 import html
 import math
 import os
@@ -2820,6 +2821,9 @@ class Controller(L5xElement):
     _ctrl_attr_signature: Union[tuple, None] = field(default=None)
     _tag_map_signature: Union[tuple, None] = field(default=None)
     _app_rollup_signature: Union[tuple, None] = field(default=None)
+    # Pre-rendered attribute string for the <SafetyInfo> open tag (recovered from the
+    # SafetyController record); "" on a non-safety project -> empty <SafetyInfo/>.
+    _safety_info_attrs: str = field(default="")
 
     def __post_init__(self):
         super().__post_init__()
@@ -2895,7 +2899,12 @@ class Controller(L5xElement):
                 ts = (f' Timestamp="{html.escape(pair[1], quote=True)}"'
                       if pair[1] else "")
                 children += f'<{tag} Signature="{pair[0]}"{ts}/>'
-        return f'<SafetyInfo>{children}</SafetyInfo>' if children else '<SafetyInfo/>'
+        attrs = self._safety_info_attrs or ""
+        if children:
+            return f'<SafetyInfo{attrs}>{children}</SafetyInfo>'
+        if attrs:
+            return f'<SafetyInfo{attrs}/>'
+        return '<SafetyInfo/>'
 
 
 # Matches an emitted tag-value Format="L5K" <Data> block: group 1 = the open tag
@@ -7215,6 +7224,103 @@ def _tagcoll_sig_attrs(cur, oid, short_header):
     return ""
 
 
+def _utf16z(buf, start):
+    """Decode a NUL-terminated UTF-16-LE string at buf[start:], scanning the
+    terminator on a 2-byte boundary. Returns (string, index past terminator)."""
+    i = start
+    while i + 1 < len(buf) and not (buf[i] == 0 and buf[i + 1] == 0):
+        i += 2
+    return buf[start:i].decode("utf-16-le", "replace"), i + 2
+
+
+def _safety_signature_attr_value(cur, rec):
+    """The <SafetyInfo> @SafetySignature value ('HEXWORDS, date, time') or None.
+    Short-header projects keep the single-word signature in a Nameless.Dat record
+    marked 94 8f c2 c7 47 ad d9 f3 (the hash then a separate date + time string);
+    long-header projects store a contiguous uppercase-hex run plus a length-prefixed
+    (0x1b) timestamp inside the SafetyController record."""
+    try:
+        for (nr,) in cur.execute("SELECT record FROM nameless").fetchall():
+            nr = bytes(nr)
+            if len(nr) < 24 or nr[8:16] != bytes.fromhex("948fc2c747add9f3"):
+                continue
+            sighex = "%08X" % struct.unpack_from("<I", nr, 20)[0]
+            date, nx = _utf16z(nr, 24)
+            tm, _ = _utf16z(nr, nx)
+            return f"{sighex}, {date}, {tm}"
+    except Exception:
+        pass
+    mh = re.search(rb"[0-9A-F]{16,}", rec)
+    mt = re.search(
+        rb"\x1b\x00\x00\x00(\d\d/\d\d/\d{4}, \d\d:\d\d:\d\d\.\d{3} [AP]M)", rec)
+    if mh and mt:
+        h = mh.group().decode()
+        if len(h) % 8 == 0 and set(h) != {"0"}:
+            words = " - ".join(h[i:i + 8] for i in range(0, len(h), 8))
+            return words + ", " + mt.group(1).decode()
+    return None
+
+
+def _safety_info_attr_string(cur, short_header):
+    """Attribute string for the <SafetyInfo> open tag, recovered from the
+    SafetyController comps record; '' when the project has no SafetyController (an
+    unsigned / non-safety project, which keeps the empty <SafetyInfo/>). The
+    SafetyController record is present in exactly the projects whose reference
+    <SafetyInfo> carries attributes, so this is 0-false-positive."""
+    row = cur.execute(
+        "SELECT record FROM comps WHERE comp_name='SafetyController'").fetchone()
+    if not row or not row[0]:
+        return ""
+    rec = bytes(row[0])
+    attrs: Dict[str, str] = {}
+    anch = rec.find(bytes.fromhex("34030000ffffffff00000000ffffffff"))
+    if anch >= 0 and len(rec) > anch + 80:
+        attrs["SafetyLocked"] = "true" if rec[anch + 78] == 1 else "false"
+        attrs["ConfigureSafetyIOAlways"] = "true" if rec[anch + 80] == 1 else "false"
+        attrs["SignatureRunModeProtect"] = "false"
+    if not short_header:
+        attrs["SafetyLevel"] = "SIL2/PLd"
+    sig = _safety_signature_attr_value(cur, rec)
+    if sig:
+        attrs["SafetySignature"] = sig
+    # Lock/Unlock passwords: 40-byte blocks following each 0x28 0x00 marker, in
+    # record order. Two blocks (leading byte 0x0d) are a cp1252 string re-encoded
+    # UTF-16-LE then base64 (Lock then Unlock); a single block (leading byte 0x01)
+    # is base64'd verbatim (Unlock only). Validated 0-FP across the SafetyController
+    # files (no other file produces blocks).
+    blocks = []
+    pos = 0
+    while True:
+        j = rec.find(b"\x28\x00", pos)
+        if j < 0:
+            break
+        blk = rec[j + 2:j + 2 + 40]
+        if len(blk) == 40:
+            blocks.append(blk)
+        pos = j + 2
+
+    def _enc_cp1252(blk):
+        try:
+            return base64.b64encode(
+                blk.decode("cp1252").encode("utf-16-le")).decode().rstrip("=")
+        except Exception:
+            return None
+    if len(blocks) >= 2:
+        lock = _enc_cp1252(blocks[0])
+        unlock = _enc_cp1252(blocks[1])
+        if lock:
+            attrs["SafetyLockPassword"] = lock
+        if unlock:
+            attrs["SafetyUnlockPassword"] = unlock
+    elif len(blocks) == 1:
+        attrs["SafetyUnlockPassword"] = base64.b64encode(blocks[0]).decode().rstrip("=")
+    order = ("SafetySignature", "SafetyLocked", "SafetyLockPassword",
+             "SafetyUnlockPassword", "SignatureRunModeProtect",
+             "ConfigureSafetyIOAlways", "SafetyLevel")
+    return "".join(f' {k}="{html.escape(attrs[k], quote=True)}"'
+                   for k in order if k in attrs)
+
+
 @dataclass
 class ProgramBuilder(L5xElementBuilder):
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
@@ -8788,6 +8894,7 @@ class ControllerBuilder(L5xElementBuilder):
         ctrl_attr_sig = _named_sig(820, "")
         tag_map_sig = _named_sig(112, "TagMap")
         app_rollup_sig = _named_sig(142, "")
+        safety_info_attrs = _safety_info_attr_string(self._cur, self._short_header)
 
         controller = Controller(
             controller_name,
@@ -8841,6 +8948,7 @@ class ControllerBuilder(L5xElementBuilder):
             _ctrl_attr_signature=ctrl_attr_sig,
             _tag_map_signature=tag_map_sig,
             _app_rollup_signature=app_rollup_sig,
+            _safety_info_attrs=safety_info_attrs,
         )
         # Controller-scoped <Tags> safety signature (separate from the AOI-section one).
         if _ctrl_tags_sig:
