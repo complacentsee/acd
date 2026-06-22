@@ -2217,6 +2217,7 @@ class Module(L5xElement):
     _ud_product_code: Union[int, None] = field(default=None)
     _ud_major: Union[int, None] = field(default=None)
     _ud_minor: Union[int, None] = field(default=None)
+    _ud_catalog_number: Union[str, None] = field(default=None)
     _shutdown_parent_on_fault: Union[str, None] = field(default=None)
 
     def __post_init__(self):
@@ -2251,6 +2252,9 @@ class Module(L5xElement):
             )
         shutdown_attr = (f' ShutdownParentOnFault="{self._shutdown_parent_on_fault}"'
                          if self._shutdown_parent_on_fault is not None else "")
+        # UserDefinedCatalogNumber is the last <Module> attribute in the reference.
+        udcn_attr = (f' UserDefinedCatalogNumber="{html.escape(self._ud_catalog_number, quote=True)}"'
+                     if self._ud_catalog_number else "")
         attrs = (
             f'{name_attr}'
             f'CatalogNumber="{self.catalog_number}" '
@@ -2263,7 +2267,7 @@ class Module(L5xElement):
             f'ParentModPortId="{self.parent_mod_port_id}" '
             f'Inhibited="{self.inhibited}" '
             f'MajorFault="{self.major_fault}"{shutdown_attr}'
-            f'{safety_attr}'
+            f'{safety_attr}{udcn_attr}'
         )
 
         # Optional <Description>
@@ -3722,6 +3726,39 @@ class ModuleBuilder(L5xElementBuilder):
                 return after_pub.rstrip("\x00 \r\n")
         return ""
 
+    def _udcn_from_data_collection(self, data_link: int) -> Union[str, None]:
+        """UserDefinedCatalogNumber (device-profile name) for a drive-peripheral
+        module. The profile record is the RxDataCollection child linked by the same
+        comment_id the ports/ExtendedProperties use (rec[12:14] == data_link & 0xFFFF);
+        its <UDCN>...</UDCN> tag is in the raw record bytes on short-header projects
+        and in the decrypted ext-attr 0x66 image on long-header ones. None when the
+        linked record carries no <UDCN> (the drive itself, not a peripheral)."""
+        if not data_link:
+            return None
+        want = data_link & 0xFFFF
+        coll_oids = [r[0] for r in self._cur.execute(
+            "SELECT object_id FROM comps WHERE comp_name='RxDataCollection'").fetchall()]
+        for coll_oid in coll_oids:
+            for oid, raw in self._cur.execute(
+                    "SELECT object_id, record FROM comps WHERE parent_id=?", (coll_oid,)).fetchall():
+                raw = bytes(raw) if raw else b""
+                if len(raw) < 14 or int.from_bytes(raw[12:14], "little") != want:
+                    continue
+                m = re.search(rb"<UDCN>([^<]*)</UDCN>", raw)
+                if not m:
+                    cf = self._cur.execute(
+                        "SELECT record FROM comps_full WHERE object_id=?", (oid,)).fetchone()
+                    if cf and cf[0]:
+                        try:
+                            img = CompsRecord.read_value_attrs(
+                                bytes(cf[0]), self._short_header, full=True).get(0x66, b"")
+                        except Exception:
+                            img = b""
+                        m = re.search(rb"<UDCN>([^<]*)</UDCN>", img)
+                if m:
+                    return m.group(1).decode("ascii", errors="replace") or None
+        return None
+
     def _comm_method_from_data_link(self, data_link: int) -> "Union[str, None]":
         """Resolve CommMethod (<CF>) from the module's comment_id link.
 
@@ -4195,6 +4232,10 @@ class ModuleBuilder(L5xElementBuilder):
         # STAGING: CommMethod resolved via the comment_id link (full Communications).
         comm_method = self._comm_method_from_data_link(data_link)
         extended_properties = self._extended_properties_from_data_collection(data_link)
+        # Drive-peripheral modules name their underlying device in
+        # UserDefinedCatalogNumber, recovered from the linked device-profile record.
+        ud_catalog_number = (self._udcn_from_data_collection(data_link)
+                             if ud_vendor is not None else None)
 
         # Read individual connection records from RxMapConnectionCollection children.
         # Each child's comp_name is the connection Name in the L5X output.
@@ -4626,6 +4667,7 @@ class ModuleBuilder(L5xElementBuilder):
             _ud_product_code=ud_product_code,
             _ud_major=ud_major,
             _ud_minor=ud_minor,
+            _ud_catalog_number=ud_catalog_number,
             _shutdown_parent_on_fault=shutdown_parent_on_fault,
         )
 
