@@ -2746,6 +2746,16 @@ class Controller(L5xElement):
     # with these two attributes; both None on a standard/unsigned project (omitted).
     _aoi_safety_signature: Union[str, None] = field(default=None)
     _aoi_safety_signature_timestamp: Union[str, None] = field(default=None)
+    # Controller-properties attributes recovered from the controller record's
+    # decrypted ext-attrs (None -> attribute omitted). A classic controller carries
+    # the continuous-task slice (time_slice / share_unused_time_slice) and, on the
+    # pre-V21 save format, compatibility_mode; a 5x80 controller carries
+    # ethernet_ip_mode instead. power_loss_program is an optional program name.
+    time_slice: Union[str, None] = field(default=None)
+    share_unused_time_slice: Union[str, None] = field(default=None)
+    compatibility_mode: Union[str, None] = field(default=None)
+    ethernet_ip_mode: Union[str, None] = field(default=None)
+    power_loss_program: Union[str, None] = field(default=None)
 
     def __post_init__(self):
         super().__post_init__()
@@ -2755,6 +2765,7 @@ class Controller(L5xElement):
             "sfc_last_scan": "SFCLastScan",
             "project_sn": "ProjectSN",
             "can_use_rpi_from_producer": "CanUseRPIFromProducer",
+            "ethernet_ip_mode": "EtherNetIPMode",
         }
         self._section_attrs: Dict[str, str] = {}
         if self._aoi_safety_signature is not None:
@@ -7521,6 +7532,51 @@ class ControllerBuilder(L5xElementBuilder):
         _ctrl_ext001 = extended_records.get(0x001, b"")
         redundancy_enabled: bool = bool(_ctrl_ext001[0x0E]) if len(_ctrl_ext001) > 0x0E else False
 
+        # Controller-properties attributes. These live in the controller record's
+        # decrypted ext-attrs, which the kaitai extended_records cannot reach on
+        # short-header (V10-V21) projects, so read them via read_value_attrs(full=True)
+        # on the comps_full record (the same dict the force gate uses).
+        time_slice = None
+        share_unused_time_slice = None
+        compatibility_mode = None
+        ethernet_ip_mode = None
+        power_loss_program = None
+        try:
+            self._cur.execute(
+                "SELECT record FROM comps_full WHERE object_id=?", (results[0][1],))
+            _ctlrow = self._cur.fetchone()
+            _ctlattrs = (CompsRecord.read_value_attrs(
+                bytes(_ctlrow[0]), self._short_header, full=True) if _ctlrow else {})
+        except Exception:
+            _ctlattrs = {}
+        _ctlblob = _ctlattrs.get(0x1, b"")
+        # The continuous-task slice is carried by classic controllers, marked by
+        # blob[16]==0x5a; 5x80 controllers (blob[16]==0) carry EtherNetIPMode instead.
+        if len(_ctlblob) > 25 and _ctlblob[16] == 0x5A:
+            time_slice = str(struct.unpack_from("<H", _ctlblob, 4)[0])
+            share_unused_time_slice = str(_ctlblob[25] & 1)
+        # CompatibilityMode "V20.01" marks the pre-V21 classic save format, whose
+        # controller-properties blob is exactly 62 bytes.
+        if len(_ctlblob) == 62:
+            compatibility_mode = "V20.01"
+        # EtherNetIPMode: ext-attr 0x7c is a u16 dual-port mode index on 5x80
+        # controllers (1 -> Dual-IP, 2 -> Linear/DLR).
+        _eth = _ctlattrs.get(0x7C)
+        if _eth is not None and len(_eth) >= 2:
+            ethernet_ip_mode = {1: "A1/A2: Dual-IP", 2: "A1/A2: Linear/DLR"}.get(
+                struct.unpack_from("<H", _eth, 0)[0])
+        # PowerLossProgram: ext-attr 0x67 holds the program object id (same scheme as
+        # MajorFaultProgram at 0x68); 0 / 0xffffffff means none.
+        _plp = _ctlattrs.get(0x67)
+        if _plp is not None and len(_plp) >= 4:
+            _plp_oid = struct.unpack_from("<I", _plp, 0)[0]
+            if _plp_oid not in (0, 0xFFFFFFFF):
+                self._cur.execute(
+                    "SELECT comp_name FROM comps WHERE object_id=?", (_plp_oid,))
+                _plp_row = self._cur.fetchone()
+                if _plp_row:
+                    power_loss_program = _plp_row[0]
+
         self._object_id = results[0][1]
         controller_name = results[0][0]
 
@@ -8250,6 +8306,11 @@ class ControllerBuilder(L5xElementBuilder):
             _description=controller_description,
             _aoi_safety_signature=aoi_sig,
             _aoi_safety_signature_timestamp=aoi_sig_ts,
+            time_slice=time_slice,
+            share_unused_time_slice=share_unused_time_slice,
+            compatibility_mode=compatibility_mode,
+            ethernet_ip_mode=ethernet_ip_mode,
+            power_loss_program=power_loss_program,
         )
 
 
