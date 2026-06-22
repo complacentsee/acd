@@ -4014,6 +4014,12 @@ class ModuleBuilder(L5xElementBuilder):
         if name == "?" and vendor == 1 and product_type in (142, 143, 150, 127):
             product_code = 29 if product_type in (150, 127) else 28
             product_type = 0
+            # The reference exports these drive-peripheral modules with a fixed
+            # Major/Minor of 1/1 (the peripheral's own firmware revision in the
+            # identity record is not surfaced); verified 135/135 (99 RHINOBP +
+            # 36 DSI) pool-wide.
+            major = 1
+            minor = 1
 
         # Resolve parent module name from the modid→name map built by ControllerBuilder.
         parent_name = self._modid_to_name.get(parent_modid, "Local")
@@ -4026,6 +4032,12 @@ class ModuleBuilder(L5xElementBuilder):
         # parent_module==name directly (see ControllerBuilder), so it no longer
         # piggy-backs on this attribute.
         major_fault = "true" if (len(e1) > 0x14 and (e1[0x14] & 0x01)) else "false"
+        # Inhibited: bit 2 (0x04) of the same flag byte e1[0x14] that holds
+        # ConfiguredAsMajorFault (bit 0). Set when the user inhibited the module.
+        # Validated bool(e1[0x14] & 0x04) pool-wide vs OEM: 110 true / 1845 false,
+        # 0 false-positives / 0 false-negatives (every other bit of e1[0x14]
+        # mis-classifies >=110 modules).
+        inhibited = "true" if (len(e1) > 0x14 and (e1[0x14] & 0x04)) else "false"
         # EKey state from the keying mask at e1[0x0a]: 0 = no keying (Disabled),
         # nonzero (0x1f = all identity fields keyed) = a keyed module. Both
         # ExactMatch and CompatibleModule carry the full 0x1f mask, so the mask
@@ -4471,8 +4483,11 @@ class ModuleBuilder(L5xElementBuilder):
             major,
             minor,
             parent_name,
-            parent_port,
-            "false",        # Inhibited: always false in practice; no known bit
+            # The root controller module always references backplane port 1; its
+            # identity record sometimes stores a different upstream port id (seen as
+            # 2 on a subset of projects). Verified 116/116 roots = 1 vs OEM.
+            1 if is_root else parent_port,
+            inhibited,
             major_fault,
             _is_root=is_root,
             _class_word=class_word,
