@@ -3994,8 +3994,12 @@ class ModuleBuilder(L5xElementBuilder):
             # controller's -- fall back to the static catalog instead of emitting
             # FLEX ports for a CompactLogix. (Fail-safe: too-strict only forfeits a
             # recovery, never regresses.)
+            # Prefix match: "Compact" covers Compact / CompactLogixL3xController /
+            # CompactVirtualAdapter (CPUs name their own backplane port with the full
+            # catalog), while FLEX-adapter types (Flex/FlexAC/FlexVA) match nothing
+            # and are rejected.
             if res and validate_controller and not any(
-                    f'Type="{t}"' in res
+                    f'Type="{t}' in res
                     for t in ("ICP", "Compact", "5069", "1768Ctrl3Slot", "PointIO")):
                 return None
             return res
@@ -4155,6 +4159,12 @@ class ModuleBuilder(L5xElementBuilder):
                     ba = dict(_re.findall(r'(\w+)=["\']([^"\']*)["\']', bm.group(1)))
                     bus = ba.get("Size") if ba.get("Size") is not None else ""
             if bus is None and upstream == "false" and ptype == "Ethernet":
+                bus = ""
+            # A CompactLogix embedded-CPU backplane port (the full-catalog type names
+            # CompactLogixL3xController / ...EController) carries an empty <Bus/> in
+            # OEM that the blob leaves implied (port self-closed). Validated: every
+            # CompactLogix*-typed Upstream=false port in the pool has an empty Bus.
+            if bus is None and upstream == "false" and ptype.startswith("CompactLogix"):
                 bus = ""
             try:
                 _pidi = int(pid)
