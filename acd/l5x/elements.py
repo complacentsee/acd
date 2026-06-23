@@ -1706,6 +1706,9 @@ class Tag(L5xElement):
     # Pre-rendered <Data Format="Message"> block for a MESSAGE tag, resolved by
     # ControllerBuilder once the module topology is complete. None -> no <Data>.
     _message_data_xml: Union[str, None] = field(default=None)
+    # Pre-rendered <Data Format="Alarm"> block for an ALARM_DIGITAL tag, resolved
+    # by ControllerBuilder from the tag's data-table backing. None -> no <Data>.
+    _alarm_data_xml: Union[str, None] = field(default=None)
 
     def _inject_tag_attrs(self, base: str) -> str:
         """Insert OpcUaAccess / Class attributes into the opening <Tag ...> of base.
@@ -2004,6 +2007,12 @@ class Tag(L5xElement):
         # the configuration decoded with full confidence.
         if not data_xml and not self._no_data and self._message_data_xml:
             data_xml = self._message_data_xml
+
+        # --- ALARM_DIGITAL tag <Data Format="Alarm"> block ---
+        # ALARM_DIGITAL is in _SKIP_DECORATED (it uses a dedicated Alarm format, not
+        # a Decorated structure); the block is resolved by the controller builder.
+        if not data_xml and not self._no_data and self._alarm_data_xml:
+            data_xml = self._alarm_data_xml
 
         # --- ConsumeInfo child (Consumed tags) ---
         # OEM emits <ConsumeInfo> as the FIRST child of a Consumed tag, before
@@ -7112,6 +7121,59 @@ class AoiBuilder(L5xElementBuilder):
 # Boolean <AlarmCondition> attributes the reference always emits "false" (none of
 # the ~1500 pool conditions has any of these set). Severity-bit fields cover only
 # Used/AlarmSet*/AckRequired (see _build_alarm_conditions).
+# AlarmDigitalParameters boolean attributes in OEM order; bit i of the backing
+# AlarmControlFlags word (V20/21 short-header form, 20 bits).
+_ADP_BITS = (
+    "EnableIn", "In", "InFault", "Condition", "AckRequired", "Latched",
+    "ProgAck", "OperAck", "ProgReset", "OperReset", "ProgSuppress", "OperSuppress",
+    "ProgUnsuppress", "OperUnsuppress", "ProgDisable", "OperDisable", "ProgEnable",
+    "OperEnable", "AlarmCountReset", "UseProgTime",
+)
+
+
+def _render_alarm_digital_data(cur, short_header, dti):
+    """Render an ALARM_DIGITAL tag's <Data Format="Alarm"> block, or None.
+
+    The configuration lives in the tag's cip-0x6a data-table backing (object id ==
+    data_table_instance): ext-attr 0x01 carries a 20-bit AlarmControlFlags word at
+    offset 141, Severity (DINT @145), MinDurationPRE (DINT @149), and a u16 message
+    join key (@0) that joins into the alarm_messages side table. V20/21 short-header
+    form only. Returns None on any failure so the tag keeps its prior no-<Data>.
+    """
+    try:
+        if not dti:
+            return None
+        row = cur.execute(
+            "SELECT record FROM comps_full WHERE object_id=?", (dti,)).fetchone()
+        if not row or row[0] is None:
+            return None
+        e1 = CompsRecord.read_value_attrs(
+            bytes(row[0]), short_header, full=True).get(0x01, b"")
+        if len(e1) < 153:
+            return None
+        flags = struct.unpack_from("<I", e1, 141)[0]
+        severity = struct.unpack_from("<i", e1, 145)[0]
+        min_dur = struct.unpack_from("<i", e1, 149)[0]
+        joinkey = struct.unpack_from("<H", e1, 0)[0]
+        attrs = [f'Severity="{severity}"', f'MinDurationPRE="{min_dur}"',
+                 'ProgTime="DT#1970-01-01-00:00:00.000000Z"']
+        for i, name in enumerate(_ADP_BITS):
+            attrs.append(f'{name}="{"true" if (flags >> i) & 1 else "false"}"')
+        adp = "<AlarmDigitalParameters " + " ".join(attrs) + " />"
+        mrow = cur.execute(
+            "SELECT mtype, text FROM alarm_messages WHERE joinkey=?",
+            (joinkey,)).fetchone()
+        if mrow and mrow[1]:
+            msg = (f'<Messages>\n<Message Type="{html.escape(mrow[0], quote=True)}">\n'
+                   f'<Text Lang="en-US">\n{html.escape(mrow[1])}\n</Text>\n'
+                   f'</Message>\n</Messages>')
+        else:
+            msg = "<Messages />"
+        return f'<Data Format="Alarm">\n{adp}\n<AlarmConfig>\n{msg}\n</AlarmConfig>\n</Data>'
+    except Exception:
+        return None
+
+
 _ALARM_FALSE_BOOLS = (
     "InFault", "Latched", "ProgAck", "OperAck", "ProgReset", "OperReset",
     "ProgSuppress", "OperSuppress", "ProgUnsuppress", "OperUnsuppress",
@@ -9066,6 +9128,21 @@ class ControllerBuilder(L5xElementBuilder):
                         _msg_oid2name, _msg_nr, _msg_rc, _msg_ips)
         except Exception:
             pass
+
+        # ALARM_DIGITAL tags carry a dedicated <Data Format="Alarm"> block decoded
+        # from their data-table backing. Short-header (V20/21) form only; the V31+
+        # variant (extra Shelve attrs/bools) is not emitted here.
+        if self._short_header:
+            try:
+                _al_tags = list(tags)
+                for _prog in programs:
+                    _al_tags.extend(_prog.tags)
+                for _at in _al_tags:
+                    if (_at.data_type or "").upper() == "ALARM_DIGITAL" and _at.tag_type != "Alias":
+                        _at._alarm_data_xml = _render_alarm_digital_data(
+                            self._cur, self._short_header, _at._data_table_instance)
+            except Exception:
+                pass
 
         # CIP Motion: a 2094-family integrated-motion drive (ProductType 37) that
         # has no axis assigned to it exports its MotionSync connection with RPI 0

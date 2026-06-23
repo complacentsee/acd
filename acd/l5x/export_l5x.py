@@ -349,6 +349,13 @@ class ExportL5x:
         self._cur.execute(
             "CREATE TABLE custom_properties(cid int, ext text, provider_id text, blob text)"
         )
+        # ALARM_DIGITAL/ANALOG tag <Message> text: a Comments.Dat record marked
+        # 0x0331 (u16 @ buf[8]) carries the alarm message, keyed by a u16 join key
+        # (buf[10]) that equals the alarm tag's data-table backing first u16. The
+        # body holds a 2-letter Type ("AM") then the UTF-16 message text.
+        self._cur.execute(
+            "CREATE TABLE alarm_messages(joinkey int, mtype text, text text)"
+        )
         _sig_needle = "SignatureID\x11GSS\x00".encode("utf-16-le")
         _ts_needle = "Timestamp\x11GSS\x00".encode("utf-16-le")
         # Same markers without the trailing NUL, so they also match the NAMED
@@ -374,9 +381,24 @@ class ExportL5x:
         _gss3: Dict[tuple, list] = {}
         _named: Dict[tuple, list] = {}
         _cp: List[tuple] = []
+        _amsg: List[tuple] = []
         for _rec in comments_db.records.record:
             _buf = bytes(_rec.record.record_buffer)
             if len(_buf) < 16:
+                continue
+            # ALARM_DIGITAL/ANALOG <Message> record (0x0331 at buf[8]); the join key
+            # (u16 @ buf[10]) equals the alarm tag's backing value first u16. The
+            # message text sits at an odd byte offset, so anchor the UTF-16 decode on
+            # the 2-letter Type token rather than slicing from an even base.
+            if struct.unpack_from("<H", _buf, 8)[0] == 0x0331:
+                _jk = struct.unpack_from("<H", _buf, 10)[0]
+                _tm = re.search(rb"[A-Z]\x00[A-Z]\x00", _buf[12:])
+                if _tm:
+                    _mtype = _tm.group(0).decode("utf-16-le")
+                    _rest = _buf[12 + _tm.start() + 4:].decode("utf-16-le", "replace")
+                    _toks = [t.strip() for t in _rest.split("\x00") if t.strip()]
+                    if _toks:
+                        _amsg.append((_jk, _mtype, _toks[0]))
                 continue
             _otype = struct.unpack_from("<H", _buf, 10)[0]
             _cid = struct.unpack_from("<I", _buf, 12)[0]
@@ -441,6 +463,8 @@ class ExportL5x:
             [(k[0], k[1], v[0], v[1]) for k, v in _named.items() if v[0]])
         self._cur.executemany(
             "INSERT INTO custom_properties VALUES (?,?,?,?)", _cp)
+        self._cur.executemany(
+            "INSERT INTO alarm_messages VALUES (?,?,?)", _amsg)
         self._db.commit()
 
         log.info(
