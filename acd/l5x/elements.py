@@ -7174,6 +7174,28 @@ def _render_alarm_digital_data(cur, short_header, dti):
         return None
 
 
+# A source-protected AOI is exported by Studio as an <EncodedData> blob, never a
+# plaintext <AddOnInstructionDefinition>; our decoder would emit a spurious plaintext
+# definition (element_extra). The protection state lives in the AOI definition comp
+# (record_type=256 under RxUDIDefinitionCollection): the long key-bearing layout
+# (len 525) holds a 16-byte protection-key hash at offset 362 -- a fixed sentinel
+# for unprotected AOIs, a per-license hash (e.g. an OEM's source-protection key) when
+# protected; the V32 wholesale-encrypted layout (len 450) is always protected.
+# Validated pool-wide: 0 false positives (every kept AOI is len!=450 and, when 525,
+# carries the sentinel). A few Rockwell library seals (PackMLv3) are byte-identical to
+# unprotected AOIs here and are NOT detectable -- a known floor.
+_AOI_NO_PROTECTION_HASH = bytes.fromhex("4d53d3ff6f158fc1cbf49bcdc8d2f9a7")
+
+
+def _aoi_is_source_protected(rec: bytes) -> bool:
+    n = len(rec)
+    if n == 450:
+        return True
+    if n == 525 and rec[362:378] != _AOI_NO_PROTECTION_HASH:
+        return True
+    return False
+
+
 _ALARM_FALSE_BOOLS = (
     "InFault", "Latched", "ProgAck", "OperAck", "ProgReset", "OperReset",
     "ProgSuppress", "OperSuppress", "ProgUnsuppress", "OperUnsuppress",
@@ -8170,6 +8192,11 @@ class ControllerBuilder(L5xElementBuilder):
     # record revision.
     _device_major: Union[int, None] = field(default=None)
     _device_minor: Union[int, None] = field(default=None)
+    # Faithful mode: reproduce exactly what Studio exports. When True, a source-
+    # protected AOI (whose source Studio withholds, emitting <EncodedData>) is
+    # omitted rather than recovered as plaintext. Default False = recover as much as
+    # possible (emit the decoded plaintext AOI definition).
+    _faithful: bool = field(default=False)
 
     def build(self) -> Controller:
         # The root controller is the named FAFA component at parent_id=0 /
@@ -8820,13 +8847,20 @@ class ControllerBuilder(L5xElementBuilder):
             raise Exception("Contains more than one AOI collection")
         _aoi_collection_object_id = results[0][1]
         self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
+            "SELECT comp_name, object_id, parent_id, record_type, record FROM comps WHERE parent_id="
             + str(_aoi_collection_object_id)
             + " AND record_type=256"
         )
         results = self._cur.fetchall()
         aois: List[AOI] = []
         for result in results:
+            # In faithful mode, a source-protected AOI is exported by Studio as an
+            # <EncodedData> blob, not a plaintext <AddOnInstructionDefinition>; skip
+            # it (the keyed ciphertext OEM emits is unrecoverable -> under-emit rather
+            # than fabricate). In the default recovery mode we keep the decoded
+            # plaintext definition (more useful for recovering the protected source).
+            if self._faithful and _aoi_is_source_protected(bytes(result[4])):
+                continue
             _aoi_object_id = result[1]
             aois.append(AoiBuilder(
                 self._cur, _aoi_object_id,

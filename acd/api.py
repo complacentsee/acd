@@ -161,10 +161,11 @@ class ImportProjectFromFile(ImportProject):
     """Import a Controller from an ACD stored on file"""
 
     filename: PathLike
+    faithful: bool = False
 
     def import_project(self) -> RSLogix5000Content:
         # Import Project Interface
-        export = ExportL5x(self.filename)
+        export = ExportL5x(self.filename, faithful=self.faithful)
         return export.project
 
 
@@ -272,14 +273,19 @@ class ConvertAcdToL5x(Extract):
     :param PathLike acd_filename: Path to the source .ACD file.
     :param PathLike l5x_filename: Path for the output .L5X file.
     :param bool pretty_print: Pretty-print the XML output (default True).
+    :param bool faithful: Reproduce exactly what Studio 5000 exports. When True,
+        source-protected content whose source Studio withholds (e.g. licensed AOIs
+        it exports as <EncodedData>) is omitted instead of recovered. Default False
+        recovers as much as possible (emits the decoded plaintext).
     """
 
     acd_filename: PathLike
     l5x_filename: PathLike
     pretty_print: bool = True
+    faithful: bool = False
 
     def extract(self):
-        project = ImportProjectFromFile(self.acd_filename).import_project()
+        project = ImportProjectFromFile(self.acd_filename, faithful=self.faithful).import_project()
         raw_xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + project.to_xml()
         if self.pretty_print:
             try:

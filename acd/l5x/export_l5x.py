@@ -48,6 +48,10 @@ class ExportL5x:
     _temp_dir: str = "build"  # tempfile.mkdtemp()
     _controller: Union[Controller, None] = None
     _project: Union[RSLogix5000Content, None] = None
+    # Faithful mode reproduces exactly what Studio exports (e.g. omits source-
+    # protected AOIs whose source Studio withholds). Default False = recover as much
+    # as possible (emit decoded plaintext for source-protected content).
+    faithful: bool = False
 
     def __post_init__(self):
         log.info(
@@ -588,6 +592,7 @@ class ExportL5x:
                 _acd_major=_major,
                 _device_major=_dev_major,
                 _device_minor=_dev_minor,
+                _faithful=self.faithful,
             ).build()
         return self._controller
 
