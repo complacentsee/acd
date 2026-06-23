@@ -501,6 +501,17 @@ def render_l5k(dt_base: str, dimensions: Optional[str], image: bytes,
             if len(image) < width:
                 return None
             return _atomic_text(dt_base, image[:width])
+        # BOOL/BIT array: bit-packed (one bit per element, so a 256-element array
+        # occupies 32 bytes), NOT one byte each. Element i = bit (i & 7) of byte
+        # i>>3; OEM writes each as the binary literal 2#0 / 2#1.
+        if dt_base in ("BOOL", "BIT"):
+            vals = []
+            for i in range(total):
+                byte = i >> 3
+                if byte >= len(image):
+                    return None
+                vals.append("2#%d" % ((image[byte] >> (i & 7)) & 1))
+            return "[" + ",".join(vals) + "]"
         # atomic array: comma list of element values
         vals = []
         for i in range(total):
