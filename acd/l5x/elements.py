@@ -3962,7 +3962,8 @@ class ModuleBuilder(L5xElementBuilder):
                             return cf_m.group(1).decode()
         return None
 
-    def _ports_from_data_collection(self, data_link: int) -> "Union[str, None]":
+    def _ports_from_data_collection(self, data_link: int,
+                                    validate_controller: bool = False) -> "Union[str, None]":
         """Build the <Ports> block from the module's RxDataCollection topology blob.
 
         Every module stores, at e1[0x24] (u32), the comment_id of its backing
@@ -3981,14 +3982,32 @@ class ModuleBuilder(L5xElementBuilder):
         """
         if not data_link:
             return None
+        # Per-port Safety Network Numbers (safety modules only); injected into the
+        # decoded ports. {} for non-safety modules.
+        port_sn = self._port_safety_networks()
+
+        def _finish(res):
+            # A controller-chassis module's data_link can mis-resolve to an unrelated
+            # I/O-adapter blob (seen on a corrupt project whose Local/Local2 link to a
+            # FLEX adapter record). A real controller's own backplane port is one of
+            # the known controller types; if none is present, the blob is not the
+            # controller's -- fall back to the static catalog instead of emitting
+            # FLEX ports for a CompactLogix. (Fail-safe: too-strict only forfeits a
+            # recovery, never regresses.)
+            if res and validate_controller and not any(
+                    f'Type="{t}"' in res
+                    for t in ("ICP", "Compact", "5069", "1768Ctrl3Slot", "PointIO")):
+                return None
+            return res
+
         # Blob children of every RxDataCollection, keyed by comment_id (u16 @ rec[12]).
         self._cur.execute("SELECT object_id FROM comps WHERE comp_name='RxDataCollection'")
         coll_oids = [r[0] for r in self._cur.fetchall()]
         if not coll_oids:
             return None
         for coll_oid in coll_oids:
-            self._cur.execute("SELECT record FROM comps WHERE parent_id=?", (coll_oid,))
-            for (raw,) in self._cur.fetchall():
+            self._cur.execute("SELECT object_id, record FROM comps WHERE parent_id=?", (coll_oid,))
+            for (child_oid, raw) in self._cur.fetchall():
                 raw = bytes(raw)
                 if len(raw) < 14:
                     continue
@@ -3998,13 +4017,89 @@ class ModuleBuilder(L5xElementBuilder):
                 if i < 0:
                     continue
                 j = raw.find(b"</in>", i)
-                if j < 0:
-                    continue
-                return self._decode_ports_blob(raw[i:j + 5].decode("latin-1", errors="replace"))
+                if j >= 0:
+                    return _finish(self._decode_ports_blob(
+                        raw[i:j + 5].decode("latin-1", errors="replace"), port_sn))
+                # <in> present but the plaintext body is truncated mid-blob (the root
+                # case); the complete topology is in the child's decrypted ext-attr
+                # 0x66 image -- the same SP-aware fallback the sibling
+                # _*_from_data_collection methods use for their blobs.
+                try:
+                    _cf = self._cur.execute(
+                        "SELECT record FROM comps_full WHERE object_id=?",
+                        (child_oid,)).fetchone()
+                    if _cf and _cf[0]:
+                        img = CompsRecord.read_value_attrs(
+                            bytes(_cf[0]), self._short_header, full=True).get(0x66)
+                        if img:
+                            txt = img.decode("latin-1", errors="replace")
+                            ii = txt.find("<in")
+                            jj = txt.find("</in>", ii) if ii >= 0 else -1
+                            if ii >= 0 and jj >= 0:
+                                return _finish(self._decode_ports_blob(
+                                    txt[ii:jj + 5], port_sn))
+                except Exception:
+                    pass
         return None
 
+    def _port_safety_networks(self) -> dict:
+        """Per-port Safety Network Numbers for a safety module's ports.
+
+        A safety module's full identity ext-attr 0x001 carries a port -> SNN table:
+            [u16 count][count x ([u16 port_id][6-byte little-endian network id])]
+        The leading count (2..7), the ascending in-range (1..7) port ids, and a
+        non-zero most-significant byte on every 48-bit network id make the table
+        self-validating: a real CIP Safety Network Number is large (time/MAC seeded,
+        MSB always set), so look-alike runs of small structured ints (seen on
+        TimeSynchronize/ExtendedDevice records) are rejected. Each port's id is
+        independent -- they need not share a base. Validated 0-FP/0-FN pool-wide
+        (TP=51): present on safety controllers (e.g. 5069-L330ERMS2), absent on
+        non-safety modules. Returns {port_id: "16#0000_xxxx_xxxx_xxxx"} or {}.
+        """
+        try:
+            row = self._cur.execute(
+                "SELECT record FROM comps_full WHERE object_id=?",
+                (self._object_id,)).fetchone()
+            if not row or not row[0]:
+                return {}
+            e0 = CompsRecord.read_value_attrs(
+                bytes(row[0]), self._short_header, full=True).get(0x001, b"")
+        except Exception:
+            return {}
+        n = len(e0)
+        for off in range(2, n - 8):
+            cnt = struct.unpack_from("<H", e0, off - 2)[0]
+            if cnt < 2 or cnt > 7:
+                continue
+            ids, vals, p, ok = [], [], off, True
+            for _ in range(cnt):
+                if p + 8 > n:
+                    ok = False
+                    break
+                pid = struct.unpack_from("<H", e0, p)[0]
+                v = e0[p + 2:p + 8]
+                # v[5] is the MSB of the 48-bit network id; a real CIP SNN always
+                # has it set, which screens out small structured look-alike runs.
+                if pid < 1 or pid > 7 or v[5] == 0:
+                    ok = False
+                    break
+                if ids and pid <= ids[-1]:
+                    ok = False
+                    break
+                ids.append(pid)
+                vals.append(v)
+                p += 8
+            if not ok or len(ids) != cnt:
+                continue
+            out = {}
+            for pid, v in zip(ids, vals):
+                h = v[::-1].hex()
+                out[pid] = f"16#0000_{h[0:4]}_{h[4:8]}_{h[8:12]}"
+            return out
+        return {}
+
     @staticmethod
-    def _decode_ports_blob(blob: str) -> "Union[str, None]":
+    def _decode_ports_blob(blob: str, port_sn: dict = None) -> "Union[str, None]":
         """Render an ``<in>`` topology blob into an L5X ``<Ports>`` block.
 
         Rules (validated byte-for-byte against the reference): Type EN->Ethernet,
@@ -4034,9 +4129,10 @@ class ModuleBuilder(L5xElementBuilder):
             "DN": "DeviceNet",
             "CN": "ControlNet",
         }
+        port_sn = port_sn or {}
         ports = []
         for m in _re.finditer(r'<Port\b([^>]*?)(/?)>', blob):
-            a = dict(_re.findall(r'(\w+)="([^"]*)"', m.group(1)))
+            a = dict(_re.findall(r'(\w+)=["\']([^"\']*)["\']', m.group(1)))
             pid = a.get("Id")
             # A real port always has an Id. Blobs without one (seen on some V10/V11
             # controller/CPU records) use a structure this decoder does not model;
@@ -4054,21 +4150,31 @@ class ModuleBuilder(L5xElementBuilder):
                 seg = rest[:nxt.start()] if nxt else rest
                 bm = _re.search(r'<Bus\b([^>]*)>', seg)
                 if bm:
-                    ba = dict(_re.findall(r'(\w+)="([^"]*)"', bm.group(1)))
+                    ba = dict(_re.findall(r'(\w+)=["\']([^"\']*)["\']', bm.group(1)))
                     bus = ba.get("Size") if ba.get("Size") is not None else ""
             if bus is None and upstream == "false" and ptype == "Ethernet":
                 bus = ""
+            try:
+                _pidi = int(pid)
+            except (TypeError, ValueError):
+                _pidi = 0
             addr_attr = f' Address="{addr}"' if addr is not None else ""
-            head = f'<Port Id="{pid}"{addr_attr} Type="{ptype}" Upstream="{upstream}"'
+            # SafetyNetwork (safety modules only) follows Upstream, matching OEM.
+            _snv = port_sn.get(_pidi)
+            sn_attr = f' SafetyNetwork="{_snv}"' if _snv else ""
+            head = (f'<Port Id="{pid}"{addr_attr} Type="{ptype}" '
+                    f'Upstream="{upstream}"{sn_attr}')
             if bus is None:
-                ports.append(f"{head}/>\n")
+                ports.append((_pidi, f"{head}/>\n"))
             elif bus == "":
-                ports.append(f"{head}>\n<Bus/>\n</Port>\n")
+                ports.append((_pidi, f"{head}>\n<Bus/>\n</Port>\n"))
             else:
-                ports.append(f'{head}>\n<Bus Size="{bus}"/>\n</Port>\n')
+                ports.append((_pidi, f'{head}>\n<Bus Size="{bus}"/>\n</Port>\n'))
         if not ports:
             return None
-        return f'<Ports>\n{"".join(ports)}</Ports>\n'
+        # OEM emits ports in ascending Id order; some blobs store them out of order.
+        ports.sort(key=lambda p: p[0])
+        return f'<Ports>\n{"".join(s for _, s in ports)}</Ports>\n'
 
     def _chassis_size_from_data_collection(self) -> "Union[int, None]":
         """Read the local backplane Bus Size from the RxDataCollection record for the CPU.
@@ -4380,6 +4486,21 @@ class ModuleBuilder(L5xElementBuilder):
         connections: List[dict] = []
         extended_properties = ""
         data_link = struct.unpack("<I", e1[0x24:0x28])[0] if len(e1) >= 0x28 else 0
+        if not data_link:
+            # The truncated comps `record` copy can zero the data_link (e1[0x24]),
+            # notably for the root controller; the untruncated comps_full stream
+            # carries it. Recover it before giving up on the port topology.
+            try:
+                _cfdl = self._cur.execute(
+                    "SELECT record FROM comps_full WHERE object_id=?",
+                    (self._object_id,)).fetchone()
+                if _cfdl and _cfdl[0]:
+                    _dle1 = CompsRecord.read_value_attrs(
+                        bytes(_cfdl[0]), self._short_header, full=True).get(0x001, b"")
+                    if len(_dle1) >= 0x28:
+                        data_link = struct.unpack("<I", _dle1[0x24:0x28])[0]
+            except Exception:
+                pass
         # STAGING: CommMethod resolved via the comment_id link (full Communications).
         comm_method = self._comm_method_from_data_link(data_link)
         extended_properties = self._extended_properties_from_data_collection(data_link)
@@ -4691,13 +4812,18 @@ class ModuleBuilder(L5xElementBuilder):
         # Real port topology from the RxDataCollection blob (preferred over the
         # static catalog). e1[0x24] is the comment_id of the module's backing
         # RxDataCollection child (a 1:1 link); None when it has no <in> blob.
-        # The root controller is left to the static-catalog path: its blob uses
-        # abbreviated CompactLogix port types (Cpt35E, Cpt32EN, ...) and a chassis
-        # bus this decoder does not model, and PORT_STRUCTURES already covers CPUs.
+        # The root controller is decoded the same way: its data_link is recovered
+        # from comps_full (above) and the full <in> blob from the child's decrypted
+        # 0x66 image when the plaintext body is truncated. _ports_from_data_collection
+        # returns None when there is no blob (e.g. a 5069 root with a degenerate
+        # data_link), so such roots still fall back to the static catalog / empty.
         is_root = (parent_name == name)
-        ports_override = None
-        if not is_root:
-            ports_override = self._ports_from_data_collection(data_link)
+        # The root and the conventionally-named controller-chassis modules
+        # ("Local"/"Local2") must decode to a controller-type backplane port; gate
+        # their blob on that so a mis-linked I/O-adapter blob can't masquerade as the
+        # CPU (see _ports_from_data_collection._finish).
+        ports_override = self._ports_from_data_collection(
+            data_link, validate_controller=(is_root or name in ("Local", "Local2")))
 
         # SafetyEnabled="true" iff the module owns a safety connection (a
         # SafetyInput/SafetyOutput/*Safety* connection record under its
