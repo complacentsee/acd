@@ -4013,17 +4013,18 @@ class ModuleBuilder(L5xElementBuilder):
                     continue
                 if int.from_bytes(raw[12:14], "little") != (data_link & 0xFFFF):
                     continue
+                # Prefer a complete plaintext blob.
                 i = raw.find(b"<in")
-                if i < 0:
-                    continue
-                j = raw.find(b"</in>", i)
-                if j >= 0:
-                    return _finish(self._decode_ports_blob(
-                        raw[i:j + 5].decode("latin-1", errors="replace"), port_sn))
-                # <in> present but the plaintext body is truncated mid-blob (the root
-                # case); the complete topology is in the child's decrypted ext-attr
-                # 0x66 image -- the same SP-aware fallback the sibling
-                # _*_from_data_collection methods use for their blobs.
+                if i >= 0:
+                    j = raw.find(b"</in>", i)
+                    if j >= 0:
+                        return _finish(self._decode_ports_blob(
+                            raw[i:j + 5].decode("latin-1", errors="replace"), port_sn))
+                # Otherwise the topology is in the child's decrypted ext-attr 0x66
+                # image -- either the plaintext body was truncated mid-blob (the root
+                # case) or the whole blob is encrypted there with no plaintext copy
+                # (local-chassis I/O cards and many CompactLogix CPUs). Same SP-aware
+                # fallback the sibling _*_from_data_collection methods use.
                 try:
                     _cf = self._cur.execute(
                         "SELECT record FROM comps_full WHERE object_id=?",
@@ -4040,6 +4041,7 @@ class ModuleBuilder(L5xElementBuilder):
                                     txt[ii:jj + 5], port_sn))
                 except Exception:
                     pass
+                # neither plaintext nor 0x66 had a blob; try the next matching child
         return None
 
     def _port_safety_networks(self) -> dict:
