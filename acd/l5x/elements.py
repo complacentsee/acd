@@ -9285,14 +9285,19 @@ class ControllerBuilder(L5xElementBuilder):
         _modern_unknown_cpu = processor_type is None and self._acd_major >= 32
         # AutoDiagsEnabled is a real per-controller flag: bit 0 of the final byte
         # (offset 135) of the 5x80 controller-properties blob. Validated 16 true /
-        # 10 false vs OEM, 0 mismatch. WebServerEnabled is NOT carried in this blob
-        # (no bit tracks it) -- it lives in the embedded Ethernet port config -- so it
-        # stays a conservative "false" until that source is decoded.
+        # 10 false vs OEM, 0 mismatch. WebServerEnabled lives in the controller's
+        # embedded Ethernet config: decrypted ext-attr 0x81, byte 0 (1=true/0=false).
+        # Emit only on a controller that actually carries the embedded-ethernet attrs
+        # (0x81 or 0x7e); a 5x80 without them (e.g. 5069-L310ERM) omits the attribute
+        # like OEM. Validated 0 over-emit / 0 value-mismatch pool-wide.
         if is_5x80 or _modern_unknown_cpu:
             auto_diags = "true" if (len(_ctlblob) > 135 and (_ctlblob[135] & 1)) else "false"
         else:
             auto_diags = None
-        web_server = "false" if (is_5x80 or _modern_unknown_cpu) else None
+        if (is_5x80 or _modern_unknown_cpu) and (0x81 in _ctlattrs or 0x7e in _ctlattrs):
+            web_server = "true" if (_ctlattrs.get(0x81) and _ctlattrs[0x81][0] == 1) else "false"
+        else:
+            web_server = None
 
         # <AddOnInstructionDefinitions> safety signature: a safety-signed project
         # carries Generated-Safety-Signature timestamp comments (tag_reference
