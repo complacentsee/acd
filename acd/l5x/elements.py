@@ -7196,6 +7196,37 @@ def _aoi_is_source_protected(rec: bytes) -> bool:
     return False
 
 
+# A source-protected ROUTINE is exported by Studio as <EncodedData EncodedType=
+# "Routine"> while our decoder recovers the plaintext (-> element_extra:Routine in
+# faithful mode). The per-routine protection signal lives in the routine's comps
+# record, in two layout families (validated 0-FP/0-FN over 601 protected routines
+# pool-wide). Family B (the V21 _SP_MARKER framing): the 2 bytes at marker+16
+# distinguish a genuinely source-protected routine (01 00) from a plaintext-at-rest
+# look-alike (00 07) whose rungs Studio re-decrypts and exports as plaintext (the
+# AreaD/VendorE/AreaA/AreaB/AreaC files -- never suppress those). Family A
+# (no marker): the unprotected record carries the no-protection sentinel; a protected
+# one carries a real key-hash instead (sentinel absent), in the standard 457-byte
+# record. Reuses _AOI_NO_PROTECTION_HASH and _SP_MARKER.
+_RT_SP_PROTECTED = bytes.fromhex("000001001000")   # marker+14 .. +20 -> protected
+_RT_SP_PLAINTEXT = bytes.fromhex("00000007")       # marker+14 .. +18 -> keep plaintext
+
+
+def _routine_is_source_protected(rec: bytes) -> bool:
+    i = rec.find(_SP_MARKER)
+    if i >= 0:
+        if rec[i + 14:i + 20] == _RT_SP_PROTECTED:
+            return True
+        if rec[i + 14:i + 18] == _RT_SP_PLAINTEXT:
+            return False
+        # Overhang fallback: ciphertext extends past the framed length -> protected.
+        plen = int.from_bytes(rec[i + 4:i + 6], "little") if len(rec) >= i + 6 else 0
+        ct_end = i + 18 + ((plen + 15) // 16) * 16
+        return len(rec) - ct_end > 0
+    if _AOI_NO_PROTECTION_HASH in rec:
+        return False
+    return len(rec) == 457
+
+
 _ALARM_FALSE_BOOLS = (
     "InFault", "Latched", "ProgAck", "OperAck", "ProgReset", "OperReset",
     "ProgSuppress", "OperSuppress", "ProgUnsuppress", "OperUnsuppress",
@@ -7644,6 +7675,9 @@ class ProgramBuilder(L5xElementBuilder):
     _alarm_map: Dict[int, str] = field(default_factory=dict)
     # {routine_object_id -> own Description} for short-header files (collision-gated).
     _short_routine_desc: Dict[int, str] = field(default_factory=dict)
+    # Faithful mode: omit source-protected routines (Studio exports them as
+    # <EncodedData>) instead of recovering their plaintext. Default False = recover.
+    _faithful: bool = field(default=False)
 
     def build(self) -> Program:
         self._cur.execute(
@@ -7734,6 +7768,12 @@ class ProgramBuilder(L5xElementBuilder):
 
         routines = []
         for child in routine_results:
+            # In faithful mode, a source-protected routine is exported by Studio as
+            # <EncodedData>, not a plaintext <Routine>; skip it (the keyed ciphertext
+            # is unrecoverable -> under-emit rather than fabricate). Recovery mode
+            # keeps the decoded plaintext routine.
+            if self._faithful and _routine_is_source_protected(bytes(child[3])):
+                continue
             routines.append(RoutineBuilder(
                 self._cur, child[1], _short_header=self._short_header,
                 _short_routine_desc=self._short_routine_desc).build())
@@ -8805,7 +8845,7 @@ class ControllerBuilder(L5xElementBuilder):
         for result in results:
             _program_object_id = result[1]
             programs.append(
-                ProgramBuilder(self._cur, _program_object_id, data_types_map, redundancy_enabled, _short_header=self._short_header, _taginfo_layout=self._taginfo_layout, _acd_major=self._acd_major, _alarm_map=alarm_map, _short_routine_desc=short_routine_desc).build()
+                ProgramBuilder(self._cur, _program_object_id, data_types_map, redundancy_enabled, _short_header=self._short_header, _taginfo_layout=self._taginfo_layout, _acd_major=self._acd_major, _alarm_map=alarm_map, _short_routine_desc=short_routine_desc, _faithful=self._faithful).build()
             )
 
         # Build comment_id → program name map for task scheduled-program resolution.
