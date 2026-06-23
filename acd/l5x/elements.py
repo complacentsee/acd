@@ -4161,10 +4161,13 @@ class ModuleBuilder(L5xElementBuilder):
             if bus is None and upstream == "false" and ptype == "Ethernet":
                 bus = ""
             # A CompactLogix embedded-CPU backplane port (the full-catalog type names
-            # CompactLogixL3xController / ...EController) carries an empty <Bus/> in
-            # OEM that the blob leaves implied (port self-closed). Validated: every
-            # CompactLogix*-typed Upstream=false port in the pool has an empty Bus.
-            if bus is None and upstream == "false" and ptype.startswith("CompactLogix"):
+            # CompactLogixL3xController / ...EController) and a 1768 controller's
+            # 1768Ctrl3Slot backplane port both carry an empty <Bus/> in OEM that the
+            # blob leaves implied (port self-closed). Validated pool-wide: every
+            # CompactLogix*-typed (83) and every 1768Ctrl3Slot (5) Upstream=false port
+            # has an empty Bus, 0 counterexamples.
+            if (bus is None and upstream == "false"
+                    and (ptype.startswith("CompactLogix") or ptype == "1768Ctrl3Slot")):
                 bus = ""
             try:
                 _pidi = int(pid)
