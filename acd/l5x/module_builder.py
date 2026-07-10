@@ -517,6 +517,74 @@ class Module(L5xElement):
         return f'<Bus Size="{child_count}"/>'
 
 
+def _module_identity_e1(cur, object_id: int, raw_rec: bytes,
+                        short_header: bool) -> "Tuple[bytes, Union[int, None], str]":
+    """Resolve a module record's identity blob via the shared recovery chain.
+
+    One implementation of the three copies that had drifted apart
+    (ModuleBuilder.build, the _pass_modules modid map, the :C-owner map):
+
+    1. Parse the truncated comps ``record`` buffer (RxGeneric; the record must
+       be a cip-0x69 module) and take ext-attr 0x001. On long-header (V24+)
+       projects re-saved by a newer Studio, count_record reads garbage and the
+       tail is trimmed, so the parse can throw -- that routes to tier 3.
+    2. When the parsed record does not surface a >= 0x30 attr 0x001 (V10..V20
+       projects), alias the identity stored inline behind the 44 02 00 00
+       marker (the u32 length 0x244 of the identity TLV); the bytes after the
+       length prefix are byte-identical to the 0x001 attribute. The marker is
+       only trusted on a record that parsed as a cip-0x69 module -- a garbage
+       buffer that happens to contain the marker must not mask tier 3.
+    3. When both miss (including a buffer that does not parse at all), recover
+       from the untruncated comps_full stream: cip-checked at body+10, attrs
+       read with read_value_attrs(full=True) (memoized by
+       CompsRecord.full_attrs), adopted only when >= 0x30.
+
+    Returns ``(e1, comment_id, source)``:
+      e1         -- identity bytes; may still be shorter than 0x30 (callers gate)
+      comment_id -- from the parsed prelude, else from comps_full body+12 (only
+                    when comps_full yielded a usable blob); None when the record
+                    is not provably a cip-0x69 module
+      source     -- "record" | "marker" | "full"; callers with per-source map
+                    policies dispatch on it
+    """
+    e1 = b""
+    comment_id = None
+    source = "record"
+    parsed = False
+    try:
+        r = RxGeneric.from_bytes(raw_rec)
+        if r.cip_type == 0x69:
+            # The ext-attr tail parses lazily; materialise it here so a
+            # garbage count_record still routes to the comps_full recovery.
+            e1 = {er.attribute_id: bytes(er.value)
+                  for er in r.extended_records}.get(0x001, b"")
+            comment_id = r.comment_id
+            parsed = True
+    except Exception:
+        parsed = False
+    if parsed and len(e1) < 0x30:
+        mk = raw_rec.find(b"\x44\x02\x00\x00")
+        if mk >= 0 and len(raw_rec) - (mk + 4) >= 0x30:
+            e1 = raw_rec[mk + 4:]
+            source = "marker"
+    if len(e1) < 0x30:
+        try:
+            full = CompsRecord.full_record(cur, object_id)
+            bo = CompsRecord.body_offset(short_header)
+            if (full and len(full) >= bo + 14
+                    and struct.unpack_from("<H", full, bo + 10)[0] == 0x69):
+                fe1 = CompsRecord.full_attrs(
+                    cur, object_id, short_header).get(0x001, b"")
+                if len(fe1) >= 0x30:
+                    e1 = fe1
+                    source = "full"
+                    if comment_id is None:
+                        comment_id = struct.unpack_from("<H", full, bo + 12)[0]
+        except Exception:
+            pass
+    return e1, comment_id, source
+
+
 def _build_rxdata_holders(cur) -> "Dict[int, List[Tuple[int, bytes]]]":
     """Ordered RxDataCollection child index, keyed by comment-id link.
 
@@ -948,49 +1016,6 @@ class ModuleBuilder(L5xElementBuilder):
                 return int(m.group(1))
         return None
 
-    def _recover_from_full(self):
-        """Rebuild (r, exts) for a module whose truncated comps record won't parse.
-
-        Returns a lightweight stand-in for the RxGeneric record (an object with
-        ``cip_type`` and ``comment_id``) plus the {attribute_id: bytes} extended-
-        attribute map, both read from the untruncated comps_full stream. Returns
-        (None, {}) when no full record exists, the record is not a cip-0x69 module,
-        or the identity attribute 0x001 is absent — so the caller falls back to the
-        all-zero Module exactly as before.
-        """
-        try:
-            self._cur.execute(
-                "SELECT record FROM comps_full WHERE object_id=?",
-                (self._object_id,),
-            )
-            row = self._cur.fetchone()
-            if not row or not row[0]:
-                return None, {}
-            full = bytes(row[0])
-            body_off = CompsRecord.body_offset(self._short_header)
-            # RxGeneric prelude within the full body: cip_type u16 @+10,
-            # comment_id u16 @+12 (validated byte-identical to RxGeneric on every
-            # record whose truncated buffer still parses).
-            if len(full) < body_off + 14:
-                return None, {}
-            cip_type = struct.unpack_from("<H", full, body_off + 10)[0]
-            if cip_type != 0x69:
-                return None, {}
-            comment_id = struct.unpack_from("<H", full, body_off + 12)[0]
-            exts = CompsRecord.read_value_attrs(full, self._short_header, full=True)
-            if len(exts.get(0x001, b"")) < 0x30:
-                return None, {}
-
-            class _RecoveredRecord:
-                pass
-
-            r = _RecoveredRecord()
-            r.cip_type = cip_type
-            r.comment_id = comment_id
-            return r, exts
-        except Exception:
-            return None, {}
-
     def build(self) -> Module:
         self._cur.execute(
             "SELECT comp_name, object_id, record FROM comps WHERE object_id=" + str(self._object_id)
@@ -1003,62 +1028,16 @@ class ModuleBuilder(L5xElementBuilder):
         # cards, etc.).  Logix Designer exports these with Name="?".
         name = "?" if (db_name.startswith("$") and db_name.endswith("$")) else db_name
 
-        # The comps `record` column is the FafaComps buffer truncated to
-        # record_length(@0)-148. On long-header (V24+) projects that have been
-        # re-saved by a newer Studio, count_record (@body+78) reads garbage and the
-        # tail is trimmed by a few bytes, so RxGeneric.from_bytes either throws
-        # ("requested <huge> bytes") or — were it to parse — would miss attributes.
-        # Whole controllers (incl. the Local CPU) export this way, which made every
-        # one of their modules collapse to an all-zero identity. Recover the real
-        # record from the untruncated comps_full stream: read_value_attrs walks the
-        # attribute table by length (ignoring count_record), and the RxGeneric
-        # prelude (cip_type u16 @body+10, comment_id u16 @body+12) is read directly
-        # from the full body. Only used when the truncated record fails to yield a
-        # usable cip-0x69 module, so records that parse normally are untouched.
-        r = None
-        try:
-            r = RxGeneric.from_bytes(raw_rec)
-            # The ext-attr tail parses lazily; materialise it here so a
-            # garbage count_record still routes to the comps_full recovery.
-            r.extended_records
-        except Exception:
-            r = None
-
-        if r is not None and r.cip_type == 0x69:
-            exts: Dict[int, bytes] = {
-                er.attribute_id: bytes(er.value) for er in r.extended_records
-            }
-        else:
-            r, exts = self._recover_from_full()
-            if r is None:
-                return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false",
-                              "false")
-
-        e1 = exts.get(0x001, b"")
-        if len(e1) < 0x30:
-            # Some module records (seen on V10..V20 projects) do not surface the
-            # identity as extended record 0x001; the same identity block sits
-            # inline behind the marker 44 02 00 00 (the u32 length 0x244 of the
-            # identity TLV). The bytes after that length prefix are byte-identical
-            # to the 0x001 attribute, so alias e1 to them and the existing field
-            # offsets below decode unchanged. Only used when 0x001 is absent, so
-            # records that do carry 0x001 (incl. long-header) are untouched.
-            marker = raw_rec.find(b"\x44\x02\x00\x00")
-            if marker >= 0 and len(raw_rec) - (marker + 4) >= 0x30:
-                e1 = raw_rec[marker + 4:]
-        if len(e1) < 0x30:
-            # The identity attribute 0x001 can be absent from the truncated
-            # FafaComps `record` buffer while present in the untruncated
-            # comps_full stream (long-header modules whose record is truncated
-            # before 0x001 surfaces). Recover it from comps_full before giving up,
-            # the same way ConfigData/ForceData read their images.
-            try:
-                _fe1 = CompsRecord.full_attrs(
-                    self._cur, self._object_id, self._short_header).get(0x001, b"")
-                if len(_fe1) >= 0x30:
-                    e1 = _fe1
-            except Exception:
-                pass
+        # Identity recovery chain (truncated-record parse -> inline 44 02 00 00
+        # marker alias -> untruncated comps_full), shared with the controller
+        # module passes -- see _module_identity_e1 for the tier semantics.
+        e1, comment_id, _src = _module_identity_e1(
+            self._cur, self._object_id, raw_rec, self._short_header)
+        if comment_id is None:
+            # Not provably a cip-0x69 module (neither the record buffer nor
+            # comps_full yields one): the all-zero fallback Module.
+            return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false",
+                          "false")
         if len(e1) < 0x30:
             major_fault = "true" if name == "Local" else "false"
             return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false", major_fault,
@@ -1193,14 +1172,16 @@ class ModuleBuilder(L5xElementBuilder):
         # description carries object_id == 1; rows sharing the key with a nonzero
         # object_id are scratch values (e.g. export timestamps) whose record_string
         # would otherwise leak in as a fabricated Description, so require object_id == 1.
+        # The identity chain above guarantees a cip-0x69 module record, so the
+        # comment key's cip component is the literal 0x69.
         description = ""
         if self._short_header:
             # sub_record_length filter (a module is 0x69) skips a cip-0x68 tag
             # that shares this comment_id.
-            description = short_own_description(self._cur, r.comment_id, r.cip_type) or ""
+            description = short_own_description(self._cur, comment_id, 0x69) or ""
         else:
             description = own_description(
-                self._cur, (r.comment_id * 0x10000) + r.cip_type) or ""
+                self._cur, (comment_id * 0x10000) + 0x69) or ""
 
         # --- Communications and ExtendedProperties ---
         # CommMethod is resolved from the module's ICP slot / IP address. The

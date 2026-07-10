@@ -37,7 +37,12 @@ from acd.l5x.controller_ports import (
     build_ethernet_ports,
 )
 from acd.l5x.messages import _msg_build_module_routes, _render_message_data
-from acd.l5x.module_builder import Module, ModuleBuilder, _build_rxdata_holders
+from acd.l5x.module_builder import (
+    Module,
+    ModuleBuilder,
+    _build_rxdata_holders,
+    _module_identity_e1,
+)
 from acd.l5x import tag_value as _tag_value
 from acd.record.comps import CompsRecord, _SP_MARKER, decrypt_sp_nameless
 
@@ -5419,79 +5424,62 @@ class ControllerBuilder(L5xElementBuilder):
             )
             mod_rows = self._cur.fetchall()
 
-            # First pass: build modid→name map so child modules can resolve their parent name.
-            from acd.generated.comps.rx_generic import RxGeneric as _RxG
+            # First pass: build modid→name map so child modules can resolve their
+            # parent name. Identity resolution runs the shared recovery chain
+            # (_module_identity_e1: truncated-record parse -> 44 02 00 00 marker
+            # alias -> comps_full); the map-write policy differs per source, so
+            # dispatch on it.
             modid_to_name: Dict[int, str] = {}
             # modid→object_id map for ConfigTag keying. On short-header (V10..V20)
             # projects it applies the 44 02 00 00 marker fallback so it is complete.
             modid_to_oid: Dict[int, int] = {}
             for db_name, mod_oid, mod_rec in mod_rows:
                 display_name = "?" if (db_name.startswith("$") and db_name.endswith("$")) else db_name
-                try:
-                    r = _RxG.from_bytes(bytes(mod_rec))
-                    if r.cip_type == 0x69:
-                        exts = {er.attribute_id: bytes(er.value) for er in r.extended_records}
-                        e1 = exts.get(0x001, b"")
-                        if len(e1) >= 0x30:
-                            # e1[0x2C] is the modid that backplane children reference
-                            # (their e1[0x16]). It reads 0 for an Ethernet-family rack
-                            # adapter (1734-AENT and the like) whose own identity sits
-                            # behind the EtherNet/IP attrs; the real modid for those is
-                            # the record-header comment_id (RxGeneric.comment_id), which
-                            # equals e1[0x2C] wherever the latter is nonzero. Prefer
-                            # e1[0x2C]; fall back to comment_id only when it is 0, so
-                            # existing keys are byte-identical and the adapter's cards
-                            # (which today wrongly resolve ParentModule to "Local" and
-                            # miss their :C ConfigTag) resolve to it.
-                            modid = ModuleIdentity.from_bytes(e1).modid or r.comment_id
-                            if modid:
-                                modid_to_name[modid] = display_name
-                                modid_to_oid[modid] = mod_oid
-                        else:
-                            raw_mr = bytes(mod_rec)
-                            mk = raw_mr.find(b"\x44\x02\x00\x00")
-                            if mk >= 0 and len(raw_mr) - (mk + 4) >= 0x30:
-                                _mkid = ModuleIdentity.from_bytes(raw_mr[mk + 4:]).modid
-                                modid_to_oid[_mkid] = mod_oid
-                                # Map modid->name too (previously only the oid was
-                                # mapped here): a child module behind this marker
-                                # references its parent by this modid, so without the
-                                # name entry it fell back to ParentModule="Local". Key
-                                # it the way children reference it (e1[0x2C], or the
-                                # record comment_id when that is 0) and never overwrite
-                                # a name a normally-parsed record already provided.
-                                _mk_modid = _mkid or r.comment_id
-                                if _mk_modid and _mk_modid not in modid_to_name:
-                                    modid_to_name[_mk_modid] = display_name
-                            else:
-                                # Long-header module whose truncated record omits the
-                                # 0x001 identity: recover the modid from comps_full so
-                                # the adapter is mapped and its child cards resolve
-                                # their :C ConfigTag (e.g. VendorD point_IO_adapter / Local,
-                                # whose own modid is the comment_id). Collision-safe:
-                                # never overwrite a modid already mapped from a
-                                # normally-parsed record.
-                                _cf = self._cur.execute(
-                                    "SELECT record FROM comps_full WHERE object_id=?",
-                                    (mod_oid,),
-                                ).fetchone()
-                                if _cf and _cf[0]:
-                                    _full = bytes(_cf[0])
-                                    _bo = CompsRecord.body_offset(self._short_header)
-                                    if (len(_full) >= _bo + 14 and struct.unpack_from(
-                                            "<H", _full, _bo + 10)[0] == 0x69):
-                                        _fmid = ModuleIdentity.from_bytes(
-                                            CompsRecord.read_value_attrs(
-                                                _full, self._short_header, full=True
-                                            ).get(0x001, b"")).modid
-                                        if _fmid is not None:
-                                            _cid = struct.unpack_from("<H", _full, _bo + 12)[0]
-                                            _modid = _fmid or _cid
-                                            if _modid and _modid not in modid_to_oid:
-                                                modid_to_name[_modid] = display_name
-                                                modid_to_oid[_modid] = mod_oid
-                except Exception:
-                    pass
+                e1, _cid, _src = _module_identity_e1(
+                    self._cur, mod_oid, bytes(mod_rec) if mod_rec else b"",
+                    self._short_header)
+                _mid = ModuleIdentity.from_bytes(e1).modid
+                if _mid is None:
+                    continue
+                if _src == "record":
+                    # e1[0x2C] is the modid that backplane children reference
+                    # (their e1[0x16]). It reads 0 for an Ethernet-family rack
+                    # adapter (1734-AENT and the like) whose own identity sits
+                    # behind the EtherNet/IP attrs; the real modid for those is
+                    # the record-header comment_id (RxGeneric.comment_id), which
+                    # equals e1[0x2C] wherever the latter is nonzero. Prefer
+                    # e1[0x2C]; fall back to comment_id only when it is 0, so
+                    # existing keys are byte-identical and the adapter's cards
+                    # (which today wrongly resolve ParentModule to "Local" and
+                    # miss their :C ConfigTag) resolve to it.
+                    modid = _mid or _cid
+                    if modid:
+                        modid_to_name[modid] = display_name
+                        modid_to_oid[modid] = mod_oid
+                elif _src == "marker":
+                    modid_to_oid[_mid] = mod_oid
+                    # Map modid->name too (previously only the oid was
+                    # mapped here): a child module behind this marker
+                    # references its parent by this modid, so without the
+                    # name entry it fell back to ParentModule="Local". Key
+                    # it the way children reference it (e1[0x2C], or the
+                    # record comment_id when that is 0) and never overwrite
+                    # a name a normally-parsed record already provided.
+                    _mk_modid = _mid or _cid
+                    if _mk_modid and _mk_modid not in modid_to_name:
+                        modid_to_name[_mk_modid] = display_name
+                else:
+                    # Module whose truncated record omits the 0x001 identity
+                    # (or does not parse at all): the modid was recovered from
+                    # comps_full so the adapter is mapped and its child cards
+                    # resolve their :C ConfigTag (e.g. VendorD point_IO_adapter / Local,
+                    # whose own modid is the comment_id). Collision-safe:
+                    # never overwrite a modid already mapped from a
+                    # normally-parsed record.
+                    _modid = _mid or _cid
+                    if _modid and _modid not in modid_to_oid:
+                        modid_to_name[_modid] = display_name
+                        modid_to_oid[_modid] = mod_oid
 
             # Supplement modid_to_oid with the owners of slotted :C config tags. A
             # &<ownerOid>:<slot>:C config tag is owned by the parent module that holds
@@ -5506,42 +5494,18 @@ class ControllerBuilder(L5xElementBuilder):
             _c_owners = {oid for (oid, _s) in io_data_map
                          if io_data_map.get((oid, _s), {}).get("C") is not None}
             for _owner in _c_owners:
-                _omodid = None
+                # Same shared recovery chain: a remote DeviceNet/EN chassis whose
+                # truncated comps record omits the identity surfaces its modid
+                # only in comps_full; short-header owners carry it inline behind
+                # the 44 02 00 00 marker.
                 _orow = self._cur.execute(
                     "SELECT record FROM comps WHERE object_id=?", (_owner,)).fetchone()
-                if _orow:
-                    try:
-                        _or = _RxG.from_bytes(bytes(_orow[0]))
-                        if _or.cip_type == 0x69:
-                            _omid = ModuleIdentity.from_bytes(
-                                {er.attribute_id: bytes(er.value)
-                                 for er in _or.extended_records}.get(0x001, b"")).modid
-                            if _omid is not None:
-                                _omodid = _omid or _or.comment_id
-                    except Exception:
-                        _omodid = None
-                # A remote DeviceNet/EN chassis whose truncated comps record omits the
-                # identity surfaces its modid only in comps_full (same recovery the
-                # module-build pass uses), so read it there when the plain record did
-                # not yield one.
-                if _omodid is None:
-                    _ocf = self._cur.execute(
-                        "SELECT record FROM comps_full WHERE object_id=?", (_owner,)).fetchone()
-                    if _ocf and _ocf[0]:
-                        _ofull = bytes(_ocf[0])
-                        _obo = CompsRecord.body_offset(self._short_header)
-                        try:
-                            if (len(_ofull) >= _obo + 14 and struct.unpack_from(
-                                    "<H", _ofull, _obo + 10)[0] == 0x69):
-                                _ofmid = ModuleIdentity.from_bytes(
-                                    CompsRecord.read_value_attrs(
-                                        _ofull, self._short_header, full=True
-                                    ).get(0x001, b"")).modid
-                                if _ofmid is not None:
-                                    _ocid = struct.unpack_from("<H", _ofull, _obo + 12)[0]
-                                    _omodid = _ofmid or _ocid
-                        except Exception:
-                            _omodid = None
+                _oe1, _ocid, _osrc = _module_identity_e1(
+                    self._cur, _owner,
+                    bytes(_orow[0]) if _orow and _orow[0] is not None else b"",
+                    self._short_header)
+                _omid = ModuleIdentity.from_bytes(_oe1).modid
+                _omodid = (_omid or _ocid) if _omid is not None else None
                 if _omodid and _omodid not in modid_to_oid:
                     modid_to_oid[_omodid] = _owner
 
