@@ -40,7 +40,9 @@ from acd.integrity import (
 )
 
 
-CUTELOGIX = os.path.join("..", "resources", "CuteLogix.ACD")
+CUTELOGIX = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "resources", "CuteLogix.ACD"
+)
 
 # Parametrize over both algorithms: (key_length, expected_header).
 ALGORITHMS = [

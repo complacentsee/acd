@@ -1,11 +1,17 @@
+import os
+
 import pytest
 
 from acd.zip.unzip import Unzip
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+CUTELOGIX = os.path.join(_HERE, "..", "resources", "CuteLogix.ACD")
+BUILD = os.path.join(_HERE, "build")
+
 
 @pytest.fixture()
 async def sample_acd():
-    unzip = Unzip("../resources/CuteLogix.ACD")
+    unzip = Unzip(CUTELOGIX)
     yield unzip
 
 
@@ -30,4 +36,4 @@ def test_filename(sample_acd):
 
 
 def test_write_files(sample_acd):
-    sample_acd.write_files("build")
+    sample_acd.write_files(BUILD)

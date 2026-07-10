@@ -36,7 +36,9 @@ from acd.integrity import (
 )
 
 
-CUTELOGIX = os.path.join("..", "resources", "CuteLogix.ACD")
+CUTELOGIX = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "resources", "CuteLogix.ACD"
+)
 TEST_KEY_V2 = b"\x77" * HMAC_KEY_LENGTH_V2
 TEST_KEY_V1 = b"\x88" * HMAC_KEY_LENGTH_V1
 

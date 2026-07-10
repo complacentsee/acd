@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from acd.database.dbextract import DbExtract
@@ -6,29 +8,33 @@ from acd.zip.unzip import Unzip
 
 from loguru import logger as log
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+CUTELOGIX = os.path.join(_HERE, "..", "resources", "CuteLogix.ACD")
+BUILD = os.path.join(_HERE, "build")
+
 
 @pytest.fixture()
 async def sample_acd():
-    unzip = Unzip("../resources/CuteLogix.ACD").write_files("build")
+    unzip = Unzip(CUTELOGIX).write_files(BUILD)
     yield unzip
 
 
 @pytest.fixture()
 async def sbregion_dat():
-    db = DbExtract("build/SbRegion.Dat")
+    db = DbExtract(os.path.join(BUILD, "SbRegion.Dat"))
     yield db
 
 
 @pytest.fixture()
 async def comps_dat():
-    db = DbExtract("build/Comps.Dat").read()
+    db = DbExtract(os.path.join(BUILD, "Comps.Dat")).read()
     yield db
 
 
 @pytest.fixture(scope="module")
 def controller():
     log.level("DEBUG")
-    yield ExportL5x("../resources/CuteLogix.ACD", "build").controller
+    yield ExportL5x(CUTELOGIX, BUILD).controller
 
 
 def test_open_file(sample_acd, sbregion_dat):
@@ -60,9 +66,11 @@ def test_parse_tags_dat(controller):
     assert toggle.data_type == "BOOL"
 
 
-def test_parse_comments_dat():
-    db: DbExtract = DbExtract("build/Comments.Dat")
+def test_parse_comments_dat(sample_acd):
+    dat = DbExtract(os.path.join(BUILD, "Comments.Dat")).read()
+    assert len(dat.records.record) > 0
 
 
-def test_parse_nameless_dat():
-    db: DbExtract = DbExtract("build/Nameless.Dat")
+def test_parse_nameless_dat(sample_acd):
+    dat = DbExtract(os.path.join(BUILD, "Nameless.Dat")).read()
+    assert len(dat.records.record) > 0
