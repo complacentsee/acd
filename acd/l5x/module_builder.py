@@ -11,6 +11,7 @@ import struct
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Union
 
+from acd.generated.comps.module_identity import ModuleIdentity
 from acd.generated.comps.rx_generic import RxGeneric
 from acd.l5x.base import (
     L5xElement,
@@ -1063,16 +1064,20 @@ class ModuleBuilder(L5xElementBuilder):
             return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false", major_fault,
                           _is_root=(name == "Local"))
 
-        class_word    = struct.unpack("<H", e1[0x00:0x02])[0] if len(e1) >= 2 else -1
-        vendor        = struct.unpack("<H", e1[0x02:0x04])[0]
-        product_type  = struct.unpack("<H", e1[0x04:0x06])[0]
-        product_code  = struct.unpack("<H", e1[0x06:0x08])[0]
+        # Fixed-offset identity fields, decoded by the ModuleIdentity grammar
+        # (resources/templates/Comps/ModuleIdentity.ksy). The >= 0x30 gate above
+        # guarantees every field through modid (@0x2C) is present (non-None).
+        mi = ModuleIdentity.from_bytes(e1)
+        class_word    = mi.class_word
+        vendor        = mi.vendor
+        product_type  = mi.product_type
+        product_code  = mi.product_code
         # bit 7 of the major byte is a flag; strip it to get the firmware revision.
-        major         = e1[0x08] & 0x7F
-        minor         = e1[0x09]
-        parent_modid  = struct.unpack("<I", e1[0x16:0x1A])[0]
-        parent_port   = struct.unpack("<H", e1[0x1A:0x1C])[0]
-        slot          = struct.unpack("<I", e1[0x1C:0x20])[0]
+        major         = mi.major_raw & 0x7F
+        minor         = mi.minor
+        parent_modid  = mi.parent_modid
+        parent_port   = mi.parent_port
+        slot          = mi.slot
 
         # Genuine drive-peripheral expansion cards are hash-named ("?") AND carry a
         # PowerFlex drive product_type. The RHINOBP families (142/143/123, PF753/755)
@@ -1117,13 +1122,13 @@ class ModuleBuilder(L5xElementBuilder):
         # 164/164.) Root detection for ProcessorType/MajorRev now uses
         # parent_module==name directly (see ControllerBuilder), so it no longer
         # piggy-backs on this attribute.
-        major_fault = "true" if (len(e1) > 0x14 and (e1[0x14] & 0x01)) else "false"
+        major_fault = "true" if (mi.flags & 0x01) else "false"
         # Inhibited: bit 2 (0x04) of the same flag byte e1[0x14] that holds
         # ConfiguredAsMajorFault (bit 0). Set when the user inhibited the module.
         # Validated bool(e1[0x14] & 0x04) pool-wide vs OEM: 110 true / 1845 false,
         # 0 false-positives / 0 false-negatives (every other bit of e1[0x14]
         # mis-classifies >=110 modules).
-        inhibited = "true" if (len(e1) > 0x14 and (e1[0x14] & 0x04)) else "false"
+        inhibited = "true" if (mi.flags & 0x04) else "false"
         # EKey state from the keying mask at e1[0x0a]: 0 = no keying (Disabled),
         # nonzero (0x1f = all identity fields keyed) = a keyed module. Both
         # ExactMatch and CompatibleModule carry the full 0x1f mask, so the mask
@@ -1136,9 +1141,9 @@ class ModuleBuilder(L5xElementBuilder):
         # same flag bit stripped to read the firmware major. Validated against the
         # reference over keyed modules: 117 ExactMatch / 1313 CompatibleModule, the
         # byte value splits the two sets with no overlap (0 false-positive/negative).
-        if len(e1) > 0x0a and e1[0x0a] == 0:
+        if mi.ekey_mask == 0:
             ekey_state = "Disabled"
-        elif len(e1) > 0x08 and not (e1[0x08] & 0x80):
+        elif not (mi.major_raw & 0x80):
             ekey_state = "ExactMatch"
         else:
             ekey_state = "CompatibleModule"
@@ -1147,11 +1152,12 @@ class ModuleBuilder(L5xElementBuilder):
         # that connect via Ethernet upstream (parent_port == 2). Local backplane bridge
         # modules (parent_port == 1, e.g. local EN2T) leave e1[0x32] zero — their IP is
         # stored as XML in a child of RxDataCollection, keyed by ICP slot number.
+        # mi.ip_raw is None when the blob ends before 0x33 or the length is 0;
+        # a blob truncated mid-string yields the bytes that remain (the grammar
+        # clamps), matching the old slice.
         own_ip = ""
-        if len(e1) > 0x32:
-            ip_len = struct.unpack("<H", e1[0x30:0x32])[0]
-            if ip_len:
-                own_ip = e1[0x32:0x32 + ip_len].rstrip(b"\x00").decode("ascii", errors="replace")
+        if mi.ip_raw is not None:
+            own_ip = mi.ip_raw.rstrip(b"\x00").decode("ascii", errors="replace")
         ip_address = own_ip
         if not ip_address and slot:
             ip_address = self._ip_from_data_collection(slot)
@@ -1206,16 +1212,17 @@ class ModuleBuilder(L5xElementBuilder):
         comm_method: Union[str, None] = None
         connections: List[dict] = []
         extended_properties = ""
-        data_link = struct.unpack("<I", e1[0x24:0x28])[0] if len(e1) >= 0x28 else 0
+        data_link = mi.data_link
         if not data_link:
             # The truncated comps `record` copy can zero the data_link (e1[0x24]),
             # notably for the root controller; the untruncated comps_full stream
             # carries it. Recover it before giving up on the port topology.
             try:
-                _dle1 = CompsRecord.full_attrs(
-                    self._cur, self._object_id, self._short_header).get(0x001, b"")
-                if len(_dle1) >= 0x28:
-                    data_link = struct.unpack("<I", _dle1[0x24:0x28])[0]
+                _dl = ModuleIdentity.from_bytes(CompsRecord.full_attrs(
+                    self._cur, self._object_id, self._short_header
+                ).get(0x001, b"")).data_link
+                if _dl is not None:
+                    data_link = _dl
             except Exception:
                 pass
         # STAGING: CommMethod resolved via the comment_id link (full Communications).
@@ -1436,12 +1443,11 @@ class ModuleBuilder(L5xElementBuilder):
                     cand = struct.unpack_from("<I", raw_rec, mk - 8)[0]
                     if cand in self._cfg_pool:
                         cd_oid = cand
-                if cd_oid is None and len(e1) >= 628:
-                    cand = struct.unpack_from("<I", e1, 624)[0]
-                    if cand in self._cfg_pool:
-                        cd_oid = cand
-            elif len(e1) >= 0x24:
-                cd_oid = self._cfg_by_mr28.get(struct.unpack_from("<I", e1, 0x20)[0])
+                if cd_oid is None and mi.config_data_oid is not None:
+                    if mi.config_data_oid in self._cfg_pool:
+                        cd_oid = mi.config_data_oid
+            elif mi.config_ref is not None:
+                cd_oid = self._cfg_by_mr28.get(mi.config_ref)
             # A PowerFlex 753-NET-E drive (product_type 123) carries a config image
             # the reference renders ONLY as <ConfigScript> (a parameter-download
             # script), never as <ConfigData> -- so resolve its script below but skip
@@ -1454,8 +1460,8 @@ class ModuleBuilder(L5xElementBuilder):
                     if 0 <= csize <= _CONFIG_IMG_MAX:
                         configdata = (_tag_value.render_hex(img), csize)
             # ConfigScript holder: comment_id at e1[556:558] -> holder; Size = image len.
-            if len(e1) >= 558:
-                cs_cid = struct.unpack_from("<H", e1, 556)[0]
+            if mi.config_script_cid is not None:
+                cs_cid = mi.config_script_cid
                 cs_oid = self._cfg_by_cid.get(cs_cid) if cs_cid else None
                 if cs_oid is not None:
                     img = _config_holder_image(self._cur, cs_oid, self._short_header)
@@ -1565,13 +1571,14 @@ class ModuleBuilder(L5xElementBuilder):
         try:
             _fe1 = CompsRecord.full_attrs(
                 self._cur, self._object_id, self._short_header).get(0x001, b"")
-            if len(_fe1) >= 2 and struct.unpack_from("<H", _fe1, 0)[0] in (0x0200, 0x0201):
+            _fmi = ModuleIdentity.from_bytes(_fe1)
+            if _fmi.class_word in (0x0200, 0x0201):
                 _p = _fe1.find(b"\xff\xff\xff\xff")
                 _v = struct.unpack_from("<I", _fe1, _p - 4)[0] if _p >= 4 else 0
                 drives_adc_enabled = "true" if (_v & 0x40) else "false"
                 drives_adc_mode = "true" if (_v & 0x02) else "false"
-            if len(_fe1) >= 311 and _fe1[310] != 0:
-                _be = _fe1[305:311][::-1].hex()
+            if _fmi.safety_network is not None and _fmi.safety_network[5] != 0:
+                _be = _fmi.safety_network[::-1].hex()
                 safety_network = f"16#0000_{_be[0:4]}_{_be[4:8]}_{_be[8:12]}"
         except Exception:
             pass
@@ -1623,7 +1630,7 @@ class ModuleBuilder(L5xElementBuilder):
             _is_root=is_root,
             _class_word=class_word,
             _product_type=product_type,
-            _modid=(struct.unpack("<I", e1[0x2C:0x30])[0] if len(e1) >= 0x30 else 0),
+            _modid=mi.modid,
             _ekey_state=ekey_state,
             _slot=slot,
             _ip_address=ip_address,

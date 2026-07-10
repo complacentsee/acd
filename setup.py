@@ -118,6 +118,19 @@ class install(_install):
                 "resources/templates/Comps/RxGeneric.ksy",
             ]
         )
+        print("Compiling Comps/ModuleIdentity.ksy")
+        subprocess.run(
+            [
+                kaitai_compiler_executable,
+                "-t",
+                "python",
+                "--outdir",
+                "acd/generated/comps/",
+                "--python-package",
+                "acd.generated.comps",
+                "resources/templates/Comps/ModuleIdentity.ksy",
+            ]
+        )
         _install.run(self)
         print("--------------------------------------------------------------------")
 

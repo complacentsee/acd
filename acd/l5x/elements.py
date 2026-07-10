@@ -11,6 +11,7 @@ from os import PathLike
 from pathlib import Path
 from typing import List, Tuple, Dict, Union
 
+from acd.generated.comps.module_identity import ModuleIdentity
 from acd.generated.comps.rx_generic import RxGeneric
 from acd.l5x.alias import TagAliasResolver
 from acd.l5x.base import (
@@ -5442,7 +5443,7 @@ class ControllerBuilder(L5xElementBuilder):
                             # existing keys are byte-identical and the adapter's cards
                             # (which today wrongly resolve ParentModule to "Local" and
                             # miss their :C ConfigTag) resolve to it.
-                            modid = struct.unpack("<I", e1[0x2C:0x30])[0] or r.comment_id
+                            modid = ModuleIdentity.from_bytes(e1).modid or r.comment_id
                             if modid:
                                 modid_to_name[modid] = display_name
                                 modid_to_oid[modid] = mod_oid
@@ -5450,8 +5451,8 @@ class ControllerBuilder(L5xElementBuilder):
                             raw_mr = bytes(mod_rec)
                             mk = raw_mr.find(b"\x44\x02\x00\x00")
                             if mk >= 0 and len(raw_mr) - (mk + 4) >= 0x30:
-                                e1o = raw_mr[mk + 4:]
-                                modid_to_oid[struct.unpack("<I", e1o[0x2C:0x30])[0]] = mod_oid
+                                _mkid = ModuleIdentity.from_bytes(raw_mr[mk + 4:]).modid
+                                modid_to_oid[_mkid] = mod_oid
                                 # Map modid->name too (previously only the oid was
                                 # mapped here): a child module behind this marker
                                 # references its parent by this modid, so without the
@@ -5459,8 +5460,7 @@ class ControllerBuilder(L5xElementBuilder):
                                 # it the way children reference it (e1[0x2C], or the
                                 # record comment_id when that is 0) and never overwrite
                                 # a name a normally-parsed record already provided.
-                                _mk_modid = (struct.unpack("<I", e1o[0x2C:0x30])[0]
-                                             or r.comment_id)
+                                _mk_modid = _mkid or r.comment_id
                                 if _mk_modid and _mk_modid not in modid_to_name:
                                     modid_to_name[_mk_modid] = display_name
                             else:
@@ -5480,13 +5480,13 @@ class ControllerBuilder(L5xElementBuilder):
                                     _bo = CompsRecord.body_offset(self._short_header)
                                     if (len(_full) >= _bo + 14 and struct.unpack_from(
                                             "<H", _full, _bo + 10)[0] == 0x69):
-                                        _e1 = CompsRecord.read_value_attrs(
-                                            _full, self._short_header, full=True
-                                        ).get(0x001, b"")
-                                        if len(_e1) >= 0x30:
+                                        _fmid = ModuleIdentity.from_bytes(
+                                            CompsRecord.read_value_attrs(
+                                                _full, self._short_header, full=True
+                                            ).get(0x001, b"")).modid
+                                        if _fmid is not None:
                                             _cid = struct.unpack_from("<H", _full, _bo + 12)[0]
-                                            _modid = struct.unpack(
-                                                "<I", _e1[0x2C:0x30])[0] or _cid
+                                            _modid = _fmid or _cid
                                             if _modid and _modid not in modid_to_oid:
                                                 modid_to_name[_modid] = display_name
                                                 modid_to_oid[_modid] = mod_oid
@@ -5513,10 +5513,11 @@ class ControllerBuilder(L5xElementBuilder):
                     try:
                         _or = _RxG.from_bytes(bytes(_orow[0]))
                         if _or.cip_type == 0x69:
-                            _oe1 = {er.attribute_id: bytes(er.value)
-                                    for er in _or.extended_records}.get(0x001, b"")
-                            if len(_oe1) >= 0x30:
-                                _omodid = struct.unpack("<I", _oe1[0x2C:0x30])[0] or _or.comment_id
+                            _omid = ModuleIdentity.from_bytes(
+                                {er.attribute_id: bytes(er.value)
+                                 for er in _or.extended_records}.get(0x001, b"")).modid
+                            if _omid is not None:
+                                _omodid = _omid or _or.comment_id
                     except Exception:
                         _omodid = None
                 # A remote DeviceNet/EN chassis whose truncated comps record omits the
@@ -5532,11 +5533,13 @@ class ControllerBuilder(L5xElementBuilder):
                         try:
                             if (len(_ofull) >= _obo + 14 and struct.unpack_from(
                                     "<H", _ofull, _obo + 10)[0] == 0x69):
-                                _oe1 = CompsRecord.read_value_attrs(
-                                    _ofull, self._short_header, full=True).get(0x001, b"")
-                                if len(_oe1) >= 0x30:
+                                _ofmid = ModuleIdentity.from_bytes(
+                                    CompsRecord.read_value_attrs(
+                                        _ofull, self._short_header, full=True
+                                    ).get(0x001, b"")).modid
+                                if _ofmid is not None:
                                     _ocid = struct.unpack_from("<H", _ofull, _obo + 12)[0]
-                                    _omodid = struct.unpack("<I", _oe1[0x2C:0x30])[0] or _ocid
+                                    _omodid = _ofmid or _ocid
                         except Exception:
                             _omodid = None
                 if _omodid and _omodid not in modid_to_oid:
