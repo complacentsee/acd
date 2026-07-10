@@ -700,15 +700,17 @@ def _build_default_data(data_type: Union[str, None],
             return ""
         if value_bytes is not None:
             # Value image present: render exactly the pair a Tag would emit,
-            # spelled <DefaultData>. Policy gates match today's DefaultData
-            # behaviour: raw-hex first block only on short-header projects, a
-            # STRING ARRAY renders as a single Format="String" block, and each
+            # spelled <DefaultData>. Policy gates: raw-hex first block only on
+            # short-header projects, the Tag STRING-array rule (a long-header
+            # STRING ARRAY keeps the Decorated <Array> tree, pool-proven on
+            # <Data>; the corpus has no long-header STRING-array AOI member,
+            # so the gate is shared rather than left divergent), and each
             # half of the pair is emitted independently of the other.
             return _render_value_blocks(
                 "DefaultData", data_type, dimensions, value_bytes,
                 data_types_map, taginfo_layout, radix,
                 raw_hex_first=short_header,
-                string_array_as_string=True,
+                string_array_as_string=short_header,
                 require_pair=False,
             )
         else:
