@@ -1270,6 +1270,8 @@ def _config_holder_image(cur, oid, short_header):
     the length-prefixed blob at record offset 410 (record[406:410] = byte length).
     """
     try:
+        # Stays on the raw comps_full path: needs the payload bytes for the
+        # offset-410 fallback below, and reads full=False (not full_attrs).
         cur.execute("SELECT record FROM comps_full WHERE object_id=?", (oid,))
         row = cur.fetchone()
         if row:
@@ -1524,11 +1526,7 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count, modu
     try:
         if not dti:
             return None
-        row = cur.execute(
-            "SELECT record FROM comps_full WHERE object_id=?", (dti,)).fetchone()
-        if not row or row[0] is None:
-            return None
-        attrs = CompsRecord.read_value_attrs(bytes(row[0]), short_header, full=True)
+        attrs = CompsRecord.full_attrs(cur, dti, short_header)
         a1 = attrs.get(0x1)
         if not a1 or len(a1) != 354:
             return None
@@ -3379,19 +3377,9 @@ class DataTypeBuilder(L5xElementBuilder):
             # data type / dimensions) are still built. Returns the no-members stub
             # only when the record is too short or no key validates.
             r = _rxgeneric_plaintext_main(results[0][3])
-            full_payload = None
-            try:
-                self._cur.execute(
-                    "SELECT record FROM comps_full WHERE object_id=" + str(self._object_id)
-                )
-                _row = self._cur.fetchone()
-                if _row and _row[0] is not None:
-                    full_payload = bytes(_row[0])
-            except Exception:
-                full_payload = None
-            if r is not None and full_payload is not None:
-                extended_records = CompsRecord.read_value_attrs(
-                    full_payload, self._short_header, full=True
+            if r is not None:
+                extended_records = CompsRecord.full_attrs(
+                    self._cur, self._object_id, self._short_header
                 )
             if r is None or not extended_records:
                 dt = DataType(name, name, "NoFamily", "User", [])
@@ -3843,22 +3831,15 @@ class ModuleBuilder(L5xElementBuilder):
                     # DECRYPTED ext-attr 0x66 image (the raw record body is ciphertext,
                     # so the plaintext scan above finds nothing). Same decrypt path the
                     # UserDefinedCatalogNumber recovery uses for these records.
-                    cf = self._cur.execute(
-                        "SELECT record FROM comps_full WHERE object_id=?",
-                        (child_oid,)).fetchone()
-                    if cf and cf[0]:
-                        try:
-                            img = CompsRecord.read_value_attrs(
-                                bytes(cf[0]), self._short_header, full=True).get(0x66, b"")
-                        except Exception:
-                            img = b""
-                        ds = img.find(b'<public>')
-                        if ds >= 0:
-                            after = img[ds + len(b'<public>'):]
-                            mm = _re.search(rb'</pub', after)
-                            return (after[:mm.start()] if mm
-                                    else after.rstrip(b'\x00 \r\n')).decode(
-                                        "latin-1", errors="replace")
+                    img = CompsRecord.full_attrs(
+                        self._cur, child_oid, self._short_header).get(0x66, b"")
+                    ds = img.find(b'<public>')
+                    if ds >= 0:
+                        after = img[ds + len(b'<public>'):]
+                        mm = _re.search(rb'</pub', after)
+                        return (after[:mm.start()] if mm
+                                else after.rstrip(b'\x00 \r\n')).decode(
+                                    "latin-1", errors="replace")
                     continue
                 after_pub = xml_text[pub_start + len("<public>"):]
                 end_tag_m = _re.search(r'</pub', after_pub)
@@ -3887,15 +3868,9 @@ class ModuleBuilder(L5xElementBuilder):
                     continue
                 m = re.search(rb"<UDCN>([^<]*)</UDCN>", raw)
                 if not m:
-                    cf = self._cur.execute(
-                        "SELECT record FROM comps_full WHERE object_id=?", (oid,)).fetchone()
-                    if cf and cf[0]:
-                        try:
-                            img = CompsRecord.read_value_attrs(
-                                bytes(cf[0]), self._short_header, full=True).get(0x66, b"")
-                        except Exception:
-                            img = b""
-                        m = re.search(rb"<UDCN>([^<]*)</UDCN>", img)
+                    img = CompsRecord.full_attrs(
+                        self._cur, oid, self._short_header).get(0x66, b"")
+                    m = re.search(rb"<UDCN>([^<]*)</UDCN>", img)
                 if m:
                     return m.group(1).decode("ascii", errors="replace") or None
         return None
@@ -3933,23 +3908,16 @@ class ModuleBuilder(L5xElementBuilder):
                         return cf_m.group(1)
                 # Source-protected child: the <CF> is in the decrypted ext-attr image
                 # (0x66, else 0x65/0x64), not the plaintext body.
-                row = self._cur.execute(
-                    "SELECT record FROM comps_full WHERE object_id=?", (child_oid,)
-                ).fetchone()
-                if row and row[0] is not None:
-                    try:
-                        attrs = CompsRecord.read_value_attrs(
-                            bytes(row[0]), self._short_header, full=True)
-                    except Exception:
-                        attrs = {}
-                    for _aid in (0x66, 0x65, 0x64):
-                        img = attrs.get(_aid)
-                        if not img:
-                            continue
-                        cf_m = _re.search(
-                            rb'<CF>(\d+)</CF>', bytes(img))
-                        if cf_m:
-                            return cf_m.group(1).decode()
+                attrs = CompsRecord.full_attrs(
+                    self._cur, child_oid, self._short_header)
+                for _aid in (0x66, 0x65, 0x64):
+                    img = attrs.get(_aid)
+                    if not img:
+                        continue
+                    cf_m = _re.search(
+                        rb'<CF>(\d+)</CF>', bytes(img))
+                    if cf_m:
+                        return cf_m.group(1).decode()
         return None
 
     def _ports_from_data_collection(self, data_link: int,
@@ -4020,19 +3988,15 @@ class ModuleBuilder(L5xElementBuilder):
                 # (local-chassis I/O cards and many CompactLogix CPUs). Same SP-aware
                 # fallback the sibling _*_from_data_collection methods use.
                 try:
-                    _cf = self._cur.execute(
-                        "SELECT record FROM comps_full WHERE object_id=?",
-                        (child_oid,)).fetchone()
-                    if _cf and _cf[0]:
-                        img = CompsRecord.read_value_attrs(
-                            bytes(_cf[0]), self._short_header, full=True).get(0x66)
-                        if img:
-                            txt = img.decode("latin-1", errors="replace")
-                            ii = txt.find("<in")
-                            jj = txt.find("</in>", ii) if ii >= 0 else -1
-                            if ii >= 0 and jj >= 0:
-                                return _finish(self._decode_ports_blob(
-                                    txt[ii:jj + 5], port_sn))
+                    img = CompsRecord.full_attrs(
+                        self._cur, child_oid, self._short_header).get(0x66)
+                    if img:
+                        txt = img.decode("latin-1", errors="replace")
+                        ii = txt.find("<in")
+                        jj = txt.find("</in>", ii) if ii >= 0 else -1
+                        if ii >= 0 and jj >= 0:
+                            return _finish(self._decode_ports_blob(
+                                txt[ii:jj + 5], port_sn))
                 except Exception:
                     pass
                 # neither plaintext nor 0x66 had a blob; try the next matching child
@@ -4053,13 +4017,8 @@ class ModuleBuilder(L5xElementBuilder):
         non-safety modules. Returns {port_id: "16#0000_xxxx_xxxx_xxxx"} or {}.
         """
         try:
-            row = self._cur.execute(
-                "SELECT record FROM comps_full WHERE object_id=?",
-                (self._object_id,)).fetchone()
-            if not row or not row[0]:
-                return {}
-            e0 = CompsRecord.read_value_attrs(
-                bytes(row[0]), self._short_header, full=True).get(0x001, b"")
+            e0 = CompsRecord.full_attrs(
+                self._cur, self._object_id, self._short_header).get(0x001, b"")
         except Exception:
             return {}
         n = len(e0)
@@ -4319,17 +4278,10 @@ class ModuleBuilder(L5xElementBuilder):
             # before 0x001 surfaces). Recover it from comps_full before giving up,
             # the same way ConfigData/ForceData read their images.
             try:
-                self._cur.execute(
-                    "SELECT record FROM comps_full WHERE object_id=?",
-                    (self._object_id,),
-                )
-                _cf = self._cur.fetchone()
-                if _cf and _cf[0]:
-                    _fe1 = CompsRecord.read_value_attrs(
-                        bytes(_cf[0]), self._short_header, full=True
-                    ).get(0x001, b"")
-                    if len(_fe1) >= 0x30:
-                        e1 = _fe1
+                _fe1 = CompsRecord.full_attrs(
+                    self._cur, self._object_id, self._short_header).get(0x001, b"")
+                if len(_fe1) >= 0x30:
+                    e1 = _fe1
             except Exception:
                 pass
         if len(e1) < 0x30:
@@ -4499,14 +4451,10 @@ class ModuleBuilder(L5xElementBuilder):
             # notably for the root controller; the untruncated comps_full stream
             # carries it. Recover it before giving up on the port topology.
             try:
-                _cfdl = self._cur.execute(
-                    "SELECT record FROM comps_full WHERE object_id=?",
-                    (self._object_id,)).fetchone()
-                if _cfdl and _cfdl[0]:
-                    _dle1 = CompsRecord.read_value_attrs(
-                        bytes(_cfdl[0]), self._short_header, full=True).get(0x001, b"")
-                    if len(_dle1) >= 0x28:
-                        data_link = struct.unpack("<I", _dle1[0x24:0x28])[0]
+                _dle1 = CompsRecord.full_attrs(
+                    self._cur, self._object_id, self._short_header).get(0x001, b"")
+                if len(_dle1) >= 0x28:
+                    data_link = struct.unpack("<I", _dle1[0x24:0x28])[0]
             except Exception:
                 pass
         # STAGING: CommMethod resolved via the comment_id link (full Communications).
@@ -4764,6 +4712,7 @@ class ModuleBuilder(L5xElementBuilder):
         # and the script are not mutually exclusive); the ConfigData fallback stays
         # gated on config_inner (mutually exclusive with ConfigTag).
         if configscript is None or (config_inner is None and configdata is None):
+            # Stays on the raw comps_full path: reads full=False (not full_attrs).
             self._cur.execute(
                 "SELECT record FROM comps_full WHERE object_id=?", (self._object_id,))
             _mr = self._cur.fetchone()
@@ -4853,13 +4802,8 @@ class ModuleBuilder(L5xElementBuilder):
         drives_adc_enabled = drives_adc_mode = safety_network = None
         safety_signature = safety_signature_timestamp = None
         try:
-            _cf = self._cur.execute(
-                "SELECT record FROM comps_full WHERE object_id=?",
-                (self._object_id,)).fetchone()
-            _fe1 = b""
-            if _cf and _cf[0]:
-                _fe1 = CompsRecord.read_value_attrs(
-                    bytes(_cf[0]), self._short_header, full=True).get(0x001, b"")
+            _fe1 = CompsRecord.full_attrs(
+                self._cur, self._object_id, self._short_header).get(0x001, b"")
             if len(_fe1) >= 2 and struct.unpack_from("<H", _fe1, 0)[0] in (0x0200, 0x0201):
                 _p = _fe1.find(b"\xff\xff\xff\xff")
                 _v = struct.unpack_from("<I", _fe1, _p - 4)[0] if _p >= 4 else 0
@@ -5689,6 +5633,8 @@ class TagBuilder(L5xElementBuilder):
         can also carry a 0x65 template, but a stale one that disagrees with the live
         (offset-decoded) target, so it must not be trusted there.
         """
+        # Stays on the raw comps_full path: the SP-marker gate below needs the
+        # payload bytes, not just the attr dict.
         row = self._cur.execute(
             "SELECT record FROM comps_full WHERE object_id=?",
             (self._object_id,)).fetchone()
@@ -6730,6 +6676,8 @@ class RoutineBuilder(L5xElementBuilder):
         # table). The lookup returns nothing for an unsigned routine (0 false-pos).
         safety_sig = safety_sig_ts = None
         try:
+            # Stays on the raw comps_full path: the (otype, cid, disc) triple
+            # sits at fixed body offsets, not in the attr table.
             _cf = self._cur.execute(
                 "SELECT record FROM comps_full WHERE object_id=?",
                 (self._object_id,)).fetchone()
@@ -7288,12 +7236,7 @@ def _render_alarm_digital_data(cur, short_header, dti):
     try:
         if not dti:
             return None
-        row = cur.execute(
-            "SELECT record FROM comps_full WHERE object_id=?", (dti,)).fetchone()
-        if not row or row[0] is None:
-            return None
-        e1 = CompsRecord.read_value_attrs(
-            bytes(row[0]), short_header, full=True).get(0x01, b"")
+        e1 = CompsRecord.full_attrs(cur, dti, short_header).get(0x01, b"")
         if len(e1) < 153:
             return None
         flags = struct.unpack_from("<I", e1, 141)[0]
@@ -7443,9 +7386,7 @@ def _build_alarm_conditions(cur, short_header):
             name = rec[0x5c:0x5c + nlen].decode("ascii")
             ctlen = struct.unpack_from("<H", rec, 0x84)[0]
             ct = rec[0x86:0x86 + ctlen].decode("ascii")
-            cur.execute("SELECT record FROM comps_full WHERE object_id=?", (oid,))
-            frow = cur.fetchone()
-            attrs = CompsRecord.read_value_attrs(bytes(frow[0]), short_header, full=True) if frow else {}
+            attrs = CompsRecord.full_attrs(cur, oid, short_header)
             in_s = attrs.get(0x6a, b"").decode("utf-16-le", errors="ignore").split("\x00")[0]
             inp, owner_oid, owner_name = _resolve(in_s)
             if owner_name and inp.startswith(owner_name):
@@ -7553,6 +7494,8 @@ def _tagcoll_sig_attrs(cur, oid, short_header):
     record embeds an (otype, cid, disc) triple at body+10/+12/+16 that keys the
     connection_signatures side table (which holds every GSS signature)."""
     try:
+        # Stays on the raw comps_full path: the triple sits at fixed body
+        # offsets, not in the attr table.
         cf = cur.execute("SELECT record FROM comps_full WHERE object_id=?", (oid,)).fetchone()
         if not cf or not cf[0]:
             return ""
@@ -7721,10 +7664,7 @@ def _alarm_definitions_xml(cur, short_header):
         nm = rec[0x5c:0x5c + nlen].decode("ascii", "replace")
         ctlen = struct.unpack_from("<H", rec, 0x84)[0]
         ct = rec[0x86:0x86 + ctlen].decode("ascii", "replace")
-        cf = cur.execute(
-            "SELECT record FROM comps_full WHERE object_id=?", (oid,)).fetchone()
-        attrs = (CompsRecord.read_value_attrs(bytes(cf[0]), short_header, full=True)
-                 if cf and cf[0] else {})
+        attrs = CompsRecord.full_attrs(cur, oid, short_header)
         ins = attrs.get(0x6a, b"").decode("utf-16-le", "ignore").split("\x00")[0]
         inp, ownn = resolve(ins)
         if ownn and inp.startswith(ownn):
@@ -8532,11 +8472,8 @@ class ControllerBuilder(L5xElementBuilder):
         ethernet_ip_mode = None
         power_loss_program = None
         try:
-            self._cur.execute(
-                "SELECT record FROM comps_full WHERE object_id=?", (results[0][1],))
-            _ctlrow = self._cur.fetchone()
-            _ctlattrs = (CompsRecord.read_value_attrs(
-                bytes(_ctlrow[0]), self._short_header, full=True) if _ctlrow else {})
+            _ctlattrs = CompsRecord.full_attrs(
+                self._cur, results[0][1], self._short_header)
         except Exception:
             _ctlattrs = {}
         # On a source-protected controller the ext-attr tail is encrypted, so the
@@ -8610,12 +8547,8 @@ class ControllerBuilder(L5xElementBuilder):
                 (_rcc[0], child)).fetchone()
             if not _r:
                 return b""
-            _cf = self._cur.execute(
-                "SELECT record FROM comps_full WHERE object_id=?", (_r[0],)).fetchone()
-            if not _cf or not _cf[0]:
-                return b""
-            return CompsRecord.read_value_attrs(
-                bytes(_cf[0]), self._short_header, full=True).get(0x1, b"")
+            return CompsRecord.full_attrs(
+                self._cur, _r[0], self._short_header).get(0x1, b"")
         try:
             _tb = _rcc_attr("TimeSynchronize")
             if len(_tb) > 273:
@@ -8776,14 +8709,9 @@ class ControllerBuilder(L5xElementBuilder):
         # self-gates via force_pool and so needs no flag.)
         _forces_installed = False
         try:
-            self._cur.execute(
-                "SELECT record FROM comps_full WHERE object_id=?", (self._object_id,)
-            )
-            _cr = self._cur.fetchone()
-            if _cr:
-                _ca = CompsRecord.read_value_attrs(
-                    bytes(_cr[0]), self._short_header, full=True)
-                _forces_installed = len(_ca.get(0x1, b"")) in (62, 70)
+            _ca = CompsRecord.full_attrs(
+                self._cur, self._object_id, self._short_header)
+            _forces_installed = len(_ca.get(0x1, b"")) in (62, 70)
         except Exception:
             _forces_installed = False
         # Per-tag <AlarmConditions> blocks (V33+), keyed by owning tag object id.

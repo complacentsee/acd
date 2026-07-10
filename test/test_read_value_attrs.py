@@ -195,3 +195,45 @@ def test_read_ext_attrs_no_marker_returns_empty():
     so its caller keeps the plaintext fallback."""
     plain = b"\x00" * 74 + struct.pack("<II", 8, 1) + _attr(0x66, b"\x01\x02")
     assert CompsRecord.read_ext_attrs_from_record(plain) == {}
+
+
+# --------------------------------------------------------------------------- #
+# full_record / full_attrs (per-cursor memoized comps_full readers)
+# --------------------------------------------------------------------------- #
+
+
+def _comps_full_cursor(rows):
+    import sqlite3
+
+    cur = sqlite3.connect(":memory:").cursor()
+    cur.execute("CREATE TABLE comps_full(object_id INTEGER PRIMARY KEY, record BLOB)")
+    cur.executemany("INSERT INTO comps_full VALUES (?, ?)", rows)
+    return cur
+
+
+def test_full_attrs_reads_comps_full_payload():
+    payload = _payload([(0x01, b"\x3e\x00"), (0x66, b"\x2a\x00\x00\x00")])
+    cur = _comps_full_cursor([(7, payload)])
+    out = CompsRecord.full_attrs(cur, 7, False)
+    assert out[0x66] == b"\x2a\x00\x00\x00"
+    assert CompsRecord.full_record(cur, 7) == payload
+
+
+def test_full_attrs_missing_row_yields_empty():
+    cur = _comps_full_cursor([])
+    assert CompsRecord.full_attrs(cur, 42, False) == {}
+    assert CompsRecord.full_record(cur, 42) is None
+
+
+def test_full_attrs_memoizes_per_cursor():
+    payload = _payload([(0x66, b"\x07\x00\x00\x00")])
+    cur = _comps_full_cursor([(7, payload)])
+    first = CompsRecord.full_attrs(cur, 7, False)
+    # Drop the row: the memo must answer, and the same dict must come back.
+    cur.execute("DELETE FROM comps_full")
+    assert CompsRecord.full_attrs(cur, 7, False) is first
+    assert CompsRecord.full_record(cur, 7) == payload
+    # A different cursor gets no shared state (the table is empty now).
+    cur2 = cur.connection.cursor()
+    cur2.execute("SELECT 1").fetchone()
+    assert CompsRecord.full_attrs(cur2, 7, False) == {}

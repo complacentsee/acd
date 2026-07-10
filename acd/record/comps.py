@@ -1,3 +1,4 @@
+import weakref
 from dataclasses import dataclass
 from io import BytesIO
 from sqlite3 import Cursor
@@ -13,6 +14,13 @@ from acd.record._aes import AES
 # Comps record identifiers (little-endian u16).
 _FAFA_IDENTIFIER = 64250  # 0xFAFA primary records
 _FDFD_IDENTIFIER = 65021  # 0xFDFD secondary / sub records
+
+# Per-cursor memo for full_record/full_attrs. One export owns one cursor, and
+# the builders re-read the same comps_full rows many times (the module builder
+# alone reads its own row several ways); entries die with the cursor, so
+# consecutive exports in one process never share state.
+_FULL_RECORD_CACHE: "weakref.WeakKeyDictionary[Cursor, dict]" = weakref.WeakKeyDictionary()
+_FULL_ATTRS_CACHE: "weakref.WeakKeyDictionary[Cursor, dict]" = weakref.WeakKeyDictionary()
 
 # --- Source-protection-at-rest (V24 "source-protected" projects) -------------
 # A source-protected project keeps each comps record's main_record PLAINTEXT but
@@ -324,6 +332,31 @@ class CompsRecord:
     def body_offset(short_header: bool) -> int:
         """Full-payload offset of the RxGeneric body (prelude) for the family."""
         return _SH_BODY_OFF if short_header else CompsRecord._LONG_BODY_OFF
+
+    @staticmethod
+    def full_record(cur: Cursor, object_id: int) -> Optional[bytes]:
+        """Untruncated comps_full stream payload for ``object_id``, or None
+        when the side table has no row. Cached per cursor."""
+        cache = _FULL_RECORD_CACHE.setdefault(cur, {})
+        if object_id not in cache:
+            row = cur.execute(
+                "SELECT record FROM comps_full WHERE object_id=?", (object_id,)
+            ).fetchone()
+            cache[object_id] = bytes(row[0]) if row and row[0] is not None else None
+        return cache[object_id]
+
+    @staticmethod
+    def full_attrs(cur: Cursor, object_id: int, short_header: bool) -> dict:
+        """{attribute_id: bytes} from ``read_value_attrs(full=True)`` on the
+        comps_full payload; {} when the side table has no row. Memoized per
+        cursor -- treat the returned dict as read-only."""
+        cache = _FULL_ATTRS_CACHE.setdefault(cur, {})
+        key = (object_id, bool(short_header))
+        if key not in cache:
+            rec = CompsRecord.full_record(cur, object_id)
+            cache[key] = ({} if rec is None else
+                          CompsRecord.read_value_attrs(rec, short_header, full=True))
+        return cache[key]
 
     @staticmethod
     def read_ext_attrs_from_record(record: bytes, full: bool = False) -> dict:
