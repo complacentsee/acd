@@ -2650,39 +2650,10 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
 
         if 0x01 not in extended_records:
             # Name comes from comp_name in the database; radix from main_record
-            raw_radix = r.main_record.radix
-            radix = radix_enum(raw_radix)
-            dim_parts = []
-            if r.main_record.dimension_1 != 0:
-                dim_parts.append(str(r.main_record.dimension_1))
-            if r.main_record.dimension_2 != 0:
-                dim_parts.append(str(r.main_record.dimension_2))
-            if r.main_record.dimension_3 != 0:
-                dim_parts.append(str(r.main_record.dimension_3))
-            # The Dimensions attribute is space-separated (Logix convention).
-            dimensions = " ".join(dim_parts) if dim_parts else None
-            value_bytes, _ = (
-                (None, 0) if (alias_for or suppress_value)
-                else self._read_tag_value(r.main_record.data_table_instance)
-            )
-            _nm = io_name or results[0][0]
-            return Tag(
-                _nm, _nm, tag_type,
-                None if alias_for else data_type, radix,
-                external_access, constant, dimensions, r.main_record.data_table_instance,
-                comment_results,
-                _operand_comments=operand_comments,
-                alias_for=alias_for,
-                _value_bytes=value_bytes,
-                _short_header=self._short_header,
-                _raw_hex_data=self._raw_hex_first_block(),
-                _no_data=suppress_value,
-                _io=is_io,
-                _opc_ua=_opc_ua, _class_attr=_cls_attr(),
-            )
-
-        name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
-        name = bytes(extended_records[0x01][2 : name_length + 2]).decode("utf-8", errors="replace")
+            name = results[0][0]
+        else:
+            name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
+            name = bytes(extended_records[0x01][2 : name_length + 2]).decode("utf-8", errors="replace")
 
         raw_radix = r.main_record.radix
         radix = radix_enum(raw_radix)
@@ -6043,6 +6014,7 @@ class ProjectBuilder:
         # SWVersion reflects the Studio 5000 application version (e.g. "RSLogix 5000 v35.04"),
         # which is what RSLogix5000Content SoftwareRevision represents.  DeviceIdentity
         # MajorRevision/MinorRevision is the controller firmware version — a different value.
+        software_revision = None
         sw_version_element = element.find("SWVersion")
         if sw_version_element is not None:
             sw_version_string = sw_version_element.attrib.get("String", "")
@@ -6050,18 +6022,9 @@ class ProjectBuilder:
             match = re.search(r"v(\d+\.\d+)$", sw_version_string.strip())
             if match:
                 software_revision = match.group(1)
-            else:
-                # Unexpected format — fall back to DeviceIdentity firmware version.
-                device_identity = element.find("DeviceIdentity")
-                if device_identity is not None:
-                    software_revision = (
-                        f"{device_identity.attrib['MajorRevision']}"
-                        f".{device_identity.attrib['MinorRevision']}"
-                    )
-                else:
-                    software_revision = "33.01"
-        else:
-            # No SWVersion element — fall back to DeviceIdentity firmware version.
+        if software_revision is None:
+            # SWVersion missing or in an unexpected format — fall back to the
+            # DeviceIdentity firmware version.
             device_identity = element.find("DeviceIdentity")
             if device_identity is not None:
                 software_revision = (
