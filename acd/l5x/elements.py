@@ -1092,7 +1092,6 @@ def _conn_modern_attrs(blob: bytes, fmt: int) -> dict:
 # Output format carries size AND connection points, but only for generic/drive
 # modules (see ModuleBuilder).
 _CONN_FMT_OUTPUT = 6
-_CONN_DATADRIVEN_FMTS = {48, 49, 50}
 # Modules whose I/O assembly is user-configured rather than fixed by a catalog
 # Module Definition state their connection points and sizes explicitly. These are
 # the drive families (CIP ProductType below) and the generic profiles (ProductType
@@ -3137,7 +3136,6 @@ class MemberBuilder(L5xElementBuilder):
         for extended_record in getattr(r, "extended_records", []):
             extended_records[extended_record.attribute_id] = extended_record.value
 
-        cip_data_typoe = struct.unpack_from("<I", self.record, 0x78)[0]
         dimension = struct.unpack_from("<I", self.record, 0x5C)[0]
         # A bogus dimension (e.g. 0x20000) appears in the 0x5C slot for some
         # non-array scalar members of predefined types; clamp implausible values
@@ -7951,15 +7949,6 @@ class ProgramBuilder(L5xElementBuilder):
                 tag._alarm_xml = self._alarm_map.get(result[1], "")
                 tags.append(tag)
 
-        if _prog_comment_parent is not None:
-            self._cur.execute(
-                "SELECT tag_reference, record_string FROM comments WHERE parent="
-                + str(_prog_comment_parent)
-            )
-            comment_results = self._cur.fetchall()
-        else:
-            comment_results = []
-
         # SynchronizeRedundancyDataAfterExecution: present only for redundant controllers.
         # The binary does not expose a per-program flag for this attribute — it is implicit
         # for all programs in a redundant controller project.
@@ -8406,14 +8395,6 @@ class ControllerBuilder(L5xElementBuilder):
             r = None
             extended_records = {}
             _comment_parent = None
-        if _comment_parent is not None:
-            self._cur.execute(
-                "SELECT tag_reference, record_string FROM comments WHERE parent="
-                + str(_comment_parent)
-            )
-            comment_results = self._cur.fetchall()
-        else:
-            comment_results = []
 
         # --- Controller own Description ---
         # Long header: own-description key parent = comment_id*0x10000 + cip_type,

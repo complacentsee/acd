@@ -368,19 +368,6 @@ def _fmt_lreal_decorated(v: float) -> str:
         return f"{sign}{ipart}.{fpart}" if fpart else f"{sign}{ipart}.0"
 
 
-def _atomic_value_decorated(dt: str, image: bytes, offset: int) -> Optional[str]:
-    """Decode one atomic value at `offset` for a Decorated Value attribute."""
-    width, fmt = _ATOMIC[dt]
-    if offset + width > len(image):
-        return None
-    val = struct.unpack_from(fmt, image, offset)[0]
-    if dt in ("REAL", "LREAL"):
-        return _fmt_real_decorated(val)
-    if dt == "BOOL":
-        return "1" if val else "0"
-    return str(val)
-
-
 def _dims_total(dimensions: Optional[str]) -> Tuple[int, List[int]]:
     if not dimensions:
         return 0, []

@@ -239,15 +239,6 @@ def record_uses_short_header(record_buffer: bytes) -> bool:
 
 
 @dataclass
-class RecordData:
-    object_id: int
-    record_length: int
-    seq_number: int
-    record_type: int
-    dat_record: DatRecord
-
-
-@dataclass
 class CompsRecord:
     _cur: Cursor
     dat_record: DatRecord

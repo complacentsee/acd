@@ -75,10 +75,6 @@ class ExportL5x:
         self._cur.execute(
             "CREATE TABLE comps(object_id int, parent_id int, comp_name text, seq_number int, record_type int, record BLOB NOT NULL)"
         )
-        log.debug("Create pointers table in sqllite db")
-        self._cur.execute(
-            "CREATE TABLE pointers(object_id int, parent_id int, comp_name text, seq_number int, record_type int, record BLOB NOT NULL)"
-        )
         log.debug("Create Rungs table in sqllite db")
         self._cur.execute(
             "CREATE TABLE rungs(object_id int, rung text, seq_number int)"
