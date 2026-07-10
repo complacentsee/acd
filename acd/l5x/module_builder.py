@@ -12,7 +12,13 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Union
 
 from acd.generated.comps.rx_generic import RxGeneric
-from acd.l5x.base import L5xElement, L5xElementBuilder, own_description, short_own_description
+from acd.l5x.base import (
+    L5xElement,
+    L5xElementBuilder,
+    own_description,
+    safety_signature_row,
+    short_own_description,
+)
 from acd.l5x.catalog_numbers import CATALOG_NUMBERS, CATALOG_NUMBERS_BY_MAJOR
 from acd.l5x.connections import (
     _CONFIG_IMG_MAX,
@@ -1660,11 +1666,7 @@ class ModuleBuilder(L5xElementBuilder):
                 (self._object_id,)).fetchone()
             if _mrow and _mrow[0] is not None and len(bytes(_mrow[0])) >= 16:
                 _mr = bytes(_mrow[0])
-                _key = (struct.unpack_from("<H", _mr, 0x0A)[0],
-                        struct.unpack_from("<I", _mr, 0x0C)[0])
-                _sr = self._cur.execute(
-                    "SELECT signature, timestamp FROM safety_signatures "
-                    "WHERE otype=? AND cid=?", _key).fetchone()
+                _sr = safety_signature_row(self._cur, _mr)
                 if _sr and _sr[0]:
                     safety_signature = _sr[0]
                     safety_signature_timestamp = _sr[1]

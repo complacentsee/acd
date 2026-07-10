@@ -6,6 +6,7 @@
 """
 import html
 import re
+import struct
 from dataclasses import dataclass
 from sqlite3 import Cursor
 from typing import List, Union
@@ -102,6 +103,37 @@ class L5xElement:
             getattr(self, "_export_name", "") or self.__class__.__name__.title().replace("_", "")
         )
         return f'<{_export_name} {" ".join(attribute_list)}>{"".join(child_list)}</{_export_name}>'
+
+
+def safety_signature_row(cur: Cursor, rec: bytes):
+    """The (signature, timestamp) row of a component's 2-key GSS join, or None.
+
+    A signed safety component joins the safety_signatures side table by its
+    object type (u16 @ record 0x0A) and comment id (u32 @ 0x0C). Returns the
+    raw row; callers keep their own truthiness gates.
+    """
+    return cur.execute(
+        "SELECT signature, timestamp FROM safety_signatures "
+        "WHERE otype=? AND cid=?",
+        (struct.unpack_from("<H", rec, 0x0A)[0],
+         struct.unpack_from("<I", rec, 0x0C)[0])).fetchone()
+
+
+def connection_signature_row(cur: Cursor, rec: bytes, body_offset: int):
+    """The (signature, timestamp) row of a record's 3-key GSS join, or None.
+
+    Names collide across the 2-key safety_signatures table, so per-object
+    signatures join the 3-key connection_signatures side table (which holds
+    every GSS signature) by the (otype u16 @ body+10, cid u32 @ body+12,
+    disc u32 @ body+16) triple embedded in the decrypted comps_full body.
+    Returns the raw row; callers keep their own truthiness gates.
+    """
+    return cur.execute(
+        "SELECT signature, timestamp FROM connection_signatures "
+        "WHERE otype=? AND cid=? AND disc=?",
+        (struct.unpack_from("<H", rec, body_offset + 10)[0],
+         struct.unpack_from("<I", rec, body_offset + 12)[0],
+         struct.unpack_from("<I", rec, body_offset + 16)[0])).fetchone()
 
 
 def own_description(cur: Cursor, comment_parent: int) -> Union[str, None]:

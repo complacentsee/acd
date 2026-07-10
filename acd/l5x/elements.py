@@ -17,7 +17,9 @@ from acd.l5x.base import (
     L5xElement,
     L5xElementBuilder,
     _xml_sane,
+    connection_signature_row,
     own_description,
+    safety_signature_row,
     short_own_description,
 )
 from acd.l5x.connections import (
@@ -3181,12 +3183,7 @@ class RoutineBuilder(L5xElementBuilder):
                 _rb = bytes(_cf[0])
                 _bo = CompsRecord.body_offset(self._short_header)
                 if len(_rb) >= _bo + 20:
-                    _sr = self._cur.execute(
-                        "SELECT signature, timestamp FROM connection_signatures "
-                        "WHERE otype=? AND cid=? AND disc=?",
-                        (struct.unpack_from("<H", _rb, _bo + 10)[0],
-                         struct.unpack_from("<I", _rb, _bo + 12)[0],
-                         struct.unpack_from("<I", _rb, _bo + 16)[0])).fetchone()
+                    _sr = connection_signature_row(self._cur, _rb, _bo)
                     if _sr and _sr[0]:
                         safety_sig, safety_sig_ts = _sr[0], _sr[1]
         except Exception:
@@ -3990,12 +3987,7 @@ def _tagcoll_sig_attrs(cur, oid, short_header):
         bo = CompsRecord.body_offset(short_header)
         if len(rb) < bo + 20:
             return ""
-        sr = cur.execute(
-            "SELECT signature, timestamp FROM connection_signatures "
-            "WHERE otype=? AND cid=? AND disc=?",
-            (struct.unpack_from("<H", rb, bo + 10)[0],
-             struct.unpack_from("<I", rb, bo + 12)[0],
-             struct.unpack_from("<I", rb, bo + 16)[0])).fetchone()
+        sr = connection_signature_row(cur, rb, bo)
         if sr and sr[0]:
             a = f' SafetySignature="{sr[0]}"'
             if sr[1]:
@@ -4431,11 +4423,7 @@ class ProgramBuilder(L5xElementBuilder):
         # object type (record[0x0A]) and comment id (record[0x0C]).
         prog_sig = prog_sig_ts = None
         if len(prog_record) >= 16:
-            _srow = self._cur.execute(
-                "SELECT signature, timestamp FROM safety_signatures "
-                "WHERE otype=? AND cid=?",
-                (struct.unpack_from("<H", prog_record, 0x0A)[0],
-                 struct.unpack_from("<I", prog_record, 0x0C)[0])).fetchone()
+            _srow = safety_signature_row(self._cur, prog_record)
             if _srow:
                 prog_sig, prog_sig_ts = _srow[0], _srow[1]
 
@@ -4629,11 +4617,7 @@ class TaskBuilder(L5xElementBuilder):
         # type (record[0x0A]) and comment id (record[0x0C]).
         task_sig = task_sig_ts = None
         if len(record) >= 16:
-            _srow = self._cur.execute(
-                "SELECT signature, timestamp FROM safety_signatures "
-                "WHERE otype=? AND cid=?",
-                (struct.unpack_from("<H", record, 0x0A)[0],
-                 struct.unpack_from("<I", record, 0x0C)[0])).fetchone()
+            _srow = safety_signature_row(self._cur, record)
             if _srow:
                 task_sig, task_sig_ts = _srow[0], _srow[1]
 
