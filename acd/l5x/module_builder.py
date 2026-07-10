@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Union
 
 from acd.generated.comps.rx_generic import RxGeneric
-from acd.l5x.base import L5xElement, L5xElementBuilder
+from acd.l5x.base import L5xElement, L5xElementBuilder, own_description, short_own_description
 from acd.l5x.catalog_numbers import CATALOG_NUMBERS, CATALOG_NUMBERS_BY_MAJOR
 from acd.l5x.connections import (
     _CONFIG_IMG_MAX,
@@ -1266,25 +1266,12 @@ class ModuleBuilder(L5xElementBuilder):
         # would otherwise leak in as a fabricated Description, so require object_id == 1.
         description = ""
         if self._short_header:
-            # V10-V21: own description keyed by the bare comment_id; the
-            # short-header own-description record stores the owner's cip_type in
-            # sub_record_length, so filter on it (a module is 0x69) to skip a
-            # cip-0x68 tag that shares this comment_id.
-            self._cur.execute(
-                "SELECT record_string FROM comments "
-                "WHERE parent=? AND member_ref=0 AND record_type IN (1,2) "
-                "AND sub_record_length=? AND record_string!='' LIMIT 1",
-                (r.comment_id, r.cip_type),
-            )
+            # sub_record_length filter (a module is 0x69) skips a cip-0x68 tag
+            # that shares this comment_id.
+            description = short_own_description(self._cur, r.comment_id, r.cip_type) or ""
         else:
-            self._cur.execute(
-                "SELECT record_string FROM comments "
-                "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
-                ((r.comment_id * 0x10000) + r.cip_type,),
-            )
-        desc_row = self._cur.fetchone()
-        if desc_row:
-            description = desc_row[0] or ""
+            description = own_description(
+                self._cur, (r.comment_id * 0x10000) + r.cip_type) or ""
 
         # --- Communications and ExtendedProperties ---
         # CommMethod is resolved from the module's ICP slot / IP address. The

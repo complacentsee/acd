@@ -13,7 +13,13 @@ from typing import List, Tuple, Dict, Union
 
 from acd.generated.comps.rx_generic import RxGeneric
 from acd.l5x.alias import TagAliasResolver
-from acd.l5x.base import L5xElement, L5xElementBuilder, _xml_sane
+from acd.l5x.base import (
+    L5xElement,
+    L5xElementBuilder,
+    _xml_sane,
+    own_description,
+    short_own_description,
+)
 from acd.l5x.connections import (
     _DESC_BLOCK_RE,
     _build_config_holders,
@@ -2049,32 +2055,12 @@ class DataTypeBuilder(L5xElementBuilder):
         # drops those fabricated Descriptions while keeping the real one.
         description: Union[str, None] = None
         if self._short_header:
-            # V10-V21: the datatype's own description is keyed by its bare
-            # comment_id (member_ref 0, record_type 1/2) -- the same scheme as
-            # short-header tags. That bare key collides with cip-0x68 tags that
-            # share the comment_id, but the short-header own-description record
-            # stores its OWNER's cip_type in the sub_record_length column, so
-            # filtering on sub_record_length == this datatype's cip_type (a
-            # datatype is 0x6c; the colliding tag is 0x68) selects the right row
-            # unambiguously -- no uniqueness gate needed.
-            self._cur.execute(
-                "SELECT record_string FROM comments "
-                "WHERE parent=? AND member_ref=0 AND record_type IN (1,2) "
-                "AND sub_record_length=? AND record_string!='' LIMIT 1",
-                (r.comment_id, r.cip_type),
-            )
-            desc_row = self._cur.fetchone()
-            if desc_row and desc_row[0]:
-                description = desc_row[0]
+            # sub_record_length == this datatype's cip_type (a datatype is 0x6c;
+            # the colliding tag is 0x68) selects the right row unambiguously --
+            # no uniqueness gate needed.
+            description = short_own_description(self._cur, r.comment_id, r.cip_type)
         else:
-            self._cur.execute(
-                "SELECT record_string FROM comments "
-                "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
-                ((r.comment_id * 0x10000) + r.cip_type,),
-            )
-            desc_row = self._cur.fetchone()
-            if desc_row and desc_row[0]:
-                description = desc_row[0]
+            description = own_description(self._cur, (r.comment_id * 0x10000) + r.cip_type)
 
         # Library raC_*/STR* UDTs carry a verbatim <CustomProperties> provider block
         # captured into the custom_properties table, keyed by this datatype's
@@ -3682,30 +3668,16 @@ class AoiBuilder(L5xElementBuilder):
         if _r_aoi is not None:
             aoi_comment_parent = (_r_aoi.comment_id * 0x10000) + _r_aoi.cip_type
             if self._short_header:
-                # V10-V21: own description keyed by the bare comment_id; the
-                # short-header own-description record stores the owner's cip_type
-                # in sub_record_length, so filter on it to skip the cip-0x68 tag
-                # that may share this comment_id (the AOI's own cip is 0x338).
-                self._cur.execute(
-                    "SELECT record_string FROM comments "
-                    "WHERE parent=? AND member_ref=0 AND record_type IN (1,2) "
-                    "AND sub_record_length=? AND record_string!='' LIMIT 1",
-                    (_r_aoi.comment_id, _r_aoi.cip_type),
-                )
+                # sub_record_length filter skips the cip-0x68 tag that may share
+                # this comment_id (the AOI's own cip is 0x338).
+                aoi_description = short_own_description(
+                    self._cur, _r_aoi.comment_id, _r_aoi.cip_type)
             else:
-                # The AOI's own description carries object_id == 1; the
-                # extended-help text rows under the same key carry a nonzero
-                # object_id (with a non-empty tag_reference such as UDI_EXT_HELP)
-                # and are not emitted by OEM as a Description, so require
-                # object_id == 1 to exclude them.
-                self._cur.execute(
-                    "SELECT record_string FROM comments "
-                    "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
-                    (aoi_comment_parent,),
-                )
-            desc_row = self._cur.fetchone()
-            if desc_row and desc_row[0]:
-                aoi_description = desc_row[0]
+                # The extended-help rows under the same key carry a nonzero
+                # object_id (with a tag_reference such as UDI_EXT_HELP) and are
+                # not emitted by OEM as a Description; own_description's
+                # object_id == 1 filter excludes them.
+                aoi_description = own_description(self._cur, aoi_comment_parent)
             try:
                 self._cur.execute(
                     "SELECT record_string FROM comments WHERE parent=? AND tag_reference='__REVISION_NOTE__' LIMIT 1",
@@ -4458,24 +4430,10 @@ class ProgramBuilder(L5xElementBuilder):
             if len(prog_record) >= 14:
                 _pcid = struct.unpack_from("<H", prog_record, 12)[0]
                 _pcip = struct.unpack_from("<H", prog_record, 10)[0]
-                self._cur.execute(
-                    "SELECT record_string FROM comments "
-                    "WHERE parent=? AND member_ref=0 AND record_type IN (1,2) "
-                    "AND sub_record_length=? AND record_string!=''",
-                    (_pcid, _pcip),
-                )
-                _prows = self._cur.fetchall()
-                if len(_prows) == 1 and _prows[0][0]:
-                    program_description = _prows[0][0]
+                program_description = short_own_description(
+                    self._cur, _pcid, _pcip, require_unique=True)
         elif _prog_comment_parent is not None:
-            self._cur.execute(
-                "SELECT record_string FROM comments "
-                "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
-                (_prog_comment_parent,),
-            )
-            _prow = self._cur.fetchone()
-            if _prow and _prow[0]:
-                program_description = _prow[0]
+            program_description = own_description(self._cur, _prog_comment_parent)
 
         # Class: a safety controller marks each program Safety/Standard with a byte
         # at record offset 0x173 (short layout) / 0xE5 (long); standard controllers
@@ -4871,18 +4829,7 @@ class ControllerBuilder(L5xElementBuilder):
             if len(_crec) >= 14:
                 _ccid = struct.unpack_from("<H", _crec, 12)[0]
                 _ccip = struct.unpack_from("<H", _crec, 10)[0]
-                # The short-header own-description record stores the owner cip_type
-                # in sub_record_length; filter on it to skip a cip-0x68 tag that
-                # shares the controller's comment_id.
-                self._cur.execute(
-                    "SELECT record_string FROM comments "
-                    "WHERE parent=? AND member_ref=0 AND record_type IN (1,2) "
-                    "AND sub_record_length=? AND record_string!='' LIMIT 1",
-                    (_ccid, _ccip),
-                )
-                _drow = self._cur.fetchone()
-                if _drow and _drow[0]:
-                    controller_description = _drow[0]
+                controller_description = short_own_description(self._cur, _ccid, _ccip)
         else:
             _desc_parent = _comment_parent
             if _desc_parent is None:
@@ -4890,14 +4837,7 @@ class ControllerBuilder(L5xElementBuilder):
                 if _pm is not None:
                     _desc_parent = (_pm.comment_id * 0x10000) + _pm.cip_type
             if _desc_parent is not None:
-                self._cur.execute(
-                    "SELECT record_string FROM comments "
-                    "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
-                    (_desc_parent,),
-                )
-                _drow = self._cur.fetchone()
-                if _drow and _drow[0]:
-                    controller_description = _drow[0]
+                controller_description = own_description(self._cur, _desc_parent)
         return controller_description
 
     def _pass_ext_record_scalars(self, r, extended_records):

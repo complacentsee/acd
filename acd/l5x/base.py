@@ -8,7 +8,7 @@ import html
 import re
 from dataclasses import dataclass
 from sqlite3 import Cursor
-from typing import List
+from typing import List, Union
 
 
 # XML 1.0 forbids the C0 control characters except TAB (0x09), LF (0x0A) and
@@ -102,3 +102,45 @@ class L5xElement:
             getattr(self, "_export_name", "") or self.__class__.__name__.title().replace("_", "")
         )
         return f'<{_export_name} {" ".join(attribute_list)}>{"".join(child_list)}</{_export_name}>'
+
+
+def own_description(cur: Cursor, comment_parent: int) -> Union[str, None]:
+    """A component's own Description (long-header form), or None.
+
+    The own-description row lives at parent == comment_id*0x10000 + cip_type
+    with member_ref 0 and carries object_id == 1; rows sharing the key with a
+    nonzero object_id are scratch/extended-help values whose record_string
+    would leak in as a fabricated Description, so they are excluded.
+    """
+    cur.execute(
+        "SELECT record_string FROM comments "
+        "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
+        (comment_parent,),
+    )
+    row = cur.fetchone()
+    return row[0] if row and row[0] else None
+
+
+def short_own_description(cur: Cursor, comment_id: int, cip_type: int,
+                          require_unique: bool = False) -> Union[str, None]:
+    """A component's own Description (short-header V10-V21 form), or None.
+
+    Keyed by the bare comment_id (member_ref 0, record_type 1/2). The bare key
+    collides with cip-0x68 tags sharing the comment_id, but the own-description
+    record stores its OWNER's cip_type in the sub_record_length column, so
+    filtering on it selects the right row. ``require_unique`` demands exactly
+    one matching row instead of first-match (program descriptions, whose
+    collisions the cip filter alone cannot break).
+    """
+    sql = (
+        "SELECT record_string FROM comments "
+        "WHERE parent=? AND member_ref=0 AND record_type IN (1,2) "
+        "AND sub_record_length=? AND record_string!=''"
+    )
+    if require_unique:
+        cur.execute(sql, (comment_id, cip_type))
+        rows = cur.fetchall()
+        return rows[0][0] if len(rows) == 1 and rows[0][0] else None
+    cur.execute(sql + " LIMIT 1", (comment_id, cip_type))
+    row = cur.fetchone()
+    return row[0] if row and row[0] else None
