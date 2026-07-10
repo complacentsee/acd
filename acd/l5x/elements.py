@@ -673,13 +673,32 @@ def _render_value_blocks(element: str,
     return (first if ok_first else "") + decorated_block
 
 
+def _raw_hex_first(short_header: bool, acd_major: int) -> bool:
+    """True when a value's flat first <Data>/<DefaultData> block is the raw-hex
+    image, not Format="L5K".
+
+    Studio's reference exporter writes the flat first block as raw hex through
+    V24 and as Format="L5K" from V28 -- but the exact choice is a per-export
+    ExportOptions setting (some V24/V15 references emit L5K, others raw hex; it
+    is NOT inferable from the ACD). The two are equivalent flat serialisations
+    of the same value, which the comparator normalises and the Decorated block
+    validates regardless; we emit raw hex through V24 (short header V10-V21
+    always), matching the dominant reference profile. One policy for <Data>
+    (TagBuilder) and <DefaultData> (AoiBuilder): the reference corpus styles
+    both identically per file (V24 references carry raw-hex DefaultData with
+    zero Format="L5K" occurrences; V28+ the reverse).
+    """
+    return short_header or (1 <= acd_major <= 24)
+
+
 def _build_default_data(data_type: Union[str, None],
                         dimensions: Union[str, None],
                         value_bytes: Union[bytes, None],
                         short_header: bool,
                         data_types_map: Dict[str, "DataType"],
                         taginfo_layout: Dict[str, object],
-                        radix: Union[str, None] = None) -> str:
+                        radix: Union[str, None] = None,
+                        raw_hex_first: Union[bool, None] = None) -> str:
     """Build the AOI-scoped <DefaultData> child pair for a Parameter/LocalTag.
 
     OEM emits, on every value-bearing AOI Parameter (Input/Output) and every
@@ -698,18 +717,22 @@ def _build_default_data(data_type: Union[str, None],
         dt_base = data_type.split("[")[0].upper() if data_type else ""
         if not dt_base or dt_base in _SKIP_DECORATED:
             return ""
+        # First-block style: the Tag policy (_raw_hex_first) threaded in by
+        # the AoiBuilder; raw_hex_first=None degrades to the short-header-only
+        # rule for callers that do not thread it.
+        raw_hex = short_header if raw_hex_first is None else raw_hex_first
         if value_bytes is not None:
             # Value image present: render exactly the pair a Tag would emit,
-            # spelled <DefaultData>. Policy gates: raw-hex first block only on
-            # short-header projects, the Tag STRING-array rule (a long-header
-            # STRING ARRAY keeps the Decorated <Array> tree, pool-proven on
-            # <Data>; the corpus has no long-header STRING-array AOI member,
-            # so the gate is shared rather than left divergent), and each
-            # half of the pair is emitted independently of the other.
+            # spelled <DefaultData>. Policy gates: the shared raw-hex first-
+            # block rule, the Tag STRING-array rule (a long-header STRING
+            # ARRAY keeps the Decorated <Array> tree, pool-proven on <Data>;
+            # the corpus has no long-header STRING-array AOI member, so the
+            # gate is shared rather than left divergent), and each half of
+            # the pair is emitted independently of the other.
             return _render_value_blocks(
                 "DefaultData", data_type, dimensions, value_bytes,
                 data_types_map, taginfo_layout, radix,
-                raw_hex_first=short_header,
+                raw_hex_first=raw_hex,
                 string_array_as_string=short_header,
                 require_pair=False,
             )
@@ -717,10 +740,10 @@ def _build_default_data(data_type: Union[str, None],
             # No value image -> zero default for this data type.
             if dimensions is None and dt_base in _PRIMITIVE_L5K_ZERO:
                 # Scalar primitive first block. The first <DefaultData> mirrors a
-                # Tag's first <Data> block and is version-styled:
-                #   LONG (V24+):  <DefaultData Format="L5K"><![CDATA[0]]>...
-                #   SHORT(V10-21): <DefaultData>00 00 00 00</DefaultData> (raw hex)
-                if short_header:
+                # Tag's first <Data> block and is version-styled (_raw_hex_first):
+                #   raw hex (through V24): <DefaultData>00 00 00 00</DefaultData>
+                #   L5K (V28+):            <DefaultData Format="L5K"><![CDATA[0]]>...
+                if raw_hex:
                     width = _PRIMITIVE_BYTE_WIDTH.get(dt_base, 0)
                     if width <= 0:
                         return ""
@@ -2050,6 +2073,7 @@ class LocalTag(L5xElement):
     _taginfo_layout: Dict[str, object] = field(default_factory=dict)
     _value_bytes: Union[bytes, None] = None
     _short_header: bool = False
+    _raw_hex_data: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -2077,7 +2101,7 @@ class LocalTag(L5xElement):
         dd_xml = _build_default_data(
             self.data_type, self.dimensions, self._value_bytes,
             self._short_header, self._data_types_map, self._taginfo_layout,
-            radix=self.radix,
+            radix=self.radix, raw_hex_first=self._raw_hex_data,
         )
         if not desc_xml and not dd_xml:
             return base
@@ -2105,6 +2129,7 @@ class Parameter(L5xElement):
     _taginfo_layout: Dict[str, object] = field(default_factory=dict)
     _value_bytes: Union[bytes, None] = None
     _short_header: bool = False
+    _raw_hex_data: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -2132,7 +2157,7 @@ class Parameter(L5xElement):
             dd_xml = _build_default_data(
                 self.data_type, self.dimensions, self._value_bytes,
                 self._short_header, self._data_types_map, self._taginfo_layout,
-                radix=self.radix,
+                radix=self.radix, raw_hex_first=self._raw_hex_data,
             )
         if not desc_xml and not dd_xml:
             return base
@@ -4987,17 +5012,9 @@ class TagBuilder(L5xElementBuilder):
             return None
 
     def _raw_hex_first_block(self) -> bool:
-        """True when the tag's first <Data> block is the raw-hex image, not L5K.
-
-        Studio's reference exporter writes the value's flat first <Data> block as
-        raw hex through V24 and as Format="L5K" from V28 -- but the exact choice is
-        a per-export ExportOptions setting (some V24/V15 references emit L5K, others
-        raw hex; it is NOT inferable from the ACD). The two are equivalent flat
-        serialisations of the same value, which the comparator normalises and the
-        Decorated block validates regardless; here we emit raw hex through V24
-        (short header V10-V21 always), matching the dominant reference profile.
-        """
-        return self._short_header or (1 <= self._acd_major <= 24)
+        """True when the tag's first <Data> block is the raw-hex image, not L5K
+        (the shared _raw_hex_first policy — see its docstring)."""
+        return _raw_hex_first(self._short_header, self._acd_major)
 
     def _read_tag_value(self, data_table_instance: int):
         """Return (value_bytes, type_code) for a tag's design value, or (None, 0).
@@ -6761,6 +6778,7 @@ class AoiBuilder(L5xElementBuilder):
     _short_header: bool = field(default=False)
     _taginfo_layout: Dict[str, object] = field(default_factory=dict)
     _short_routine_desc: Dict[int, str] = field(default_factory=dict)
+    _acd_major: int = field(default=0)
 
     def build(self) -> AOI:
         self._cur.execute(
@@ -7071,6 +7089,8 @@ class AoiBuilder(L5xElementBuilder):
                             p._data_types_map = self._data_types_map
                             p._taginfo_layout = self._taginfo_layout
                             p._short_header = self._short_header
+                            p._raw_hex_data = _raw_hex_first(
+                                self._short_header, self._acd_major)
                             sl = _member_slice(p.name, p.data_type)
                             if sl is not None:
                                 p._value_bytes = sl
@@ -7086,6 +7106,8 @@ class AoiBuilder(L5xElementBuilder):
                             lt._data_types_map = self._data_types_map
                             lt._taginfo_layout = self._taginfo_layout
                             lt._short_header = self._short_header
+                            lt._raw_hex_data = _raw_hex_first(
+                                self._short_header, self._acd_major)
                             sl = _member_slice(lt.name, lt.data_type)
                             if sl is not None:
                                 lt._value_bytes = sl
@@ -8936,6 +8958,7 @@ class ControllerBuilder(L5xElementBuilder):
                 _short_header=self._short_header,
                 _taginfo_layout=self._taginfo_layout,
                 _short_routine_desc=short_routine_desc,
+                _acd_major=self._acd_major,
             ).build())
 
         # Get the Module (IO) Collection and build all Module elements.
