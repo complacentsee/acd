@@ -20,10 +20,10 @@
 #                       "fixed:N" → always emit <Bus Size="N"/>
 #                       "children" → emit <Bus Size=K/> where K = count of this module's children
 #                                   that connect to this port; if zero, still emits <Bus Size="0"/>
-#                       "children_or_empty" → emit <Bus/> when no children, <Bus Size=K/> when K>0
+#                       "children_or_none" → emit <Bus Size=K/> when K>0 children, else no <Bus>
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
 
 @dataclass(frozen=True)

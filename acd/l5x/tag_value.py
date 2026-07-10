@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import struct
 from decimal import Decimal, localcontext, ROUND_HALF_UP
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 # Atomic primitive byte widths and struct-unpack formats.
 _ATOMIC: Dict[str, Tuple[int, str]] = {

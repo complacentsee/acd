@@ -1653,7 +1653,6 @@ class Tag(L5xElement):
     # succeeds; None leaves today's zero-placeholder <Data> behaviour untouched
     # (so both header families fall back identically on any failure).
     _value_bytes: Union[bytes, None] = None
-    _value_type_code: int = 0
     # True for V10..V21 short-header projects. Selects the raw-hex <Data> first
     # block (the older Studio style: <Data>1D 00 00 00</Data>) instead of the
     # V24+ L5K CDATA block. Defaults False so the long (V24+) path is unchanged.
@@ -2074,7 +2073,6 @@ class LocalTag(L5xElement):
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
     _taginfo_layout: Dict[str, object] = field(default_factory=dict)
     _value_bytes: Union[bytes, None] = None
-    _value_type_code: int = 0
     _short_header: bool = False
 
     def __post_init__(self):
@@ -2130,7 +2128,6 @@ class Parameter(L5xElement):
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
     _taginfo_layout: Dict[str, object] = field(default_factory=dict)
     _value_bytes: Union[bytes, None] = None
-    _value_type_code: int = 0
     _short_header: bool = False
 
     def __post_init__(self):
@@ -3120,7 +3117,7 @@ class MemberBuilder(L5xElementBuilder):
         name = results[0][0]
         try:
             r = RxGeneric.from_bytes(results[0][3])
-        except Exception as e:
+        except Exception:
             # Source-protected member record: its own ext-attr tail is encrypted,
             # but every field this builder needs comes from ``self.record`` (the
             # member descriptor blob, passed in already-decrypted by the datatype
@@ -3336,6 +3333,14 @@ class MemberBuilder(L5xElementBuilder):
             return Member(name, name, "", 0, "Decimal", False, None, None, "Read/Write")
 
 
+# Byte size of each atomic backing type, used when walking a predefined type's
+# member descriptors to compute offsets.
+_BACKING_SIZE = {"SINT": 1, "USINT": 1, "BYTE": 1, "BOOL": 1,
+                 "INT": 2, "UINT": 2, "WORD": 2,
+                 "DINT": 4, "UDINT": 4, "DWORD": 4,
+                 "LINT": 8, "ULINT": 8, "LWORD": 8}
+
+
 @dataclass
 class DataTypeBuilder(L5xElementBuilder):
     # V10..V21 short-header datatypes carry their members inline (extended
@@ -3361,7 +3366,7 @@ class DataTypeBuilder(L5xElementBuilder):
                 extended_records[extended_record.attribute_id] = bytes(
                     extended_record.value
                 )
-        except Exception as e:
+        except Exception:
             # Source-protected datatype: the ext-attr tail (member descriptors at
             # 0x6E.., the member_count at 0x64, class flags at 0x67/0x69/0x6C) is
             # AES-encrypted, so the kaitai parser throws. Recover the WHOLE attr
@@ -3447,10 +3452,6 @@ class DataTypeBuilder(L5xElementBuilder):
             # offset via [0x6c].  Non-BIT members have [0x6c]=0xFFFFFFFF and 0x68=0x800.
             # Only include non-BIT members (0x68==0x800) so that BIT members sharing the
             # same 0x60 value as their backing field do not overwrite the backing entry.
-            _BACKING_SIZE = {"SINT": 1, "USINT": 1, "BYTE": 1, "BOOL": 1,
-                             "INT": 2, "UINT": 2, "WORD": 2,
-                             "DINT": 4, "UDINT": 4, "DWORD": 4,
-                             "LINT": 8, "ULINT": 8, "LWORD": 8}
             offset60_to_name: Dict[int, str] = {}
             for idx2, child2 in enumerate(children_results):
                 key2 = 0x6E + idx2
@@ -3567,10 +3568,6 @@ class DataTypeBuilder(L5xElementBuilder):
             # past the backing field's own 0x60 (e.g. the high byte of an INT),
             # so we map EVERY byte the backing field covers to its name (sizes
             # below). _build_short still tries the exact 0x60 first.
-            _BACKING_SIZE = {"SINT": 1, "USINT": 1, "BYTE": 1, "BOOL": 1,
-                             "INT": 2, "UINT": 2, "WORD": 2,
-                             "DINT": 4, "UDINT": 4, "DWORD": 4,
-                             "LINT": 8, "ULINT": 8, "LWORD": 8}
             offset60_to_name = {}
             for mname, blob in short_recs:
                 if len(blob) < 0x78:
@@ -5891,7 +5888,7 @@ class TagBuilder(L5xElementBuilder):
 
         try:
             r = RxGeneric.from_bytes(raw_rec)
-        except Exception as e:
+        except Exception:
             # A source-protected record's encrypted ext-attr tail defeats the
             # kaitai parser; recover the (plaintext) main_record at fixed offsets
             # so the tag still emits its data_type / dimensions / design value.
@@ -6149,7 +6146,7 @@ class TagBuilder(L5xElementBuilder):
                 dim_parts.append(str(r.main_record.dimension_3))
             # The Dimensions attribute is space-separated (Logix convention).
             dimensions = " ".join(dim_parts) if dim_parts else None
-            value_bytes, value_type_code = (
+            value_bytes, _ = (
                 (None, 0) if (alias_for or suppress_value)
                 else self._read_tag_value(r.main_record.data_table_instance)
             )
@@ -6162,7 +6159,6 @@ class TagBuilder(L5xElementBuilder):
                 _operand_comments=operand_comments,
                 alias_for=alias_for,
                 _value_bytes=value_bytes,
-                _value_type_code=value_type_code,
                 _short_header=self._short_header,
                 _raw_hex_data=self._raw_hex_first_block(),
                 _no_data=suppress_value,
@@ -6185,7 +6181,7 @@ class TagBuilder(L5xElementBuilder):
             dim_parts.append(str(r.main_record.dimension_3))
         # The Dimensions attribute is space-separated (Logix convention).
         dimensions = " ".join(dim_parts) if dim_parts else None
-        value_bytes, value_type_code = (
+        value_bytes, _ = (
             (None, 0) if (alias_for or suppress_value)
             else self._read_tag_value(r.main_record.data_table_instance)
         )
@@ -6204,7 +6200,6 @@ class TagBuilder(L5xElementBuilder):
             _operand_comments=operand_comments,
             alias_for=alias_for,
             _value_bytes=value_bytes,
-            _value_type_code=value_type_code,
             _short_header=self._short_header,
             _raw_hex_data=self._raw_hex_first_block(),
             _no_data=suppress_value,

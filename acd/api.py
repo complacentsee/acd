@@ -17,7 +17,7 @@ from acd.integrity import (
 )
 from acd.l5x.export_l5x import ExportL5x
 from acd.zip.unzip import Unzip
-from acd.zip.write_acd import build_acd_bytes, write_acd
+from acd.zip.write_acd import build_acd_bytes
 from acd.zip.write_dat import patch_sbregion_dat
 
 from acd.database.acd_database import AcdDatabase
