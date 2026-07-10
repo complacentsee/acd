@@ -17,7 +17,8 @@
 #                       "omit"    → omit the Address attribute entirely
 #   bus_mode         -- "none"    → no Bus element
 #                       "always"  → always emit <Bus/> (no Size attribute)
-#                       "fixed:N" → always emit <Bus Size="N"/>
+#                       "chassis" → emit <Bus Size=N/> with the chassis size read from
+#                                   the binary when known, else a size-less <Bus/>
 #                       "children" → emit <Bus Size=K/> where K = count of this module's children
 #                                   that connect to this port; if zero, still emits <Bus Size="0"/>
 #                       "children_or_none" → emit <Bus Size=K/> when K>0 children, else no <Bus>
@@ -33,7 +34,7 @@ class PortDef:
     upstream_fixed: bool
     upstream_port: bool
     address_mode: str   # "slot", "zero", "empty", "omit"
-    bus_mode: str       # "none", "always", "fixed:N", "children"
+    bus_mode: str       # "none", "always", "chassis", "children"
 
 
 # ---------------------------------------------------------------------------
@@ -56,15 +57,15 @@ PORT_STRUCTURES: Dict[Tuple[int, int, int], List[PortDef]] = {
     # whether this is a root CPU.  upstream_fixed=False so parent_mod_port_id logic
     # applies to Port 2; Port 1 is always downstream.
     (1, 14, 166): [  # 1756-L83E
-        PortDef(port_id=1, port_type="ICP",      upstream_fixed=True,  upstream_port=False, address_mode="slot",  bus_mode="fixed:17"),
+        PortDef(port_id=1, port_type="ICP",      upstream_fixed=True,  upstream_port=False, address_mode="slot",  bus_mode="chassis"),
         PortDef(port_id=2, port_type="Ethernet",  upstream_fixed=False, upstream_port=False, address_mode="omit",  bus_mode="always"),
     ],
     (1, 14, 167): [  # 1756-L84E
-        PortDef(port_id=1, port_type="ICP",      upstream_fixed=True,  upstream_port=False, address_mode="slot",  bus_mode="fixed:17"),
+        PortDef(port_id=1, port_type="ICP",      upstream_fixed=True,  upstream_port=False, address_mode="slot",  bus_mode="chassis"),
         PortDef(port_id=2, port_type="Ethernet",  upstream_fixed=False, upstream_port=False, address_mode="omit",  bus_mode="always"),
     ],
     (1, 14, 168): [  # 1756-L85E
-        PortDef(port_id=1, port_type="ICP",      upstream_fixed=True,  upstream_port=False, address_mode="slot",  bus_mode="fixed:17"),
+        PortDef(port_id=1, port_type="ICP",      upstream_fixed=True,  upstream_port=False, address_mode="slot",  bus_mode="chassis"),
         PortDef(port_id=2, port_type="Ethernet",  upstream_fixed=False, upstream_port=False, address_mode="omit",  bus_mode="always"),
     ],
 
@@ -115,22 +116,23 @@ PORT_STRUCTURES: Dict[Tuple[int, int, int], List[PortDef]] = {
     ],
 
     # --- 1794 Flex adapters PT=12 ---
-    # Port 1 Flex downstream (Bus Size=8 fixed — physical Flex bus capacity).
-    # Port 2 Ethernet upstream. IP not stored in binary.
+    # Port 1 Flex downstream (bus size from the binary; OEM shows the physical
+    # Flex bus capacity, 8). Port 2 Ethernet upstream. IP not stored in binary.
     (1, 12, 90): [   # 1794-AENT
-        PortDef(port_id=1, port_type="Flex",     upstream_fixed=True,  upstream_port=False, address_mode="omit",  bus_mode="fixed:8"),
+        PortDef(port_id=1, port_type="Flex",     upstream_fixed=True,  upstream_port=False, address_mode="omit",  bus_mode="chassis"),
         PortDef(port_id=2, port_type="Ethernet",  upstream_fixed=True,  upstream_port=True,  address_mode="empty", bus_mode="none"),
     ],
     (1, 12, 261): [  # 1794-AENTR
-        PortDef(port_id=1, port_type="Flex",     upstream_fixed=True,  upstream_port=False, address_mode="omit",  bus_mode="fixed:8"),
+        PortDef(port_id=1, port_type="Flex",     upstream_fixed=True,  upstream_port=False, address_mode="omit",  bus_mode="chassis"),
         PortDef(port_id=2, port_type="Ethernet",  upstream_fixed=True,  upstream_port=True,  address_mode="empty", bus_mode="none"),
     ],
 
     # --- 5094 Ethernet adapter PT=12 ---
-    # Port 1 5094-bus downstream (Bus Size=17 — default 5094 chassis capacity).
+    # Port 1 5094-bus downstream (bus size from the binary; OEM shows the default
+    # 5094 chassis capacity, 17).
     # Port 2 Ethernet upstream. Address slot is stored (observed Address="0" in samples).
     (1, 12, 322): [  # 5094-AEN2TR/A
-        PortDef(port_id=1, port_type="5094",     upstream_fixed=True,  upstream_port=False, address_mode="slot",  bus_mode="fixed:17"),
+        PortDef(port_id=1, port_type="5094",     upstream_fixed=True,  upstream_port=False, address_mode="slot",  bus_mode="chassis"),
         PortDef(port_id=2, port_type="Ethernet",  upstream_fixed=True,  upstream_port=True,  address_mode="empty", bus_mode="none"),
     ],
 
@@ -154,11 +156,11 @@ PORT_STRUCTURES: Dict[Tuple[int, int, int], List[PortDef]] = {
     (1, 7, 399):  [PortDef(port_id=1, port_type="5094", upstream_fixed=True, upstream_port=True, address_mode="slot", bus_mode="none")],  # 5094-OB16/A
     (1, 115, 323): [  # 5094-IF8IH/A
         PortDef(port_id=1, port_type="5094", upstream_fixed=True,  upstream_port=True,  address_mode="slot", bus_mode="none"),
-        PortDef(port_id=2, port_type="HART", upstream_fixed=True,  upstream_port=False, address_mode="omit", bus_mode="fixed:8"),
+        PortDef(port_id=2, port_type="HART", upstream_fixed=True,  upstream_port=False, address_mode="omit", bus_mode="chassis"),
     ],
     (1, 115, 324): [  # 5094-OF8IH/A
         PortDef(port_id=1, port_type="5094", upstream_fixed=True,  upstream_port=True,  address_mode="slot", bus_mode="none"),
-        PortDef(port_id=2, port_type="HART", upstream_fixed=True,  upstream_port=False, address_mode="omit", bus_mode="fixed:8"),
+        PortDef(port_id=2, port_type="HART", upstream_fixed=True,  upstream_port=False, address_mode="omit", bus_mode="chassis"),
     ],
 
     # --- 1756 backplane I/O modules PT=7/10 ---

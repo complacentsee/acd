@@ -494,13 +494,13 @@ class Module(L5xElement):
             return ""
         if mode == "always":
             return "<Bus/>"
-        if mode.startswith("fixed:"):
-            # Use binary chassis size when available (read from RxDataCollection);
-            # fall back to the hardcoded port_structures value.
+        if mode == "chassis":
+            # Bus size comes only from the binary (RxDataCollection topology /
+            # Output-connection record). No static per-catalog size: when the
+            # ACD does not carry one, emit a size-less <Bus/>.
             if self._chassis_size is not None:
                 return f'<Bus Size="{self._chassis_size}"/>'
-            size = mode.split(":")[1]
-            return f'<Bus Size="{size}"/>'
+            return "<Bus/>"
         if mode == "children_or_none":
             child_count = self._port_child_counts.get(pd.port_id, 0)
             if self._chassis_size is not None:
