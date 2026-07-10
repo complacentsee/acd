@@ -3542,28 +3542,19 @@ class DataTypeBuilder(L5xElementBuilder):
                 mname = _decode_utf16z(blob[0:0x54]) if len(blob) >= 2 else ""
                 short_recs.append((mname, blob))
 
-            # The kaitai RxGeneric parser only counts (count_record - 1)
-            # extended records; the FINAL member is carried in the trailing
-            # LastAttributeRecord (same layout the controller CommPath uses).
+            # The counted extended_records stop before the record's FINAL
+            # attribute; the last member is carried in the trailing
+            # last_attribute_record (absent on the plaintext-main SP view).
             # Recover it so datatypes don't lose their last member.
             if len(short_recs) < member_count:
-                try:
-                    raw_rec = bytes(results[0][3])
-                    rec_offset = 82
-                    for _er in r.extended_records:
-                        rec_offset += 4 + 4 + len(bytes(_er.value))
-                    tail = raw_rec[rec_offset:]
-                    if len(tail) >= 8:
-                        last_len = struct.unpack_from("<I", tail, 4)[0]
-                        actual = last_len - 4
-                        if actual > 0 and len(tail) >= 8 + actual:
-                            tail_blob = tail[8: 8 + actual]
-                            # Same name-field boundary as the inline path (0x54).
-                            tail_name = _decode_utf16z(tail_blob[0:0x54])
-                            if tail_name:
-                                short_recs.append((tail_name, tail_blob))
-                except Exception:
-                    pass
+                _last = getattr(r, "last_attribute_record", None)
+                tail_blob = getattr(_last, "value", None) if _last is not None else None
+                if tail_blob:
+                    tail_blob = bytes(tail_blob)
+                    # Same name-field boundary as the inline path (0x54).
+                    tail_name = _decode_utf16z(tail_blob[0:0x54])
+                    if tail_name:
+                        short_recs.append((tail_name, tail_blob))
 
             # offset60 -> backing-field name map (non-BIT members only), so BIT
             # members can resolve their Target, mirroring the long path. A BIT
@@ -8480,25 +8471,16 @@ class ControllerBuilder(L5xElementBuilder):
             if _cp_str:
                 _comm_path_prefix = _cp_str
         elif r is not None:
-            # LastAttributeRecord tail: located after the (count_record - 1) parsed records.
-            # Header layout: parent_id(4) + unique_tag_id(4) + record_format_version(2) +
-            #   cip_type(2) + comment_id(2) = 14 bytes, then main_record(60), then
-            #   len_record(4) + count_record(4) = 82 bytes total before first AttributeRecord.
-            _raw_record = bytes(results[0][4])
-            _rec_offset = 82
-            for _er in r.extended_records:
-                _rec_offset += 4 + 4 + len(bytes(_er.value))
-            _tail = _raw_record[_rec_offset:]
-            if len(_tail) >= 8:
-                _last_attr_id = struct.unpack_from("<I", _tail, 0)[0]
-                _last_len_value = struct.unpack_from("<I", _tail, 4)[0]
-                if _last_attr_id == 0x06A and _last_len_value >= 4:
-                    _actual_len = _last_len_value - 4
-                    if len(_tail) >= 8 + _actual_len and _actual_len > 0:
-                        _cp_val = _tail[8: 8 + _actual_len]
-                        _cp_str = _cp_val.decode("utf-16-le", errors="replace").rstrip("\x00")
-                        if _cp_str:
-                            _comm_path_prefix = _cp_str
+            # The CommPath is the record's FINAL attribute, which the counted
+            # extended_records stop before; it parses as the trailing
+            # last_attribute_record.
+            _last = getattr(r, "last_attribute_record", None)
+            if _last is not None and _last.attribute_id == 0x06A:
+                _cp_val = getattr(_last, "value", None)
+                if _cp_val:
+                    _cp_str = bytes(_cp_val).decode("utf-16-le", errors="replace").rstrip("\x00")
+                    if _cp_str:
+                        _comm_path_prefix = _cp_str
 
         if 0x75 in extended_records and len(extended_records[0x75]) >= 4:
             sn_raw = hex(struct.unpack("<I", extended_records[0x75])[0])[2:].zfill(8)
