@@ -347,3 +347,74 @@ def test_layout_walkers_empty_string_has_no_quotes():
             == "[0,'$00$00$00$00$00$00']")
     xml = T.render_decorated_layout("S6", None, img, _STR_LAYOUT, {})
     assert "<![CDATA[]]>" in xml
+
+
+# --------------------------------------------------------------------------- #
+# Walker robustness on malformed layout_maps (never raise; degrade to None /
+# render the members that DO decode). These pin the entry-point contract on
+# adversarial inputs that real TagInfo extraction cannot produce -- found by
+# fuzzing the unification.
+# --------------------------------------------------------------------------- #
+
+
+def test_decorated_zero_len_struct_array_of_unresolvable_type_is_none():
+    # dims=[0] array whose element type has a stride but no member list:
+    # Decorated refuses (needs the layout); L5K renders from the stride alone.
+    lm = {"PARENT": [("Arr", "Elem", 0, None, False, [0])], "@size@ELEM": 8}
+    assert T.render_decorated_layout("PARENT", None, b"", lm, {}) is None
+    assert T.render_l5k_layout("PARENT", None, b"", lm, {}) == "[[]]"
+
+
+def test_cyclic_layout_degrades_instead_of_recursing():
+    # Self-referential type reachable only via a hidden member: the visible
+    # members still render (Decorated); L5K includes the hidden member, cannot
+    # decode it, and degrades to None. Neither entry point may raise.
+    lm = {
+        "PARENT": [("Vis", "DINT", 0, None, False, None),
+                   ("Hid", "CYC", 4, None, True, None)],
+        "CYC": [("Self", "CYC", 0, None, False, None)],
+    }
+    img = b"\x01\x00\x00\x00\x00\x00\x00\x00"
+    assert T.render_decorated_layout("PARENT", None, img, lm, {}) == (
+        '<Structure DataType="PARENT">'
+        '<DataValueMember Name="Vis" DataType="DINT" Radix="Decimal" Value="1"/>'
+        '</Structure>'
+    )
+    assert T.render_l5k_layout("PARENT", None, img, lm, {}) is None
+
+
+def test_negative_offsets_never_raise():
+    # A policy-skipped member with a negative offset must not blow up the
+    # serialisation that skips it, and must degrade (None) the one that
+    # includes it.
+    lm = {"X": [("h", "DINT", -50, None, True, None),
+                ("v", "DINT", 0, None, False, None)]}
+    img = b"\x07\x00\x00\x00\x00\x00\x00\x00"
+    assert T.render_decorated_layout("X", None, img, lm, {}) == (
+        '<Structure DataType="X">'
+        '<DataValueMember Name="v" DataType="DINT" Radix="Decimal" Value="7"/>'
+        '</Structure>'
+    )
+    assert T.render_l5k_layout("X", None, img, lm, {}) is None
+    # Bit-alias BOOL with a pathological negative bit index: L5K skips the
+    # alias (renders the covering member), Decorated degrades to None.
+    lm2 = {"P": [("BASE", "SINT", 0, None, False, None),
+                 ("B", "BOOL", 0, -800, False, None)]}
+    assert T.render_l5k_layout("P", None, b"\x07\x00\x00\x00", lm2, {}) == "[7]"
+    assert T.render_decorated_layout("P", None, b"\x07\x00\x00\x00", lm2, {}) is None
+
+
+def test_depth_capped_self_reference_terminates_quickly():
+    # A self-referential array member walks to the depth cap; the walk must
+    # short-circuit (not explore branching**24 elements) and keep the old
+    # outputs: Decorated skips the hidden member, L5K degrades to None.
+    lm = {"T1": [("B0", "T1", 0, 5, True, [2])], "@size@T1": 8}
+    xml = T.render_decorated_layout("T1", "3", b"\x00" * 24, lm, {})
+    assert xml == (
+        '<Array DataType="T1" Dimensions="3">'
+        '<Element Index="[0]"><Structure DataType="T1"></Structure></Element>'
+        '<Element Index="[1]"><Structure DataType="T1"></Structure></Element>'
+        '<Element Index="[2]"><Structure DataType="T1"></Structure></Element>'
+        '</Array>'
+    )
+    assert T.render_l5k_layout("T1", "3", b"\x00" * 24, lm, {}) is None

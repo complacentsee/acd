@@ -494,10 +494,10 @@ def render_l5k(dt_base: str, dimensions: Optional[str], image: bytes,
         if dt_base in ("BOOL", "BIT"):
             vals = []
             for i in range(total):
-                byte = i >> 3
-                if byte >= len(image):
+                v = _unpack_bit(image, 0, i)
+                if v is None:
                     return None
-                vals.append("2#%d" % ((image[byte] >> (i & 7)) & 1))
+                vals.append("2#%d" % v)
             return "[" + ",".join(vals) + "]"
         # atomic array: comma list of element values
         vals = []
@@ -547,7 +547,8 @@ def render_l5k_layout(dt_base: str, dimensions: Optional[str], image: bytes,
         return None
 
     if total == 0:
-        return _l5k_struct(dt_base, image, layout_map, data_types_map, 0)
+        return _emit_l5k(_walk_struct(dt_base, image, layout_map,
+                                      data_types_map, 0))
 
     stride = _struct_stride(dt_base, layout_map, data_types_map)
     if stride is None:
@@ -555,21 +556,16 @@ def render_l5k_layout(dt_base: str, dimensions: Optional[str], image: bytes,
     elems = []
     for i in range(total):
         sub = image[i * stride:(i + 1) * stride]
-        frag = _l5k_struct(dt_base, sub, layout_map, data_types_map, 1)
+        frag = _emit_l5k(_walk_struct(dt_base, sub, layout_map,
+                                      data_types_map, 1))
         if frag is None:
             return None
         elems.append(frag)
     return "[" + ",".join(elems) + "]"
 
 
-def _l5k_atomic(mdt: str, image: bytes, offset: int) -> Optional[str]:
-    """Signed decimal of one atomic member at ``offset`` for the L5K bracket form."""
-    if mdt not in _ATOMIC:
-        return None
-    width, fmt = _ATOMIC[mdt]
-    if offset + width > len(image):
-        return None
-    val = struct.unpack_from(fmt, image, offset)[0]
+def _l5k_value(mdt: str, val) -> str:
+    """L5K text of one decoded atomic value (signed decimal; L5K floats)."""
     if mdt == "LREAL":
         return _fmt_lreal(val)
     if mdt == "REAL":
@@ -609,26 +605,72 @@ def _l5k_string(layout, image: bytes) -> Optional[str]:
     return "[%d,'%s']" % (length, text)
 
 
-def _l5k_struct(dt_name: str, image: bytes, layout_map: Dict,
-                data_types_map: Dict, depth: int) -> Optional[str]:
-    """Render one struct as the L5K bracket tree ``[m0,m1,...]``."""
-    if depth > 24:
+# --------------------------------------------------------------------------- #
+# Unified layout traversal (P4) — ONE walker over the TagInfo layout decodes
+# every member into a small value tree; the L5K and Decorated emitters
+# (_emit_l5k below, _emit_decorated_inner further down) consume it. The two
+# serialisations deliberately differ in POLICY, applied at emit time from the
+# per-member flags:
+#   hidden     L5K serialises the physical STORAGE image (hidden members
+#              included, e.g. AB:1734_4SLOT:O:0's SlotStatusBits DINTs or the
+#              connection-header CfgSize/CfgIDNum/Reserved words); Decorated
+#              serialises the VIEW (hidden skipped).
+#   bit_alias  a scalar BOOL whose base byte falls inside a wider member
+#              (e.g. Pt0FaultMode overlaying the FaultMode SINT) is NOT a
+#              distinct storage slot: L5K skips it, Decorated shows it.
+# Decode failures become ("err",) nodes evaluated per-emitter, so a failing
+# member only fails the serialisation(s) that actually include it.
+#
+# Nodes:
+#   ("err",)                                undecodable (bounds/layout/depth)
+#   ("atomic", mdt, val, width, def_radix)  decoded atomic scalar
+#   ("bool", v, explicit_bit)               scalar BOOL; explicit_bit = a bit
+#                                           index was declared (packed BOOL)
+#   ("aarr", mdt, dims, vals, def_radix)    atomic array (BOOL: 0/1 ints)
+#   ("sarr", mdt, dims, walk_elem, total,   struct array; elements walked
+#           layout_ok)                      LAZILY via walk_elem(i) so a
+#                                           skipping/bailing consumer never
+#                                           pays for the subtree; layout_ok =
+#                                           element member list resolves
+#                                           (Decorated requires it, L5K
+#                                           renders from stride alone)
+#   ("struct", dt_name, members)            members = [(name, mdt, hidden,
+#                                           bit_alias, node), ...]
+#   ("string", dt_name, layout, image)      STRING-shaped struct; the two
+#                                           leaf formatters (_l5k_string /
+#                                           _render_string_inner) keep their
+#                                           distinct capacity/tolerance rules
+# --------------------------------------------------------------------------- #
+
+
+def _unpack_bit(image: bytes, off: int, i: int) -> Optional[int]:
+    """Element/bit ``i`` of the packed BOOL run based at byte ``off``: bit
+    (i & 7) of byte off + (i >> 3), LSB-first. None when out of the image."""
+    byte = off + (i >> 3)
+    if byte < 0 or byte >= len(image):
         return None
+    return (image[byte] >> (i & 7)) & 1
+
+
+def _walk_struct(dt_name: str, image: bytes, layout_map: Dict,
+                 data_types_map: Dict, depth: int):
+    """Decode one struct image into a value-tree node.
+
+    Contract: never raises on any layout_map/image input — every
+    undecodable member (out-of-bounds or negative offset, unresolvable or
+    cyclic type, depth cap) becomes an ("err",) node for the emitters to
+    judge. The walker decodes policy-skipped members too (hidden /
+    bit-alias); their flags are applied at emit time.
+    """
+    if depth > 24:
+        return ("err",)
     layout = _resolve_layout(dt_name, layout_map, data_types_map)
     if layout is None:
-        return None
+        return ("err",)
     if _is_string_layout(layout):
-        return _l5k_string(layout, image)
-    # The L5K bracket form serialises the physical STORAGE image: one entry per
-    # distinct storage location.  Unlike the Decorated block it DOES include
-    # HIDDEN members (e.g. AB:1734_4SLOT:O:0's SlotStatusBits DINTs, or the
-    # connection-header CfgSize/CfgIDNum/Reserved words that Logix hides from the
-    # Decorated view but still serialises).  BUT a BOOL member that is merely a
-    # BIT-ALIAS of a wider integer member at the same byte (e.g. Pt0FaultMode
-    # overlaying the FaultMode SINT) is NOT a separate storage location and must
-    # be skipped -- only the containing integer member is emitted.  Build the set
-    # of byte offsets owned by non-BOOL atomic / struct members, then drop any
-    # BOOL/BIT scalar member whose byte falls inside one of those.
+        return ("string", dt_name, layout, image)
+    # Byte offsets owned by non-BOOL atomic / struct members: a scalar BOOL
+    # whose base byte falls inside one is a bit-alias of that member.
     covered = set()
     for (name, mdt, off, bit, hidden, dims, def_radix) in layout:
         if mdt in ("BOOL", "BIT") and not dims:
@@ -643,73 +685,120 @@ def _l5k_struct(dt_name: str, image: bytes, layout_map: Dict,
                 n *= d
         for b in range(off, off + w * n):
             covered.add(b)
-    parts: List[str] = []
+    members = []
     for (name, mdt, off, bit, hidden, dims, def_radix) in layout:
-        if mdt in ("BOOL", "BIT") and not dims and off in covered:
-            # bit-alias of a wider integer member -> not a distinct storage slot
-            continue
-        frag = _l5k_member(mdt, off, bit, dims, image, layout_map,
-                           data_types_map, depth)
-        if frag is None:
-            return None
-        parts.append(frag)
-    return "[" + ",".join(parts) + "]"
+        bit_alias = mdt in ("BOOL", "BIT") and not dims and off in covered
+        node = _walk_member(mdt, off, bit, dims, def_radix, image,
+                            layout_map, data_types_map, depth)
+        members.append((name, mdt, hidden, bit_alias, node))
+    return ("struct", dt_name, members)
 
 
-def _l5k_member(mdt: str, off: int, bit, dims, image: bytes, layout_map: Dict,
-                data_types_map: Dict, depth: int) -> Optional[str]:
-    """Render one member's L5K fragment (scalar text, or nested bracket)."""
+def _walk_member(mdt: str, off: int, bit, dims, def_radix, image: bytes,
+                 layout_map: Dict, data_types_map: Dict, depth: int):
+    """Decode one member (scalar, array, or nested struct) into a node."""
     if dims:
         total = 1
         for d in dims:
             total *= d
         if mdt in _ATOMIC:
-            width, _ = _ATOMIC[mdt]
-            if mdt in ("BOOL", "BIT"):
-                # packed BOOL array -> one int per element (0/1) from the bits
-                vals = []
-                for i in range(total):
-                    byte = off + (i // 8)
-                    if byte >= len(image):
-                        return None
-                    vals.append(str((image[byte] >> (i % 8)) & 1))
-                return "[" + ",".join(vals) + "]"
+            width, fmt = _ATOMIC[mdt]
             vals = []
-            for i in range(total):
-                vt = _l5k_atomic(mdt, image, off + i * width)
-                if vt is None:
-                    return None
-                vals.append(vt)
-            return "[" + ",".join(vals) + "]"
-        # array of nested struct
+            if mdt in ("BOOL", "BIT"):
+                # packed BOOL array: 1 bit per element from the base offset
+                for i in range(total):
+                    v = _unpack_bit(image, off, i)
+                    if v is None:
+                        return ("err",)
+                    vals.append(v)
+            else:
+                for i in range(total):
+                    eoff = off + i * width
+                    if eoff < 0 or eoff + width > len(image):
+                        return ("err",)
+                    vals.append(struct.unpack_from(fmt, image, eoff)[0])
+            return ("aarr", mdt, dims, vals, def_radix)
+        # array of nested struct. Elements are walked LAZILY via walk_elem(i)
+        # so a consumer that skips this member (Decorated on hidden) or bails
+        # at its first failing element (both, like the old walkers) never
+        # pays for the remaining subtree -- this also keeps depth-capped
+        # self-referential layouts from exploding exponentially. layout_ok
+        # records whether the element type's member list resolves; the
+        # Decorated emitter refuses the member without it (the old
+        # pre-check), L5K renders from the stride alone.
         stride = _struct_stride(mdt, layout_map, data_types_map)
         if stride is None:
-            return None
-        elems = []
-        for i in range(total):
-            sub = image[off + i * stride: off + (i + 1) * stride]
-            frag = _l5k_struct(mdt, sub, layout_map, data_types_map, depth + 1)
-            if frag is None:
-                return None
-            elems.append(frag)
-        return "[" + ",".join(elems) + "]"
+            return ("err",)
+        layout_ok = _resolve_layout(mdt, layout_map, data_types_map) is not None
+
+        def walk_elem(i, _mdt=mdt, _off=off, _stride=stride, _depth=depth):
+            return _walk_struct(
+                _mdt, image[_off + i * _stride: _off + (i + 1) * _stride],
+                layout_map, data_types_map, _depth + 1)
+
+        return ("sarr", mdt, dims, walk_elem, total, layout_ok)
 
     if mdt in ("BOOL", "BIT"):
-        b = bit if bit is not None else 0
-        byte = off + (b // 8)
-        if byte >= len(image):
-            return None
-        return str((image[byte] >> (b % 8)) & 1)
+        v = _unpack_bit(image, off, bit if bit is not None else 0)
+        if v is None:
+            return ("err",)
+        return ("bool", v, bit is not None)
 
     if mdt in _ATOMIC:
-        return _l5k_atomic(mdt, image, off)
+        width, fmt = _ATOMIC[mdt]
+        if off < 0 or off + width > len(image):
+            return ("err",)
+        return ("atomic", mdt, struct.unpack_from(fmt, image, off)[0],
+                width, def_radix)
 
     # nested struct member
     stride = _struct_stride(mdt, layout_map, data_types_map)
     if stride is None:
+        return ("err",)
+    return _walk_struct(mdt, image[off: off + stride], layout_map,
+                        data_types_map, depth + 1)
+
+
+def _emit_l5k(node) -> Optional[str]:
+    """Serialise a value-tree node in the L5K bracket form ``[m0,m1,...]``.
+
+    Storage policy: hidden members included, bit-alias scalar BOOLs skipped
+    (only their containing integer member is emitted). Values are plain signed
+    decimals regardless of display radix.
+    """
+    kind = node[0]
+    if kind == "err":
         return None
-    return _l5k_struct(mdt, image[off: off + stride], layout_map,
-                       data_types_map, depth + 1)
+    if kind == "string":
+        return _l5k_string(node[2], node[3])
+    if kind == "struct":
+        parts: List[str] = []
+        for (_name, _mdt, _hidden, bit_alias, sub) in node[2]:
+            if bit_alias:
+                # bit-alias of a wider integer member -> not a storage slot
+                continue
+            frag = _emit_l5k(sub)
+            if frag is None:
+                return None
+            parts.append(frag)
+        return "[" + ",".join(parts) + "]"
+    if kind == "atomic":
+        return _l5k_value(node[1], node[2])
+    if kind == "bool":
+        return str(node[1])
+    if kind == "aarr":
+        _kind, mdt, _dims, vals, _radix = node
+        return "[" + ",".join(_l5k_value(mdt, v) for v in vals) + "]"
+    if kind == "sarr":
+        _kind, _mdt, _dims, walk_elem, total, _layout_ok = node
+        parts = []
+        for i in range(total):
+            frag = _emit_l5k(walk_elem(i))
+            if frag is None:
+                return None
+            parts.append(frag)
+        return "[" + ",".join(parts) + "]"
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -824,7 +913,7 @@ def render_decorated(dt_base: str, dimensions: Optional[str], image: bytes,
                 return None
             belems = [
                 f'<Element Index="{_index_str(i, dim_parts)}" '
-                f'Value="{(image[i >> 3] >> (i & 7)) & 1}"/>'
+                f'Value="{_unpack_bit(image, 0, i)}"/>'
                 for i in range(total)
             ]
             dim_str = ",".join(str(d) for d in dim_parts)
@@ -919,18 +1008,13 @@ def _format_int_radix(dt: str, val: int, width: int, radix: Optional[str]) -> st
     return str(val)
 
 
-def _member_value_text(dt: str, image: bytes, offset: int, radix: Optional[str]
-                       ) -> Optional[str]:
-    """Decode one atomic member's value text from the image at `offset`."""
-    width, fmt = _ATOMIC[dt]
-    if offset + width > len(image):
-        return None
-    val = struct.unpack_from(fmt, image, offset)[0]
-    if dt == "LREAL":
+def _decorated_value(mdt: str, val, width: int, radix: Optional[str]) -> str:
+    """Decorated text of one decoded atomic value (radix-aware)."""
+    if mdt == "LREAL":
         return _fmt_lreal_decorated(val)
-    if dt == "REAL":
+    if mdt == "REAL":
         return _fmt_real_decorated(val)
-    return _format_int_radix(dt, val, width, radix)
+    return _format_int_radix(mdt, val, width, radix)
 
 
 def _radix_for(member_dt: str, def_radix: Optional[str]) -> Optional[str]:
@@ -1070,79 +1154,80 @@ def _ascii_string_cdata(b: bytes) -> str:
     return "".join(out)
 
 
-def _decorated_struct_layout(dt_name: str, image: bytes, layout_map: Dict,
-                             data_types_map: Dict, depth: int = 0
-                             ) -> Optional[str]:
-    """Render <Structure DataType=..>..</Structure> using the TagInfo layout."""
-    if depth > 24:
+def _emit_decorated_inner(node) -> Optional[str]:
+    """Serialise a struct/string node's INNER members (no <Structure> wrap).
+
+    View policy: hidden members skipped, bit-alias scalar BOOLs shown.
+    """
+    kind = node[0]
+    if kind == "string":
+        return _render_string_inner(node[2], node[3], node[1])
+    if kind != "struct":
         return None
-    layout = _resolve_layout(dt_name, layout_map, data_types_map)
-    if layout is None:
-        return None
-    if _is_string_layout(layout):
-        inner = _render_string_inner(layout, image, dt_name)
-        if inner is None:
-            return None
-        return f'<Structure DataType="{dt_name}">{inner}</Structure>'
     parts: List[str] = []
-    for (name, mdt, off, bit, hidden, dims, def_radix) in layout:
+    for (name, mdt, hidden, _bit_alias, sub) in node[2]:
         if hidden:
             continue
-        frag = _decorated_member(name, mdt, off, bit, dims, def_radix,
-                                 image, layout_map, data_types_map, depth)
+        frag = _emit_decorated_member(name, mdt, sub)
         if frag is None:
             return None
         parts.append(frag)
-    return f'<Structure DataType="{dt_name}">{"".join(parts)}</Structure>'
+    return "".join(parts)
 
 
-def _decorated_member(name: str, mdt: str, off: int, bit, dims,
-                      def_radix: Optional[str], image: bytes, layout_map: Dict,
-                      data_types_map: Dict, depth: int) -> Optional[str]:
-    """Render one DataValueMember / ArrayMember / StructureMember."""
-    # ---- array member ----------------------------------------------------- #
-    if dims:
-        total = 1
-        for d in dims:
-            total *= d
+def _emit_decorated_member(name: str, mdt: str, node) -> Optional[str]:
+    """Serialise one member: DataValueMember/ArrayMember/StructureMember."""
+    kind = node[0]
+    if kind == "err":
+        return None
+
+    # ---- BOOL / BIT scalar member ---------------------------------------- #
+    if kind == "bool":
+        # A standalone (byte-aligned) BOOL member carries Radix="Decimal"; a BOOL
+        # packed into a backing byte (an explicit bit index) carries no Radix.
+        ra = "" if node[2] else ' Radix="Decimal"'
+        return (f'<DataValueMember Name="{name}" DataType="BOOL"{ra} '
+                f'Value="{node[1]}"/>')
+
+    # ---- atomic scalar member -------------------------------------------- #
+    if kind == "atomic":
+        _kind, _mdt, val, width, def_radix = node
+        radix = _radix_for(mdt, def_radix)
+        vt = _decorated_value(mdt, val, width, radix)
+        ra = f' Radix="{radix}"' if radix else ""
+        return f'<DataValueMember Name="{name}" DataType="{mdt}"{ra} Value="{vt}"/>'
+
+    # ---- atomic array member ---------------------------------------------- #
+    if kind == "aarr":
+        _kind, _mdt, dims, vals, def_radix = node
         dim_str = ",".join(str(d) for d in dims)
-        if mdt in _ATOMIC:
-            width, _ = _ATOMIC[mdt]
-            # BOOL/BIT scalar members carry no Radix, but a BOOL *array* member
-            # is emitted with Radix="Decimal" by Logix.
-            radix = "Decimal" if mdt in ("BOOL", "BIT") else _radix_for(mdt, def_radix)
-            elems = []
-            for i in range(total):
-                eoff = off + i * width
-                if mdt in ("BOOL", "BIT"):
-                    # packed BOOL array: 1 bit per element from the base offset
-                    byte = off + (i // 8)
-                    if byte >= len(image):
-                        return None
-                    v = (image[byte] >> (i % 8)) & 1
-                    elems.append(f'<Element Index="{_index_str(i, dims)}" Value="{v}"/>')
-                    continue
-                vt = _member_value_text(mdt, image, eoff, radix)
-                if vt is None:
-                    return None
-                elems.append(f'<Element Index="{_index_str(i, dims)}" Value="{vt}"/>')
-            ra = f' Radix="{radix}"' if radix else ""
-            return (f'<ArrayMember Name="{name}" DataType="{mdt}" '
-                    f'Dimensions="{dim_str}"{ra}>{"".join(elems)}</ArrayMember>')
-        # array of struct/UDT
-        sub_layout = _resolve_layout(mdt, layout_map, data_types_map)
-        if sub_layout is None:
+        # BOOL/BIT scalar members carry no Radix, but a BOOL *array* member
+        # is emitted with Radix="Decimal" by Logix.
+        if mdt in ("BOOL", "BIT"):
+            radix = "Decimal"
+            elems = [f'<Element Index="{_index_str(i, dims)}" Value="{v}"/>'
+                     for i, v in enumerate(vals)]
+        else:
+            radix = _radix_for(mdt, def_radix)
+            width = _ATOMIC[mdt][0]
+            elems = [
+                f'<Element Index="{_index_str(i, dims)}" '
+                f'Value="{_decorated_value(mdt, v, width, radix)}"/>'
+                for i, v in enumerate(vals)
+            ]
+        ra = f' Radix="{radix}"' if radix else ""
+        return (f'<ArrayMember Name="{name}" DataType="{mdt}" '
+                f'Dimensions="{dim_str}"{ra}>{"".join(elems)}</ArrayMember>')
+
+    # ---- struct array member ---------------------------------------------- #
+    if kind == "sarr":
+        _kind, _mdt, dims, walk_elem, total, layout_ok = node
+        if not layout_ok:
             return None
-        # element size = struct size from layout map (max offset+width). We need a
-        # per-element stride; derive from the datatype Size if present, else span.
-        stride = _struct_stride(mdt, layout_map, data_types_map)
-        if stride is None:
-            return None
+        dim_str = ",".join(str(d) for d in dims)
         elems = []
         for i in range(total):
-            sub = image[off + i * stride: off + (i + 1) * stride]
-            inner = _decorated_struct_inner(mdt, sub, layout_map, data_types_map,
-                                            depth + 1)
+            inner = _emit_decorated_inner(walk_elem(i))
             if inner is None:
                 return None
             # OEM wraps each array-of-struct element's members in <Structure>.
@@ -1153,70 +1238,28 @@ def _decorated_member(name: str, mdt: str, off: int, bit, dims,
         return (f'<ArrayMember Name="{name}" DataType="{mdt}" '
                 f'Dimensions="{dim_str}">{"".join(elems)}</ArrayMember>')
 
-    # ---- BOOL / BIT scalar member ---------------------------------------- #
-    if mdt in ("BOOL", "BIT"):
-        b = bit if bit is not None else 0
-        byte = off + (b // 8)
-        if byte >= len(image):
-            return None
-        v = (image[byte] >> (b % 8)) & 1
-        # A standalone (byte-aligned) BOOL member carries Radix="Decimal"; a BOOL
-        # packed into a backing byte (an explicit bit index) carries no Radix.
-        ra = ' Radix="Decimal"' if bit is None else ""
-        return f'<DataValueMember Name="{name}" DataType="BOOL"{ra} Value="{v}"/>'
-
-    # ---- atomic scalar member -------------------------------------------- #
-    if mdt in _ATOMIC:
-        radix = _radix_for(mdt, def_radix)
-        vt = _member_value_text(mdt, image, off, radix)
-        if vt is None:
-            return None
-        ra = f' Radix="{radix}"' if radix else ""
-        return f'<DataValueMember Name="{name}" DataType="{mdt}"{ra} Value="{vt}"/>'
-
-    # ---- nested struct/UDT member ---------------------------------------- #
-    stride = _struct_stride(mdt, layout_map, data_types_map)
-    if stride is None:
-        return None
-    sub = image[off: off + stride]
-    inner = _decorated_struct_inner(mdt, sub, layout_map, data_types_map, depth + 1)
+    # ---- nested struct/UDT (or STRING-shaped) member ----------------------- #
+    inner = _emit_decorated_inner(node)
     if inner is None:
         return None
     return f'<StructureMember Name="{name}" DataType="{mdt}">{inner}</StructureMember>'
 
 
-def _decorated_struct_inner(dt_name: str, image: bytes, layout_map: Dict,
-                            data_types_map: Dict, depth: int) -> Optional[str]:
-    """Render the INNER member list of a struct (no <Structure> wrapper)."""
-    if depth > 24:
-        return None
-    layout = _resolve_layout(dt_name, layout_map, data_types_map)
-    if layout is None:
-        return None
-    if _is_string_layout(layout):
-        return _render_string_inner(layout, image, dt_name)
-    parts: List[str] = []
-    for (name, mdt, off, bit, hidden, dims, def_radix) in layout:
-        if hidden:
-            continue
-        frag = _decorated_member(name, mdt, off, bit, dims, def_radix,
-                                 image, layout_map, data_types_map, depth)
-        if frag is None:
-            return None
-        parts.append(frag)
-    return "".join(parts)
-
-
-def _struct_stride(dt_name: str, layout_map: Dict, data_types_map: Dict
-                   ) -> Optional[int]:
+def _struct_stride(dt_name: str, layout_map: Dict, data_types_map: Dict,
+                   _seen: frozenset = frozenset()) -> Optional[int]:
     """Per-element byte stride of a struct datatype.
 
     Uses the TagInfo Size if cached on the layout map (key "@size@<NAME>"); else
-    falls back to max(member_offset + member_width) over the layout.
+    falls back to max(member_offset + member_width) over the layout. ``_seen``
+    guards the recursion against a (malformed) cyclic member graph: a type
+    whose stride is already being computed resolves to None instead of
+    recursing forever.
     """
     sz = layout_map.get("@size@" + dt_name.upper())
     if isinstance(sz, int) and sz > 0:
         return sz
+    if dt_name.upper() in _seen:
+        return None
     layout = _resolve_layout(dt_name, layout_map, data_types_map)
     if layout is None:
         return None
@@ -1225,7 +1268,8 @@ def _struct_stride(dt_name: str, layout_map: Dict, data_types_map: Dict
         if mdt in _ATOMIC:
             w = _ATOMIC[mdt][0]
         else:
-            w = _struct_stride(mdt, layout_map, data_types_map)
+            w = _struct_stride(mdt, layout_map, data_types_map,
+                               _seen | {dt_name.upper()})
             if w is None:
                 return None
         n = 1
@@ -1266,7 +1310,11 @@ def render_decorated_layout(dt_base: str, dimensions: Optional[str], image: byte
         return None
 
     if total == 0:
-        return _decorated_struct_layout(dt_base, image, layout_map, data_types_map)
+        inner = _emit_decorated_inner(
+            _walk_struct(dt_base, image, layout_map, data_types_map, 0))
+        if inner is None:
+            return None
+        return f'<Structure DataType="{dt_base}">{inner}</Structure>'
 
     # Array of struct.
     stride = _struct_stride(dt_base, layout_map, data_types_map)
@@ -1276,7 +1324,8 @@ def render_decorated_layout(dt_base: str, dimensions: Optional[str], image: byte
     elems = []
     for i in range(total):
         sub = image[i * stride:(i + 1) * stride]
-        inner = _decorated_struct_inner(dt_base, sub, layout_map, data_types_map, 1)
+        inner = _emit_decorated_inner(
+            _walk_struct(dt_base, sub, layout_map, data_types_map, 1))
         if inner is None:
             return None
         # OEM wraps each array-of-struct element's members in <Structure>.
