@@ -4882,34 +4882,7 @@ class ControllerBuilder(L5xElementBuilder):
     # possible (emit the decoded plaintext AOI definition).
     _faithful: bool = field(default=False)
 
-    def build(self) -> Controller:
-        # The root controller is the named FAFA component at parent_id=0 /
-        # record_type=256. A few projects also carry an anomalous empty-named
-        # FDFD sub-record that decodes to the same parent/type; exclude empty
-        # names so it isn't mistaken for a second controller. The real controller
-        # always carries the project name, so named-only never drops it.
-        self._cur.execute(
-            "SELECT comp_name, object_id, parent_id, record_type, record FROM comps "
-            "WHERE parent_id=0 AND record_type=256 AND comp_name IS NOT NULL AND comp_name != ''"
-        )
-        results = self._cur.fetchall()
-        if len(results) != 1:
-            raise Exception("Does not contain exactly one root controller node")
-
-        # V10..V21 component BODIES are source-protected/opaque to the V36
-        # RxGeneric parser; degrade body-derived fields to defaults rather than
-        # crashing so the L5X skeleton (names + hierarchy) still exports.
-        try:
-            r = RxGeneric.from_bytes(results[0][4])
-            extended_records: Dict[int, bytes] = {
-                er.attribute_id: bytes(er.value) for er in r.extended_records
-            }
-            _comment_parent = (r.comment_id * 0x10000) + r.cip_type
-        except Exception:
-            r = None
-            extended_records = {}
-            _comment_parent = None
-
+    def _pass_own_description(self, results, _comment_parent):
         # --- Controller own Description ---
         # Long header: own-description key parent = comment_id*0x10000 + cip_type,
         # member_ref 0, object_id == 1 (excludes scratch/operand rows). Recover the
@@ -4954,7 +4927,9 @@ class ControllerBuilder(L5xElementBuilder):
                 _drow = self._cur.fetchone()
                 if _drow and _drow[0]:
                     controller_description = _drow[0]
+        return controller_description
 
+    def _pass_ext_record_scalars(self, r, extended_records):
         def _decode_utf16(key):
             raw = extended_records.get(key)
             if raw is None or len(raw) < 2:
@@ -5025,7 +5000,11 @@ class ControllerBuilder(L5xElementBuilder):
         # and 0x00 for non-redundant controllers.
         _ctrl_ext001 = extended_records.get(0x001, b"")
         redundancy_enabled: bool = bool(_ctrl_ext001[0x0E]) if len(_ctrl_ext001) > 0x0E else False
+        return (sfc_execution_control, sfc_restart_position, sfc_last_scan, project_sn,
+                project_creation_date, last_modified_date, _comm_path_prefix,
+                major_fault_program, redundancy_enabled)
 
+    def _pass_controller_props(self, results, sfc_execution_control, sfc_restart_position, sfc_last_scan):
         # Controller-properties attributes. These live in the controller record's
         # decrypted ext-attrs, which the kaitai extended_records cannot reach on
         # short-header (V10-V21) projects, so read them via read_value_attrs(full=True)
@@ -5088,10 +5067,12 @@ class ControllerBuilder(L5xElementBuilder):
                 _plp_row = self._cur.fetchone()
                 if _plp_row:
                     power_loss_program = _plp_row[0]
+        return (time_slice, share_unused_time_slice, compatibility_mode, ethernet_ip_mode,
+                power_loss_program, io_memory_pad_percentage, data_table_pad_percentage,
+                sfc_execution_control, sfc_restart_position, sfc_last_scan, _ctlattrs,
+                _ctlblob)
 
-        self._object_id = results[0][1]
-        controller_name = results[0][0]
-
+    def _pass_time_sync_cst(self):
         # TimeSynchronize PTPEnable / Priority1 / Priority2 from the controller's
         # TimeSynchronize config record (RxControllerCollection child): PTPEnable is
         # bit 0 of its ext-attr 0x1, Priority1/Priority2 are the bytes at offset
@@ -5125,7 +5106,9 @@ class ControllerBuilder(L5xElementBuilder):
                 cst_master_id = str(struct.unpack_from("<H", _cb, 14)[0])
         except Exception:
             pass
+        return ts_ptp_enable, ts_priority1, ts_priority2, cst_master_id
 
+    def _pass_data_types(self):
         # Get the data types
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
@@ -5193,7 +5176,9 @@ class ControllerBuilder(L5xElementBuilder):
         # data_types_map: case-insensitive name → DataType for all types (User + ProductDefined).
         # Used by Tag.to_xml() when generating Decorated XML.
         data_types_map: Dict[str, DataType] = all_data_types_map
+        return data_types, data_types_map
 
+    def _pass_controller_tags(self, data_types_map):
         # Get the Controller Scoped Tags
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
@@ -5438,7 +5423,9 @@ class ControllerBuilder(L5xElementBuilder):
                             if getattr(tag, "_class_attr", None) == "Safety":
                                 si = _DESC_BLOCK_RE.sub("", si)
                             slot_entry[io_type] = si
+        return tags, io_data_map, alarm_map, short_routine_desc, _ctrl_tags_sig
 
+    def _pass_programs(self, data_types_map, redundancy_enabled, alarm_map, short_routine_desc):
         # Get the Program Collection and get the programs
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
@@ -5471,7 +5458,9 @@ class ControllerBuilder(L5xElementBuilder):
             struct.unpack_from("<H", rec, 0x0C)[0]: pname
             for pname, rec in self._cur.fetchall()
         }
+        return programs, comment_id_to_program
 
+    def _pass_tasks(self, comment_id_to_program):
         # Get the Task Collection and build Tasks
         self._cur.execute(
             "SELECT comp_name, object_id FROM comps WHERE parent_id="
@@ -5489,7 +5478,9 @@ class ControllerBuilder(L5xElementBuilder):
             )
             for task_result in self._cur.fetchall():
                 tasks.append(TaskBuilder(self._cur, task_result[1]).build(comment_id_to_program))
+        return tasks
 
+    def _pass_aois(self, data_types_map, short_routine_desc):
         # Get the AOI Collection and get the AOIs
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
@@ -5524,7 +5515,9 @@ class ControllerBuilder(L5xElementBuilder):
                 _short_routine_desc=short_routine_desc,
                 _acd_major=self._acd_major,
             ).build())
+        return aois
 
+    def _pass_modules(self, io_data_map):
         # Get the Module (IO) Collection and build all Module elements.
         self._cur.execute(
             "SELECT object_id FROM comps WHERE parent_id="
@@ -5697,7 +5690,9 @@ class ControllerBuilder(L5xElementBuilder):
                     for port_id in range(1, 20)
                     if (m.name, port_id) in child_counts
                 }
+        return modules
 
+    def _pass_processor_identity(self, modules, _comm_path_prefix, _ctlattrs):
         # ProcessorType is the CatalogNumber of the root controller module (the one
         # whose parent resolves to itself). (MajorFault is no longer root-only, so
         # the root is identified by parent_module==name instead.)
@@ -5744,7 +5739,9 @@ class ControllerBuilder(L5xElementBuilder):
                     _cp_full.decode("utf-16-le", errors="replace").rstrip("\x00")
                     if _cp_full else _comm_path_prefix + str(_ctrl_slot)
                 )
+        return processor_type, major_rev, minor_rev, comm_path
 
+    def _pass_project_settings(self, processor_type, _ctlattrs, _ctlblob):
         # Controller project settings that Studio only writes for certain
         # controller generations / save versions. Emitting them unconditionally
         # fabricates attributes the reference omits on older saves and on
@@ -5787,7 +5784,10 @@ class ControllerBuilder(L5xElementBuilder):
             web_server = "true" if (_ctlattrs.get(0x81) and _ctlattrs[0x81][0] == 1) else "false"
         else:
             web_server = None
+        return (pass_through, download_docs, download_custom, report_minor_overflow,
+                auto_diags, web_server, _v24_plus)
 
+    def _pass_aoi_signature(self):
         # <AddOnInstructionDefinitions> safety signature: a safety-signed project
         # carries Generated-Safety-Signature timestamp comments (tag_reference
         # "Timestamp\x11GSS"). When present, the reference stamps the AOI collection
@@ -5802,7 +5802,9 @@ class ControllerBuilder(L5xElementBuilder):
                 aoi_sig_ts = max(sorted(set(_gss)), key=_gss.count)
         except Exception:
             aoi_sig = aoi_sig_ts = None
+        return aoi_sig, aoi_sig_ts
 
+    def _pass_message_alarm_data(self, tags, programs, modules):
         # --- MESSAGE tag <Data Format="Message"> blocks (post-process) ---
         # Resolved here, not in TagBuilder, because the CIP ConnectionPath
         # resolves against the module topology, which is only complete once every
@@ -5838,6 +5840,7 @@ class ControllerBuilder(L5xElementBuilder):
             except Exception:
                 pass
 
+    def _pass_motion_sync(self, tags, programs, modules):
         # CIP Motion: a 2094-family integrated-motion drive (ProductType 37) that
         # has no axis assigned to it exports its MotionSync connection with RPI 0
         # (the connection is present but unscheduled). The axis->module association
@@ -5874,6 +5877,7 @@ class ControllerBuilder(L5xElementBuilder):
         except Exception:
             pass
 
+    def _pass_safety_info(self):
         # Controller-level <SafetyInfo> signature children (safety-signed projects
         # only). The named_safety_signatures table is keyed by (otype, embedded name);
         # it is empty on unsigned projects, so the lookups return None and nothing is
@@ -5895,6 +5899,67 @@ class ControllerBuilder(L5xElementBuilder):
         app_rollup_sig = _named_sig(142, "")
         safety_info_attrs = _safety_info_attr_string(self._cur, self._short_header)
         alarm_definitions = _alarm_definitions_xml(self._cur, self._short_header)
+        return (root_sig, ctrl_attr_sig, tag_map_sig, app_rollup_sig, safety_info_attrs,
+                alarm_definitions)
+
+    def build(self) -> Controller:
+        # The root controller is the named FAFA component at parent_id=0 /
+        # record_type=256. A few projects also carry an anomalous empty-named
+        # FDFD sub-record that decodes to the same parent/type; exclude empty
+        # names so it isn't mistaken for a second controller. The real controller
+        # always carries the project name, so named-only never drops it.
+        self._cur.execute(
+            "SELECT comp_name, object_id, parent_id, record_type, record FROM comps "
+            "WHERE parent_id=0 AND record_type=256 AND comp_name IS NOT NULL AND comp_name != ''"
+        )
+        results = self._cur.fetchall()
+        if len(results) != 1:
+            raise Exception("Does not contain exactly one root controller node")
+
+        # V10..V21 component BODIES are source-protected/opaque to the V36
+        # RxGeneric parser; degrade body-derived fields to defaults rather than
+        # crashing so the L5X skeleton (names + hierarchy) still exports.
+        try:
+            r = RxGeneric.from_bytes(results[0][4])
+            extended_records: Dict[int, bytes] = {
+                er.attribute_id: bytes(er.value) for er in r.extended_records
+            }
+            _comment_parent = (r.comment_id * 0x10000) + r.cip_type
+        except Exception:
+            r = None
+            extended_records = {}
+            _comment_parent = None
+
+        controller_description = self._pass_own_description(results, _comment_parent)
+        (sfc_execution_control, sfc_restart_position, sfc_last_scan, project_sn,
+         project_creation_date, last_modified_date, _comm_path_prefix, major_fault_program,
+         redundancy_enabled) = self._pass_ext_record_scalars(r, extended_records)
+        (time_slice, share_unused_time_slice, compatibility_mode, ethernet_ip_mode,
+         power_loss_program, io_memory_pad_percentage, data_table_pad_percentage,
+         sfc_execution_control, sfc_restart_position, sfc_last_scan, _ctlattrs, _ctlblob) = \
+            self._pass_controller_props(results, sfc_execution_control, sfc_restart_position, sfc_last_scan)
+
+        self._object_id = results[0][1]
+        controller_name = results[0][0]
+
+        ts_ptp_enable, ts_priority1, ts_priority2, cst_master_id = self._pass_time_sync_cst()
+        data_types, data_types_map = self._pass_data_types()
+        tags, io_data_map, alarm_map, short_routine_desc, _ctrl_tags_sig = \
+            self._pass_controller_tags(data_types_map)
+        programs, comment_id_to_program = \
+            self._pass_programs(data_types_map, redundancy_enabled, alarm_map, short_routine_desc)
+        tasks = self._pass_tasks(comment_id_to_program)
+        aois = self._pass_aois(data_types_map, short_routine_desc)
+        modules = self._pass_modules(io_data_map)
+        processor_type, major_rev, minor_rev, comm_path = \
+            self._pass_processor_identity(modules, _comm_path_prefix, _ctlattrs)
+        (pass_through, download_docs, download_custom, report_minor_overflow, auto_diags,
+         web_server, _v24_plus) = self._pass_project_settings(processor_type, _ctlattrs, _ctlblob)
+        aoi_sig, aoi_sig_ts = self._pass_aoi_signature()
+        self._pass_message_alarm_data(tags, programs, modules)
+        self._pass_motion_sync(tags, programs, modules)
+        (root_sig, ctrl_attr_sig, tag_map_sig, app_rollup_sig, safety_info_attrs,
+         alarm_definitions) = self._pass_safety_info()
 
         controller = Controller(
             controller_name,
