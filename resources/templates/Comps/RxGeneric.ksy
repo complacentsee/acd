@@ -6,6 +6,17 @@ instances:
   record_buffer:
     pos: 0x0E
     size: 0x3C
+  # The extended-attribute tail is parsed LAZILY so a record with an encrypted
+  # (source-protected) or garbage tail still yields its plaintext prelude and
+  # main_record; accessing extended_records raises exactly where eager parsing
+  # used to.
+  ext_tail:
+    pos: 0x52
+    type: ext_tail
+  extended_records:
+    value: ext_tail.records
+  last_attribute_record:
+    value: ext_tail.last
 
 seq:
   - id: parent_id
@@ -30,12 +41,21 @@ seq:
     type: u4
   - id: count_record
     type: u4
-  - id: extended_records
-    type: attribute_record
-    repeat: expr
-    repeat-expr: count_record - 1
 
 types:
+  ext_tail:
+    seq:
+      - id: records
+        type: attribute_record
+        repeat: expr
+        repeat-expr: _parent.count_record - 1
+      # The record's FINAL attribute is not covered by the count_record - 1
+      # loop; it trails the counted records with data = len_value - 4 bytes.
+      # Both guards mirror the tolerant hand-walkers: a short or absent tail
+      # skips the field instead of failing the whole parse.
+      - id: last
+        type: last_attribute_record
+        if: _io.size - _io.pos >= 8
   attribute_record:
     seq:
       - id: attribute_id
@@ -52,6 +72,7 @@ types:
         type: u4
       - id: value
         size: len_value - 4
+        if: len_value >= 4 and len_value - 4 <= _io.size - _io.pos
   rx_tag:
     instances:
       valid:

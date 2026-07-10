@@ -3118,6 +3118,9 @@ class MemberBuilder(L5xElementBuilder):
         name = results[0][0]
         try:
             r = RxGeneric.from_bytes(results[0][3])
+            # The ext-attr tail parses lazily; materialise it here so an
+            # encrypted (source-protected) tail still raises into the fallback.
+            r.extended_records
         except Exception:
             # Source-protected member record: its own ext-attr tail is encrypted,
             # but every field this builder needs comes from ``self.record`` (the
@@ -4290,6 +4293,9 @@ class ModuleBuilder(L5xElementBuilder):
         r = None
         try:
             r = RxGeneric.from_bytes(raw_rec)
+            # The ext-attr tail parses lazily; materialise it here so a
+            # garbage count_record still routes to the comps_full recovery.
+            r.extended_records
         except Exception:
             r = None
 
@@ -5117,7 +5123,11 @@ class TagBuilder(L5xElementBuilder):
         kaitai parser throws on their encrypted ext-attr tail).
         """
         try:
-            return RxGeneric.from_bytes(raw_rec)
+            r = RxGeneric.from_bytes(raw_rec)
+            # The ext-attr tail parses lazily; materialise it here so an
+            # encrypted tail still yields the plaintext-main view instead.
+            r.extended_records
+            return r
         except Exception:
             return _rxgeneric_plaintext_main(raw_rec)
 
@@ -5563,6 +5573,9 @@ class TagBuilder(L5xElementBuilder):
             bdname = None
             try:
                 br = RxGeneric.from_bytes(bytes(row[1]))
+                # The ext-attr tail parses lazily; materialise it so an
+                # unparseable base record still bails out (as before).
+                br.extended_records
                 if br.main_record.data_type:
                     self._cur.execute(
                         "SELECT comp_name FROM comps WHERE object_id="
@@ -5889,6 +5902,9 @@ class TagBuilder(L5xElementBuilder):
 
         try:
             r = RxGeneric.from_bytes(raw_rec)
+            # The ext-attr tail parses lazily; materialise it here so an
+            # encrypted tail still routes to the plaintext-main fallback.
+            r.extended_records
         except Exception:
             # A source-protected record's encrypted ext-attr tail defeats the
             # kaitai parser; recover the (plaintext) main_record at fixed offsets
@@ -6551,6 +6567,9 @@ class RoutineBuilder(L5xElementBuilder):
 
         try:
             r = RxGeneric.from_bytes(results[0][3])
+            # The ext-attr tail parses lazily; materialise it here so a
+            # source-protected routine still takes the raw-offset fallback.
+            r.extended_records
         except Exception:
             # RxGeneric cannot parse a source-protected routine record, but the
             # routine type index still sits at raw record offset 0x3e (1=RLL,
@@ -8315,7 +8334,11 @@ def _build_short_routine_descriptions(cur) -> Dict[int, str]:
         if len(rec) < 20:
             continue
         try:
-            cid = RxGeneric.from_bytes(rec).comment_id
+            _r = RxGeneric.from_bytes(rec)
+            # The ext-attr tail parses lazily; materialise it so records with
+            # unparseable tails stay excluded from the map (as before).
+            _r.extended_records
+            cid = _r.comment_id
         except Exception:
             continue
         parent = 0x6D0000 | (cid & 0xFFFF)

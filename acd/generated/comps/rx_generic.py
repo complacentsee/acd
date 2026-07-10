@@ -39,10 +39,6 @@ class RxGeneric(KaitaiStruct):
             self.main_record = RxGeneric.Unknown(_io__raw_main_record, self, self._root)
         self.len_record = self._io.read_u4le()
         self.count_record = self._io.read_u4le()
-        self.extended_records = []
-        for i in range(self.count_record - 1):
-            self.extended_records.append(RxGeneric.AttributeRecord(self._io, self, self._root))
-
 
 
     def _fetch_instances(self):
@@ -57,9 +53,10 @@ class RxGeneric(KaitaiStruct):
         else:
             pass
             self.main_record._fetch_instances()
-        for i in range(len(self.extended_records)):
+        _ = self.ext_tail
+        if hasattr(self, '_m_ext_tail'):
             pass
-            self.extended_records[i]._fetch_instances()
+            self._m_ext_tail._fetch_instances()
 
         _ = self.record_buffer
         if hasattr(self, '_m_record_buffer'):
@@ -83,6 +80,36 @@ class RxGeneric(KaitaiStruct):
             pass
 
 
+    class ExtTail(KaitaiStruct):
+        def __init__(self, _io, _parent=None, _root=None):
+            super(RxGeneric.ExtTail, self).__init__(_io)
+            self._parent = _parent
+            self._root = _root
+            self._read()
+
+        def _read(self):
+            self.records = []
+            for i in range(self._parent.count_record - 1):
+                self.records.append(RxGeneric.AttributeRecord(self._io, self, self._root))
+
+            if self._io.size() - self._io.pos() >= 8:
+                pass
+                self.last = RxGeneric.LastAttributeRecord(self._io, self, self._root)
+
+
+
+        def _fetch_instances(self):
+            pass
+            for i in range(len(self.records)):
+                pass
+                self.records[i]._fetch_instances()
+
+            if self._io.size() - self._io.pos() >= 8:
+                pass
+                self.last._fetch_instances()
+
+
+
     class LastAttributeRecord(KaitaiStruct):
         def __init__(self, _io, _parent=None, _root=None):
             super(RxGeneric.LastAttributeRecord, self).__init__(_io)
@@ -93,11 +120,17 @@ class RxGeneric(KaitaiStruct):
         def _read(self):
             self.attribute_id = self._io.read_u4le()
             self.len_value = self._io.read_u4le()
-            self.value = self._io.read_bytes(self.len_value - 4)
+            if  ((self.len_value >= 4) and (self.len_value - 4 <= self._io.size() - self._io.pos())) :
+                pass
+                self.value = self._io.read_bytes(self.len_value - 4)
+
 
 
         def _fetch_instances(self):
             pass
+            if  ((self.len_value >= 4) and (self.len_value - 4 <= self._io.size() - self._io.pos())) :
+                pass
+
 
 
     class RxMapDevice(KaitaiStruct):
@@ -362,6 +395,33 @@ class RxGeneric(KaitaiStruct):
         def _fetch_instances(self):
             pass
 
+
+    @property
+    def ext_tail(self):
+        if hasattr(self, '_m_ext_tail'):
+            return self._m_ext_tail
+
+        _pos = self._io.pos()
+        self._io.seek(82)
+        self._m_ext_tail = RxGeneric.ExtTail(self._io, self, self._root)
+        self._io.seek(_pos)
+        return getattr(self, '_m_ext_tail', None)
+
+    @property
+    def extended_records(self):
+        if hasattr(self, '_m_extended_records'):
+            return self._m_extended_records
+
+        self._m_extended_records = self.ext_tail.records
+        return getattr(self, '_m_extended_records', None)
+
+    @property
+    def last_attribute_record(self):
+        if hasattr(self, '_m_last_attribute_record'):
+            return self._m_last_attribute_record
+
+        self._m_last_attribute_record = self.ext_tail.last
+        return getattr(self, '_m_last_attribute_record', None)
 
     @property
     def record_buffer(self):
