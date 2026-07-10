@@ -471,8 +471,9 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
             return ""
 
         # For multi-dimensional arrays the total element count is the product.
-        # We generate flat [0]..[N-1] indices for 1D, and nested for multi-D.
-        # Logix displays multi-dim as [i][j] etc.
+        # We generate flat [0]..[N-1] indices for 1D, and comma-joined for
+        # multi-D. Logix displays a multi-dim element index as [i,j] (matching
+        # tag_value._index_str, verified against OEM V17/V34 arrays).
         total = 1
         for d in dim_parts:
             total *= d
@@ -487,7 +488,7 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
             # BOOL array: flat indexed elements with Radix="Decimal"
             def _bool_elems(parts: List[int], remaining: List[int]) -> str:
                 if not remaining:
-                    idx = "[" + "][".join(str(p) for p in parts) + "]"
+                    idx = "[" + ",".join(str(p) for p in parts) + "]"
                     return f'<Element Index="{idx}" Value="0"/>'
                 return "".join(
                     _bool_elems(parts + [i], remaining[1:]) for i in range(remaining[0])
@@ -499,7 +500,7 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
             # Primitive array (DINT, REAL, etc.)
             def _prim_elems(parts: List[int], remaining: List[int]) -> str:
                 if not remaining:
-                    idx = "[" + "][".join(str(p) for p in parts) + "]"
+                    idx = "[" + ",".join(str(p) for p in parts) + "]"
                     return f'<Element Index="{idx}" Value="{zero}"/>'
                 return "".join(
                     _prim_elems(parts + [i], remaining[1:]) for i in range(remaining[0])
@@ -516,7 +517,7 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
 
             def _struct_elems(parts: List[int], remaining: List[int]) -> str:
                 if not remaining:
-                    idx = "[" + "][".join(str(p) for p in parts) + "]"
+                    idx = "[" + ",".join(str(p) for p in parts) + "]"
                     return f'<Element Index="{idx}">{struct_xml}</Element>'
                 return "".join(
                     _struct_elems(parts + [i], remaining[1:]) for i in range(remaining[0])
