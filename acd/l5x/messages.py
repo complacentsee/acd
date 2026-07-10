@@ -7,6 +7,7 @@ topology; ``_render_message_data`` is the single entry point.
 import html
 import re
 import struct
+import xml.etree.ElementTree as ET
 from typing import Dict
 
 from acd.record.comps import CompsRecord
@@ -40,20 +41,25 @@ def _msg_route_segment(m) -> bytes:
     carries a downstream-port IP that would mis-encode the segment.
     """
     ppid = m.parent_mod_port_id & 0xFF
+    # Parse the ports as XML (works for both the RxDataCollection override and
+    # the catalog-derived form) rather than regexing the rendered string, so
+    # the lookup does not depend on the renderer's attribute order.
+    up = None
     try:
-        px = m._build_ports_xml()
+        for port in ET.fromstring(m._build_ports_xml()).iter("Port"):
+            if port.get("Upstream") == "true":
+                up = port
+                break
     except Exception:
-        px = ""
-    ups = re.findall(
-        r'<Port Id="(\d+)"(?: Address="([^"]*)")? Type="([^"]+)" Upstream="true"', px)
-    if ups:
-        _pid, addr, _typ = ups[0]
+        up = None
+    if up is not None:
+        addr = up.get("Address")
         if addr and _MSG_IPRE.match(addr):
             a = addr.encode("ascii", "replace")
             if len(a) % 2:
                 a = a + b"\x00"
             return bytes([0x10 | ppid, len(addr)]) + a
-        if addr != "":
+        if addr:
             try:
                 return bytes([ppid, int(addr) & 0xFF])
             except Exception:
