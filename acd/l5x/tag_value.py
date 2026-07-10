@@ -640,6 +640,11 @@ def _l5k_string(layout, image: bytes) -> Optional[str]:
 #                                           leaf formatters (_l5k_string /
 #                                           _render_string_inner) keep their
 #                                           distinct capacity/tolerance rules
+#   ("literal", inner_xml)                  pre-rendered Decorated inner XML
+#                                           (the zero-value STRING default
+#                                           from elements' zero generator,
+#                                           which Logix writes with no CDATA
+#                                           block); Decorated-only
 # --------------------------------------------------------------------------- #
 
 
@@ -1160,6 +1165,8 @@ def _emit_decorated_inner(node) -> Optional[str]:
     View policy: hidden members skipped, bit-alias scalar BOOLs shown.
     """
     kind = node[0]
+    if kind == "literal":
+        return node[1]
     if kind == "string":
         return _render_string_inner(node[2], node[3], node[1])
     if kind != "struct":

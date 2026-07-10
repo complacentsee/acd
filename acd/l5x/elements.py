@@ -325,123 +325,75 @@ def _is_valid_operand(op: str) -> bool:
     return bool(op) and ".!" not in op and bool(_OPERAND_RE.match(op))
 
 
-def _member_decorated_xml(member_name: str, member_dt: str, member_dim: int,
-                           data_types_map: Dict[str, "DataType"]) -> str:
-    """Return the Decorated XML fragment for a single UDT member.
+def _zero_member_node(mdt: str, mdim: int,
+                      data_types_map: Dict[str, "DataType"], depth: int):
+    """Zero-valued tag_value node for one member (scalar or 1-D array)."""
+    if mdim > 0:
+        if mdt in ("BOOL", "BIT"):
+            return ("aarr", "BOOL", [mdim], [0] * mdim, None)
+        if mdt in _PRIMITIVE_RADIX:
+            zero = 0.0 if mdt in ("REAL", "LREAL") else 0
+            return ("aarr", mdt, [mdim], [zero] * mdim, None)
+        sub = _zero_value_node(mdt, data_types_map, depth + 1)
+        if sub is None:
+            return None
+        return ("sarr", mdt, [mdim], lambda i, _s=sub: _s, mdim, True)
+    if mdt in ("BOOL", "BIT"):
+        # explicit_bit=True suppresses the Radix attribute: a zero-default
+        # BOOL member never carries one (unlike the value-image walker's
+        # byte-aligned BOOLs).
+        return ("bool", 0, True)
+    if mdt in _PRIMITIVE_RADIX:
+        val = 0.0 if mdt in ("REAL", "LREAL") else 0
+        return ("atomic", mdt, val, _PRIMITIVE_BYTE_WIDTH.get(mdt, 4), None)
+    return _zero_value_node(mdt, data_types_map, depth + 1)
 
-    member_dt:  the DataType name of the member (already upper-cased by caller)
-    member_dim: array dimension (0 = scalar)
+
+def _zero_value_node(dt_name: str, data_types_map: Dict[str, "DataType"],
+                     depth: int = 0):
+    """Build a zero-valued tag_value node tree for a datatype with NO image.
+
+    Used by _generate_decorated (the zero-placeholder <Data> fallback): the
+    XML spelling comes from tag_value's shared Decorated emitter, so only the
+    zero-tree POLICIES live here, encoded in the nodes:
+      * members of unknown / skipped types are OMITTED (partial emission,
+        never a whole-render failure);
+      * BOOL members never carry a Radix attribute;
+      * the empty-STRING default keeps its literal two-member form (Logix
+        writes no CDATA block there), as a ("literal", ...) leaf.
+    Returns a node, or None for an unknown/skipped type (or a depth cap the
+    old recursion did not have -- a cyclic data_types_map now degrades
+    instead of overflowing the stack).
     """
-    if member_dim > 0:
-        # Array member
-        return _array_member_xml(member_name, member_dt, member_dim, data_types_map)
-
-    if member_dt in ("BOOL", "BIT"):
-        return f'<DataValueMember Name="{member_name}" DataType="BOOL" Value="0"/>'
-
-    radix = _PRIMITIVE_RADIX.get(member_dt)
-    zero = _PRIMITIVE_DECORATED_ZERO.get(member_dt)
-    if radix is not None and zero is not None:
-        return f'<DataValueMember Name="{member_name}" DataType="{member_dt}" Radix="{radix}" Value="{zero}"/>'
-
-    # Struct member (nested UDT, TIMER, COUNTER, etc.)
-    inner = _struct_members_xml(member_dt, data_types_map)
-    if inner is None:
-        return ""  # unknown / skip
-    return f'<StructureMember Name="{member_name}" DataType="{member_dt}">{inner}</StructureMember>'
-
-
-def _array_member_xml(member_name: str, member_dt: str, dim: int,
-                      data_types_map: Dict[str, "DataType"]) -> str:
-    """Generate an <ArrayMember> element for a member that is an array."""
-    radix = _PRIMITIVE_RADIX.get(member_dt)
-    zero = _PRIMITIVE_DECORATED_ZERO.get(member_dt)
-    is_bool = member_dt in ("BOOL", "BIT")
-
-    if is_bool:
-        elems = "".join(
-            f'<Element Index="[{i}]" Value="0"/>' for i in range(dim)
-        )
-        return (
-            f'<ArrayMember Name="{member_name}" DataType="BOOL" Dimensions="{dim}" Radix="Decimal">'
-            f'{elems}'
-            f'</ArrayMember>'
-        )
-
-    if radix is not None and zero is not None:
-        elems = "".join(
-            f'<Element Index="[{i}]" Value="{zero}"/>' for i in range(dim)
-        )
-        return (
-            f'<ArrayMember Name="{member_name}" DataType="{member_dt}" Dimensions="{dim}" Radix="{radix}">'
-            f'{elems}'
-            f'</ArrayMember>'
-        )
-
-    # Array of structs
-    inner = _struct_members_xml(member_dt, data_types_map)
-    if inner is None:
-        return ""
-    struct_xml = f'<Structure DataType="{member_dt}">{inner}</Structure>'
-    elems = "".join(
-        f'<Element Index="[{i}]">{struct_xml}</Element>' for i in range(dim)
-    )
-    return (
-        f'<ArrayMember Name="{member_name}" DataType="{member_dt}" Dimensions="{dim}">'
-        f'{elems}'
-        f'</ArrayMember>'
-    )
-
-
-def _struct_members_xml(dt_name: str, data_types_map: Dict[str, "DataType"]) -> Union[str, None]:
-    """Return the inner XML for a Structure/StructureMember of the given DataType.
-
-    Returns None if the type is unknown or should be skipped.
-    The returned string does NOT include the outer <Structure> wrapper.
-    """
-    if dt_name in _SKIP_DECORATED:
+    if dt_name in _SKIP_DECORATED or depth > 24:
         return None
 
-    # Handle STRING as a special built-in: LEN (DINT) + DATA (STRING/ASCII)
+    # STRING as a special built-in: LEN (DINT) + DATA (STRING/ASCII)
     if dt_name == "STRING":
-        return (
+        return ("literal", (
             '<DataValueMember Name="LEN" DataType="DINT" Radix="Decimal" Value="0"/>'
             '<DataValueMember Name="DATA" DataType="STRING" Radix="ASCII">\n\n</DataValueMember>'
-        )
+        ))
 
-    # Built-in struct types (TIMER, COUNTER, CONTROL)
     builtin_members = _BUILTIN_STRUCT_MEMBERS.get(dt_name)
     if builtin_members is not None:
-        parts: List[str] = []
-        for mname, mdt in builtin_members:
-            radix = _PRIMITIVE_RADIX.get(mdt)
-            zero = _PRIMITIVE_DECORATED_ZERO.get(mdt)
-            if radix is not None and zero is not None:
-                parts.append(
-                    f'<DataValueMember Name="{mname}" DataType="{mdt}" Radix="{radix}" Value="{zero}"/>'
-                )
-            else:
-                # BOOL member
-                parts.append(f'<DataValueMember Name="{mname}" DataType="{mdt}" Value="0"/>')
-        return "".join(parts)
+        raw_members = [(mname, mdt, 0) for mname, mdt in builtin_members]
+    else:
+        dt_obj = data_types_map.get(dt_name)
+        if dt_obj is None:
+            return None
+        raw_members = [(m.name, m.data_type.upper(), m.dimension)
+                       for m in dt_obj.members if not m.hidden]
 
-    # User-defined type: look up in data_types_map
-    dt_obj = data_types_map.get(dt_name)
-    if dt_obj is None:
-        return None
-
-    parts = []
-    for member in dt_obj.members:
-        if member.hidden:
-            continue
-        mdt = member.data_type.upper()
-        mname = member.name
-        mdim = member.dimension
-
-        fragment = _member_decorated_xml(mname, mdt, mdim, data_types_map)
-        if fragment:
-            parts.append(fragment)
-    return "".join(parts)
+    members = []
+    for mname, mdt, mdim in raw_members:
+        node = _zero_member_node(mdt, mdim, data_types_map, depth)
+        if node is None:
+            continue  # unknown member type -> omitted (partial emission)
+        if mdt in ("BOOL", "BIT"):
+            mdt = "BOOL"
+        members.append((mname, mdt, False, False, node))
+    return ("struct", dt_name, members)
 
 
 def _generate_decorated(dt_base: str, dimensions: Union[str, None],
@@ -451,78 +403,66 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
     dt_base:    the base DataType name (uppercase, array brackets already stripped)
     dimensions: comma-separated dimension string (e.g. "100" or "4,8") or None for scalar
     Returns "" if this type should not have a Decorated element.
+
+    Zero-value fallback (no design-value image): struct member trees are
+    built as zero-valued tag_value nodes (_zero_value_node) and spelled by
+    the shared Decorated emitter; only the tag-level <Array>/<Structure>
+    wrapper is assembled here, mirroring render_decorated_layout's top level.
     """
     if dt_base in _SKIP_DECORATED:
         return ""
 
+    def _struct_inner() -> Union[str, None]:
+        node = _zero_value_node(dt_base, data_types_map)
+        if node is None:
+            return None
+        return _tag_value._emit_decorated_inner(node)
+
     if dimensions is None:
         # Scalar struct
-        inner = _struct_members_xml(dt_base, data_types_map)
+        inner = _struct_inner()
         if inner is None:
             return ""
         body = f'<Structure DataType="{dt_base}">{inner}</Structure>'
     else:
-        # Array tag: parse dimensions (up to 3D). The tag-level Dimensions attribute
-        # is space-separated (Logix convention) while AOI param/local dims may still
-        # arrive comma-separated, so accept either separator.
+        # Array tag: parse dimensions (up to 3D). The tag-level Dimensions
+        # attribute is space-separated (Logix convention) while AOI param/
+        # local dims may still arrive comma-separated, so accept either
+        # separator. Multi-dim element indices are row-major [i,j] via
+        # _index_str (verified against OEM V17/V34 arrays).
         dim_parts = [int(d) for d in re.split(r"[,\s]+", dimensions.strip())
                      if d.strip().isdigit()]
         if not dim_parts:
             return ""
-
-        # For multi-dimensional arrays the total element count is the product.
-        # We generate flat [0]..[N-1] indices for 1D, and comma-joined for
-        # multi-D. Logix displays a multi-dim element index as [i,j] (matching
-        # tag_value._index_str, verified against OEM V17/V34 arrays).
         total = 1
         for d in dim_parts:
             total *= d
-
         dim_str = ",".join(str(d) for d in dim_parts)
 
         radix = _PRIMITIVE_RADIX.get(dt_base)
         zero = _PRIMITIVE_DECORATED_ZERO.get(dt_base)
-        is_bool = dt_base in ("BOOL", "BIT")
 
-        if is_bool:
+        if dt_base in ("BOOL", "BIT"):
             # BOOL array: flat indexed elements with Radix="Decimal"
-            def _bool_elems(parts: List[int], remaining: List[int]) -> str:
-                if not remaining:
-                    idx = "[" + ",".join(str(p) for p in parts) + "]"
-                    return f'<Element Index="{idx}" Value="0"/>'
-                return "".join(
-                    _bool_elems(parts + [i], remaining[1:]) for i in range(remaining[0])
-                )
-            elems = _bool_elems([], dim_parts)
+            elems = "".join(
+                f'<Element Index="{_tag_value._index_str(i, dim_parts)}" Value="0"/>'
+                for i in range(total))
             body = f'<Array DataType="BOOL" Dimensions="{dim_str}" Radix="Decimal">{elems}</Array>'
-
         elif radix is not None and zero is not None:
             # Primitive array (DINT, REAL, etc.)
-            def _prim_elems(parts: List[int], remaining: List[int]) -> str:
-                if not remaining:
-                    idx = "[" + ",".join(str(p) for p in parts) + "]"
-                    return f'<Element Index="{idx}" Value="{zero}"/>'
-                return "".join(
-                    _prim_elems(parts + [i], remaining[1:]) for i in range(remaining[0])
-                )
-            elems = _prim_elems([], dim_parts)
+            elems = "".join(
+                f'<Element Index="{_tag_value._index_str(i, dim_parts)}" Value="{zero}"/>'
+                for i in range(total))
             body = f'<Array DataType="{dt_base}" Dimensions="{dim_str}" Radix="{radix}">{elems}</Array>'
-
         else:
             # Struct array (UDT, TIMER, COUNTER, STRING, ...)
-            inner = _struct_members_xml(dt_base, data_types_map)
+            inner = _struct_inner()
             if inner is None:
                 return ""
             struct_xml = f'<Structure DataType="{dt_base}">{inner}</Structure>'
-
-            def _struct_elems(parts: List[int], remaining: List[int]) -> str:
-                if not remaining:
-                    idx = "[" + ",".join(str(p) for p in parts) + "]"
-                    return f'<Element Index="{idx}">{struct_xml}</Element>'
-                return "".join(
-                    _struct_elems(parts + [i], remaining[1:]) for i in range(remaining[0])
-                )
-            elems = _struct_elems([], dim_parts)
+            elems = "".join(
+                f'<Element Index="{_tag_value._index_str(i, dim_parts)}">{struct_xml}</Element>'
+                for i in range(total))
             body = f'<Array DataType="{dt_base}" Dimensions="{dim_str}">{elems}</Array>'
 
     return f'<Data Format="Decorated">\n{body}\n</Data>'
