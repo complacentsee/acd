@@ -31,7 +31,7 @@ from acd.l5x.connections import (
     _strip_input_tag_inner,
 )
 from acd.l5x.messages import _msg_build_module_routes, _render_message_data
-from acd.l5x.module_builder import Module, ModuleBuilder
+from acd.l5x.module_builder import Module, ModuleBuilder, _build_rxdata_holders
 from acd.l5x import tag_value as _tag_value
 from acd.record.comps import CompsRecord, _SP_MARKER, decrypt_sp_nameless
 
@@ -5528,14 +5528,17 @@ class ControllerBuilder(L5xElementBuilder):
                     modid_to_oid[_omodid] = _owner
 
             # Second pass: build Module objects. The connection decode map (RPI/
-            # Unicast/EventID per connection record) and the ConfigData/ConfigScript
-            # holder indexes are built once and shared.
+            # Unicast/EventID per connection record), the ConfigData/ConfigScript
+            # holder indexes and the ordered RxDataCollection child index are
+            # built once and shared.
             conn_decode = _build_connection_map(self._cur, self._short_header)
             cfg_mr28, cfg_cid, cfg_pool = _build_config_holders(self._cur)
+            rxdata_by_cid = _build_rxdata_holders(self._cur)
             modules = []
             for _, mod_oid, _ in mod_rows:
                 modules.append(
                     ModuleBuilder(self._cur, mod_oid, modid_to_name,
+                                  _rxdata_by_cid=rxdata_by_cid,
                                   _conn_decode=conn_decode,
                                   _io_map=io_data_map,
                                   _modid_to_oid=modid_to_oid,

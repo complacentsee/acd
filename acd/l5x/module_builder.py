@@ -516,10 +516,46 @@ class Module(L5xElement):
         return f'<Bus Size="{child_count}"/>'
 
 
+def _build_rxdata_holders(cur) -> "Dict[int, List[Tuple[int, bytes]]]":
+    """Ordered RxDataCollection child index, keyed by comment-id link.
+
+    Every module points at its backing hash-named RxDataCollection child by
+    comment_id (module e1[0x24] & 0xFFFF == child record[12:14]); the ports /
+    CommMethod / ExtendedProperties / UserDefinedCatalogNumber decoders all
+    resolve that link by scanning every collection's children in order. This
+    builds that scan's result once per controller: {cid: [(child_oid, raw)]},
+    children kept in collection-then-row order. Deliberately ORDER-PRESERVING
+    and not unique-only (unlike connections._build_config_holders): a decoder
+    walks ALL same-cid children until one yields its payload, so dropping
+    ambiguous keys would forfeit recoveries. Children too short to carry the
+    link (< 14 bytes) can never match and are skipped.
+    """
+    holders: Dict[int, List[Tuple[int, bytes]]] = {}
+    cur.execute("SELECT object_id FROM comps WHERE comp_name='RxDataCollection'")
+    coll_oids = [r[0] for r in cur.fetchall()]
+    for coll_oid in coll_oids:
+        cur.execute(
+            "SELECT object_id, record FROM comps WHERE parent_id=?", (coll_oid,))
+        for child_oid, raw in cur.fetchall():
+            raw = bytes(raw) if raw else b""
+            if len(raw) < 14:
+                continue
+            cid = int.from_bytes(raw[12:14], "little")
+            holders.setdefault(cid, []).append((child_oid, raw))
+    return holders
+
+
 @dataclass
 class ModuleBuilder(L5xElementBuilder):
     # Map from modid (u32) → module name, built by ControllerBuilder and passed in.
     _modid_to_name: Dict[int, str] = field(default_factory=dict)
+    # Ordered RxDataCollection child index {cid: [(child_oid, raw)]}, built once
+    # per controller by _build_rxdata_holders and shared by every module; the
+    # comment_id-link decoders (ports / CommMethod / ExtendedProperties / UDCN)
+    # walk their cid's list in the original collection scan order. The decrypted
+    # ext-attr dicts those decoders fall back to are memoized per cursor by
+    # CompsRecord.full_attrs.
+    _rxdata_by_cid: "Dict[int, List[Tuple[int, bytes]]]" = field(default_factory=dict)
     # Map connection record object_id → decoded {RPI, Unicast, EventID}, built once
     # by ControllerBuilder (see _build_connection_map). Empty -> connection values
     # fall back to the import defaults.
@@ -572,87 +608,13 @@ class ModuleBuilder(L5xElementBuilder):
             return m.group(1).decode("ascii", errors="replace") if m else ""
         return ""
 
-    def _comms_from_data_collection(
-        self, icp_slot: int, ip_address: str = ""
-    ) -> "Tuple[Union[str, None], str]":
-        """Extract CommMethod and ExtendedProperties public data for a module.
-
-        Searches RxDataCollection for the hash-named child whose <in> block contains
-        a Port with Type="ICP" Addr="{icp_slot}".  For Ethernet-connected modules
-        (icp_slot == 0 or not found by ICP slot) a second pass matches by the
-        module's IP address instead.
-
-        Returns a 2-tuple:
-          (comm_method_str_or_None, public_content_str)
-
-        comm_method_str: the numeric string from <CF>...</CF>, or None if absent.
-        public_content_str: inner content of <public>...</public>, or "" if absent.
-
-        The record XML is often stored without the closing </public> tag (it is
-        truncated in the ACD binary). We reconstruct the content by extracting
-        everything after <public>.
-        """
-        import re as _re
-
-        def _extract(raw: bytes) -> "Tuple[Union[str, None], str]":
-            xml_start = raw.find(b'<')
-            if xml_start < 0:
-                return (None, "")
-            xml_text = raw[xml_start:].decode("latin-1", errors="replace")
-            comm_method: Union[str, None] = None
-            cf_m = _re.search(r'<CF>(\d+)</CF>', xml_text)
-            if cf_m:
-                comm_method = cf_m.group(1)
-            pub_content = ""
-            pub_start = xml_text.find("<public>")
-            if pub_start >= 0:
-                after_pub = xml_text[pub_start + len("<public>"):]
-                end_tag_m = _re.search(r'</pub', after_pub)
-                if end_tag_m:
-                    pub_content = after_pub[:end_tag_m.start()]
-                else:
-                    pub_content = after_pub.rstrip("\x00 \r\n")
-            return (comm_method, pub_content)
-
-        self._cur.execute(
-            "SELECT object_id FROM comps WHERE comp_name='RxDataCollection' LIMIT 1"
-        )
-        row = self._cur.fetchone()
-        if not row:
-            return (None, "")
-        coll_oid = row[0]
-        self._cur.execute(
-            "SELECT record FROM comps WHERE parent_id=?", (coll_oid,)
-        )
-        all_recs = [(bytes(raw),) for (raw,) in self._cur.fetchall()]
-
-        # First pass: match by ICP slot.
-        if icp_slot:
-            needle = f'Type="ICP" Addr="{icp_slot}"'.encode()
-            for (raw,) in all_recs:
-                if needle in raw:
-                    result = _extract(raw)
-                    if result[0] is not None or result[1]:
-                        return result
-
-        # Second pass: match by IP address (for EN-connected modules).
-        if ip_address:
-            ip_needle = f'Addr="{ip_address}"'.encode()
-            for (raw,) in all_recs:
-                if ip_needle in raw:
-                    result = _extract(raw)
-                    if result[0] is not None or result[1]:
-                        return result
-
-        return (None, "")
-
     def _extended_properties_from_data_collection(self, data_link: int) -> str:
         """Extract the <ExtendedProperties> <public> content for a module.
 
         The module's <public> block lives in the SAME hash-named RxDataCollection
         child that carries its port topology (see _ports_from_data_collection),
-        linked by the module's comment_id at e1[0x24] (u32). Match that child by
-        rec[12:14] == data_link & 0xFFFF across ALL RxDataCollection collections --
+        linked by the module's comment_id at e1[0x24] (u32). That child is looked
+        up by rec[12:14] == data_link & 0xFFFF in the shared _rxdata_by_cid index --
         the exact 1:1 key the ports decode uses. This resolves the correct record
         for every module type (backplane cards, EN bridges, PointIO adapters, drive
         peripherals); a module whose link finds no <public> yields "".
@@ -664,72 +626,51 @@ class ModuleBuilder(L5xElementBuilder):
         if not data_link:
             return ""
         import re as _re
-        want = data_link & 0xFFFF
-        self._cur.execute(
-            "SELECT object_id FROM comps WHERE comp_name='RxDataCollection'"
-        )
-        coll_oids = [r[0] for r in self._cur.fetchall()]
-        for coll_oid in coll_oids:
-            self._cur.execute(
-                "SELECT object_id, record FROM comps WHERE parent_id=?", (coll_oid,)
-            )
-            for (child_oid, raw) in self._cur.fetchall():
-                raw = bytes(raw)
-                if len(raw) < 14:
-                    continue
-                if int.from_bytes(raw[12:14], "little") != want:
-                    continue
-                xml_start = raw.find(b'<')
-                xml_text = (raw[xml_start:].decode("latin-1", errors="replace")
-                            if xml_start >= 0 else "")
-                pub_start = xml_text.find("<public>")
-                if pub_start < 0:
-                    # Source-protected modules store the <public> block only in the
-                    # DECRYPTED ext-attr 0x66 image (the raw record body is ciphertext,
-                    # so the plaintext scan above finds nothing). Same decrypt path the
-                    # UserDefinedCatalogNumber recovery uses for these records.
-                    img = CompsRecord.full_attrs(
-                        self._cur, child_oid, self._short_header).get(0x66, b"")
-                    ds = img.find(b'<public>')
-                    if ds >= 0:
-                        after = img[ds + len(b'<public>'):]
-                        mm = _re.search(rb'</pub', after)
-                        return (after[:mm.start()] if mm
-                                else after.rstrip(b'\x00 \r\n')).decode(
-                                    "latin-1", errors="replace")
-                    continue
-                after_pub = xml_text[pub_start + len("<public>"):]
-                end_tag_m = _re.search(r'</pub', after_pub)
-                if end_tag_m:
-                    return after_pub[:end_tag_m.start()]
-                return after_pub.rstrip("\x00 \r\n")
+        for child_oid, raw in self._rxdata_by_cid.get(data_link & 0xFFFF, []):
+            xml_start = raw.find(b'<')
+            xml_text = (raw[xml_start:].decode("latin-1", errors="replace")
+                        if xml_start >= 0 else "")
+            pub_start = xml_text.find("<public>")
+            if pub_start < 0:
+                # Source-protected modules store the <public> block only in the
+                # DECRYPTED ext-attr 0x66 image (the raw record body is ciphertext,
+                # so the plaintext scan above finds nothing). Same decrypt path the
+                # UserDefinedCatalogNumber recovery uses for these records.
+                img = CompsRecord.full_attrs(
+                    self._cur, child_oid, self._short_header).get(0x66, b"")
+                ds = img.find(b'<public>')
+                if ds >= 0:
+                    after = img[ds + len(b'<public>'):]
+                    mm = _re.search(rb'</pub', after)
+                    return (after[:mm.start()] if mm
+                            else after.rstrip(b'\x00 \r\n')).decode(
+                                "latin-1", errors="replace")
+                continue
+            after_pub = xml_text[pub_start + len("<public>"):]
+            end_tag_m = _re.search(r'</pub', after_pub)
+            if end_tag_m:
+                return after_pub[:end_tag_m.start()]
+            return after_pub.rstrip("\x00 \r\n")
         return ""
 
     def _udcn_from_data_collection(self, data_link: int) -> Union[str, None]:
         """UserDefinedCatalogNumber (device-profile name) for a drive-peripheral
         module. The profile record is the RxDataCollection child linked by the same
-        comment_id the ports/ExtendedProperties use (rec[12:14] == data_link & 0xFFFF);
-        its <UDCN>...</UDCN> tag is in the raw record bytes on short-header projects
-        and in the decrypted ext-attr 0x66 image on long-header ones. None when the
-        linked record carries no <UDCN> (the drive itself, not a peripheral)."""
+        comment_id the ports/ExtendedProperties use (rec[12:14] == data_link & 0xFFFF,
+        via the shared _rxdata_by_cid index); its <UDCN>...</UDCN> tag is in the raw
+        record bytes on short-header projects and in the decrypted ext-attr 0x66
+        image on long-header ones. None when the linked record carries no <UDCN>
+        (the drive itself, not a peripheral)."""
         if not data_link:
             return None
-        want = data_link & 0xFFFF
-        coll_oids = [r[0] for r in self._cur.execute(
-            "SELECT object_id FROM comps WHERE comp_name='RxDataCollection'").fetchall()]
-        for coll_oid in coll_oids:
-            for oid, raw in self._cur.execute(
-                    "SELECT object_id, record FROM comps WHERE parent_id=?", (coll_oid,)).fetchall():
-                raw = bytes(raw) if raw else b""
-                if len(raw) < 14 or int.from_bytes(raw[12:14], "little") != want:
-                    continue
-                m = re.search(rb"<UDCN>([^<]*)</UDCN>", raw)
-                if not m:
-                    img = CompsRecord.full_attrs(
-                        self._cur, oid, self._short_header).get(0x66, b"")
-                    m = re.search(rb"<UDCN>([^<]*)</UDCN>", img)
-                if m:
-                    return m.group(1).decode("ascii", errors="replace") or None
+        for oid, raw in self._rxdata_by_cid.get(data_link & 0xFFFF, []):
+            m = re.search(rb"<UDCN>([^<]*)</UDCN>", raw)
+            if not m:
+                img = CompsRecord.full_attrs(
+                    self._cur, oid, self._short_header).get(0x66, b"")
+                m = re.search(rb"<UDCN>([^<]*)</UDCN>", img)
+            if m:
+                return m.group(1).decode("ascii", errors="replace") or None
         return None
 
     def _comm_method_from_data_link(self, data_link: int) -> "Union[str, None]":
@@ -742,39 +683,25 @@ class ModuleBuilder(L5xElementBuilder):
         if not data_link:
             return None
         import re as _re
-        want = data_link & 0xFFFF
-        self._cur.execute(
-            "SELECT object_id FROM comps WHERE comp_name='RxDataCollection'"
-        )
-        coll_oids = [r[0] for r in self._cur.fetchall()]
-        for coll_oid in coll_oids:
-            self._cur.execute(
-                "SELECT object_id, record FROM comps WHERE parent_id=?", (coll_oid,)
-            )
-            for (child_oid, raw) in self._cur.fetchall():
-                raw = bytes(raw)
-                if len(raw) < 14:
+        for child_oid, raw in self._rxdata_by_cid.get(data_link & 0xFFFF, []):
+            xml_start = raw.find(b'<')
+            if xml_start >= 0:
+                xml_text = raw[xml_start:].decode("latin-1", errors="replace")
+                cf_m = _re.search(r'<CF>(\d+)</CF>', xml_text)
+                if cf_m:
+                    return cf_m.group(1)
+            # Source-protected child: the <CF> is in the decrypted ext-attr image
+            # (0x66, else 0x65/0x64), not the plaintext body.
+            attrs = CompsRecord.full_attrs(
+                self._cur, child_oid, self._short_header)
+            for _aid in (0x66, 0x65, 0x64):
+                img = attrs.get(_aid)
+                if not img:
                     continue
-                if int.from_bytes(raw[12:14], "little") != want:
-                    continue
-                xml_start = raw.find(b'<')
-                if xml_start >= 0:
-                    xml_text = raw[xml_start:].decode("latin-1", errors="replace")
-                    cf_m = _re.search(r'<CF>(\d+)</CF>', xml_text)
-                    if cf_m:
-                        return cf_m.group(1)
-                # Source-protected child: the <CF> is in the decrypted ext-attr image
-                # (0x66, else 0x65/0x64), not the plaintext body.
-                attrs = CompsRecord.full_attrs(
-                    self._cur, child_oid, self._short_header)
-                for _aid in (0x66, 0x65, 0x64):
-                    img = attrs.get(_aid)
-                    if not img:
-                        continue
-                    cf_m = _re.search(
-                        rb'<CF>(\d+)</CF>', bytes(img))
-                    if cf_m:
-                        return cf_m.group(1).decode()
+                cf_m = _re.search(
+                    rb'<CF>(\d+)</CF>', bytes(img))
+                if cf_m:
+                    return cf_m.group(1).decode()
         return None
 
     def _ports_from_data_collection(self, data_link: int,
@@ -819,44 +746,34 @@ class ModuleBuilder(L5xElementBuilder):
                 return None
             return res
 
-        # Blob children of every RxDataCollection, keyed by comment_id (u16 @ rec[12]).
-        self._cur.execute("SELECT object_id FROM comps WHERE comp_name='RxDataCollection'")
-        coll_oids = [r[0] for r in self._cur.fetchall()]
-        if not coll_oids:
-            return None
-        for coll_oid in coll_oids:
-            self._cur.execute("SELECT object_id, record FROM comps WHERE parent_id=?", (coll_oid,))
-            for (child_oid, raw) in self._cur.fetchall():
-                raw = bytes(raw)
-                if len(raw) < 14:
-                    continue
-                if int.from_bytes(raw[12:14], "little") != (data_link & 0xFFFF):
-                    continue
-                # Prefer a complete plaintext blob.
-                i = raw.find(b"<in")
-                if i >= 0:
-                    j = raw.find(b"</in>", i)
-                    if j >= 0:
+        # Blob children linked by comment_id (u16 @ rec[12]), via the shared
+        # per-controller _rxdata_by_cid index.
+        for child_oid, raw in self._rxdata_by_cid.get(data_link & 0xFFFF, []):
+            # Prefer a complete plaintext blob.
+            i = raw.find(b"<in")
+            if i >= 0:
+                j = raw.find(b"</in>", i)
+                if j >= 0:
+                    return _finish(self._decode_ports_blob(
+                        raw[i:j + 5].decode("latin-1", errors="replace"), port_sn))
+            # Otherwise the topology is in the child's decrypted ext-attr 0x66
+            # image -- either the plaintext body was truncated mid-blob (the root
+            # case) or the whole blob is encrypted there with no plaintext copy
+            # (local-chassis I/O cards and many CompactLogix CPUs). Same SP-aware
+            # fallback the sibling _*_from_data_collection methods use.
+            try:
+                img = CompsRecord.full_attrs(
+                    self._cur, child_oid, self._short_header).get(0x66)
+                if img:
+                    txt = img.decode("latin-1", errors="replace")
+                    ii = txt.find("<in")
+                    jj = txt.find("</in>", ii) if ii >= 0 else -1
+                    if ii >= 0 and jj >= 0:
                         return _finish(self._decode_ports_blob(
-                            raw[i:j + 5].decode("latin-1", errors="replace"), port_sn))
-                # Otherwise the topology is in the child's decrypted ext-attr 0x66
-                # image -- either the plaintext body was truncated mid-blob (the root
-                # case) or the whole blob is encrypted there with no plaintext copy
-                # (local-chassis I/O cards and many CompactLogix CPUs). Same SP-aware
-                # fallback the sibling _*_from_data_collection methods use.
-                try:
-                    img = CompsRecord.full_attrs(
-                        self._cur, child_oid, self._short_header).get(0x66)
-                    if img:
-                        txt = img.decode("latin-1", errors="replace")
-                        ii = txt.find("<in")
-                        jj = txt.find("</in>", ii) if ii >= 0 else -1
-                        if ii >= 0 and jj >= 0:
-                            return _finish(self._decode_ports_blob(
-                                txt[ii:jj + 5], port_sn))
-                except Exception:
-                    pass
-                # neither plaintext nor 0x66 had a blob; try the next matching child
+                            txt[ii:jj + 5], port_sn))
+            except Exception:
+                pass
+            # neither plaintext nor 0x66 had a blob; try the next matching child
         return None
 
     def _port_safety_networks(self) -> dict:
