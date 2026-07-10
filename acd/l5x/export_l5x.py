@@ -52,23 +52,49 @@ class ExportL5x:
     # protected AOIs whose source Studio withholds). Default False = recover as much
     # as possible (emit decoded plaintext for source-protected content).
     faithful: bool = False
+    # Staging database location. None (the default) stages the parsed ACD tables
+    # into an in-memory SQLite database; a path stages into that file instead
+    # (replacing any existing one), for inspecting the tables after an export.
+    db_path: Union[str, None] = None
 
     def __post_init__(self):
-        log.info(
-            "Creating temporary directory (if it doesn't exist to store ACD database files - "
-            + self._temp_dir
-        )
-        _DEFAULT_SQL_DATABASE_NAME = "acd.db"
-        if os.path.exists(os.path.join(self._temp_dir, _DEFAULT_SQL_DATABASE_NAME)):
-            os.remove(os.path.join(self._temp_dir, _DEFAULT_SQL_DATABASE_NAME))
-        if not os.path.exists(os.path.join(self._temp_dir)):
-            os.makedirs(self._temp_dir)
-        log.info("Creating sqllite database to store ACD database records")
-        self._db = sqlite3.connect(
-            os.path.join(self._temp_dir, _DEFAULT_SQL_DATABASE_NAME)
-        )
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=OFF")
+        self._init_db()
+        self._extract_files()
+        comps_db, name_lookup = self._load_comps()
+        self.populate_region_map()
+        self.populate_regn_link()
+        self._load_rungs(comps_db, name_lookup)
+        self._load_comments()
+        self._load_nameless()
+        self._load_taginfo()
+        self._create_indexes()
+
+    def close(self):
+        """Close the staging database connection.
+
+        The exporter (and any Controller still holding its cursor) is unusable
+        afterwards; call once the L5X output has been produced.
+        """
+        self._db.close()
+
+    def _init_db(self):
+        """Create the staging SQLite database (see db_path) and its core tables."""
+        if self.db_path is None:
+            log.info("Creating in-memory sqllite database to store ACD database records")
+            self._db = sqlite3.connect(":memory:")
+        else:
+            log.info(
+                "Creating sqllite database to store ACD database records - "
+                + str(self.db_path)
+            )
+            if os.path.exists(self.db_path):
+                os.remove(self.db_path)
+            _parent = os.path.dirname(str(self.db_path))
+            if _parent and not os.path.exists(_parent):
+                os.makedirs(_parent)
+            self._db = sqlite3.connect(self.db_path)
+            self._db.execute("PRAGMA journal_mode=WAL")
+            self._db.execute("PRAGMA synchronous=OFF")
         self._cur: Cursor = self._db.cursor()
 
         log.debug("Create Comps table in sqllite db")
@@ -101,6 +127,17 @@ class ExportL5x:
             "CREATE TABLE regn_link(rung_oid int, rc_hi int, rc_lo7 int, group_id int, is_short int)"
         )
 
+    def _extract_files(self):
+        """Unzip the ACD container into _temp_dir, keeping the raw member files
+        (in original order) for byte-identical write-back, and detect the Studio
+        version from the container head."""
+        log.info(
+            "Creating temporary directory (if it doesn't exist to store ACD database files - "
+            + self._temp_dir
+        )
+        if not os.path.exists(os.path.join(self._temp_dir)):
+            os.makedirs(self._temp_dir)
+
         # Detect the Studio version (V21 source-protects SbRegion rungs
         # differently from V30+ — see acd.record.source_protection).
         self._acd_version: Optional[str] = detect_acd_version(self.input_filename)
@@ -121,6 +158,11 @@ class ExportL5x:
                 acd_fh.seek(record.file_offset)
                 self._raw_files[record.filename] = acd_fh.read(record.file_length)
 
+    def _load_comps(self):
+        """Parse Comps.Dat into the comps/comps_full tables plus their derived
+        side tables (unique_comment_key, project_flags), detecting the header
+        family, and build the object_id -> name map used for write-back.
+        Returns (comps_db, name_lookup) for the rung loader."""
         log.info("Getting records from ACD Comps file and storing in sqllite database")
         comps_db = DbExtract(os.path.join(self._temp_dir, "Comps.Dat")).read()
         # Deduplicate by object_id. When duplicate object_ids exist (e.g. a routine that
@@ -260,17 +302,11 @@ class ExportL5x:
         # Store on self for use during write-back (patch_sbregion_dat needs id_to_name).
         name_lookup = {oid: t[2] for oid, t in comps_by_id.items()}
         self._id_to_name: Dict[int, str] = name_lookup
+        return comps_db, name_lookup
 
-        log.info(
-            "Getting records from ACD Region Map file and storing in sqllite database"
-        )
-        self.populate_region_map()
-
-        log.info(
-            "Getting records from ACD Region Link file and storing in sqllite database"
-        )
-        self.populate_regn_link()
-
+    def _load_rungs(self, comps_db, name_lookup):
+        """Resolve the rung name map (V21-corrected, __Map:-stripped) and parse
+        SbRegion.Dat into the rungs table."""
         # V21 stores comps with a different FAFA layout than V30+ (the shared
         # comps parser reads object_id 4 bytes too far for V21), so the V21 rung
         # @HEX@ -> name resolution needs a V21-correct object_id -> name map.
@@ -303,6 +339,11 @@ class ExportL5x:
         self._cur.executemany("INSERT INTO rungs VALUES (?,?,?)", rung_tuples)
         self._db.commit()
 
+    def _load_comments(self):
+        """Parse Comments.Dat into the comments table and harvest the record
+        types the comment parser drops into their side tables: GSS safety
+        signatures (per-object, per-connection and named controller-level),
+        <CustomProperties> provider blocks, and alarm <Message> text."""
         log.info(
             "Getting records from ACD Comments file and storing in sqllite database"
         )
@@ -467,6 +508,8 @@ class ExportL5x:
             "INSERT INTO alarm_messages VALUES (?,?,?)", _amsg)
         self._db.commit()
 
+    def _load_nameless(self):
+        """Parse Nameless.Dat into the nameless table."""
         log.info(
             "Getting records from ACD Nameless file and storing in sqllite database"
         )
@@ -475,6 +518,7 @@ class ExportL5x:
         self._cur.executemany("INSERT INTO nameless VALUES (?,?,?)", nameless_tuples)
         self._db.commit()
 
+    def _load_taginfo(self):
         # Step 6d: parse TagInfo.XML ONCE into a datatype -> member byte-layout
         # map used to decode tag value images into the Decorated <Data> tree.
         # Best-effort; on any failure the map is empty and the zero-generator
@@ -490,6 +534,7 @@ class ExportL5x:
             log.warning("TagInfo layout parse failed, skipping value decode: {}", exc)
             self._taginfo_layout = {}
 
+    def _create_indexes(self):
         log.info("Creating indexes for fast object graph queries")
         self._cur.execute("CREATE INDEX idx_comps_object_id ON comps(object_id)")
         self._cur.execute("CREATE INDEX idx_comps_parent_id ON comps(parent_id)")
@@ -606,6 +651,9 @@ class ExportL5x:
         return self._project
 
     def populate_region_map(self):
+        log.info(
+            "Getting records from ACD Region Map file and storing in sqllite database"
+        )
         # The Region Map body is parsed at V24+/V36-specific absolute offsets
         # (70/78). For V10..V21 short-header projects the body layout differs, so
         # the short path uses its own empirically-derived offset.
@@ -778,6 +826,9 @@ class ExportL5x:
     # RoutineBuilder falls back to today's behaviour (no rung comments) so nothing
     # regresses.
     def populate_regn_link(self):
+        log.info(
+            "Getting records from ACD Region Link file and storing in sqllite database"
+        )
         path = os.path.join(self._temp_dir, "RegnLink.Dat")
         try:
             with open(path, "rb") as fh:
