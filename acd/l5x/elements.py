@@ -3808,6 +3808,47 @@ _ALARM_FALSE_BOOLS = (
 _ALARM_CT_EXPR = {"TRIP": "= 1", "LO": "<=", "HI": ">="}
 
 
+def _alarm_f32(rec, off):
+    """Render an alarm f32 field the way OEM spells it (x.0 for whole values)."""
+    v = struct.unpack_from("<f", rec, off)[0]
+    return f"{v:.1f}" if v == int(v) else repr(v)
+
+
+def _resolve_alarm_hex(s, oid2name):
+    """Replace @hex@ object-id tokens with their comp_names; first token = owner.
+
+    Returns (resolved_text, owner_oid, owner_name); owner_oid is None and
+    owner_name "" when the string carries no token.
+    """
+    owner = None
+    owner_name = ""
+    out = []
+    for i, p in enumerate(re.split(r"@([0-9A-Fa-f]+)@", s)):
+        if i % 2 == 1:
+            nm = oid2name.get(int(p, 16), "")
+            if owner is None:
+                owner_name = nm
+                owner = int(p, 16)
+            out.append(nm)
+        else:
+            out.append(p)
+    return "".join(out), owner, owner_name
+
+
+def _alarm_common_fields(rec, base):
+    """The Limit..Deadband field block shared by _CA condition and _AD
+    definition records (the two layouts differ only by where it starts)."""
+    return {
+        "Limit": _alarm_f32(rec, base),
+        "Severity": str(struct.unpack_from("<H", rec, base + 4)[0]),
+        "OnDelay": str(struct.unpack_from("<I", rec, base + 8)[0]),
+        "OffDelay": str(struct.unpack_from("<I", rec, base + 12)[0]),
+        "ShelveDuration": str(struct.unpack_from("<I", rec, base + 16)[0]),
+        "MaxShelveDuration": str(struct.unpack_from("<I", rec, base + 20)[0]),
+        "Deadband": _alarm_f32(rec, base + 24),
+    }
+
+
 def _build_alarm_conditions(cur, short_header):
     """Build per-tag <AlarmConditions> blocks from RxConfiguredAlarmCollection.
 
@@ -3839,25 +3880,6 @@ def _build_alarm_conditions(cur, short_header):
             if m:
                 def_suffixes.add(m.group(1))
 
-    def _f32(rec, off):
-        v = struct.unpack_from("<f", rec, off)[0]
-        return f"{v:.1f}" if v == int(v) else repr(v)
-
-    def _resolve(s):
-        # Replace @hex@ object-id tokens with their comp_names; first token = owner.
-        owner = None
-        out = []
-        for i, p in enumerate(re.split(r"@([0-9A-Fa-f]+)@", s)):
-            if i % 2 == 1:
-                nm = oid2name.get(int(p, 16), "")
-                if owner is None:
-                    owner_name = nm
-                    owner = int(p, 16)
-                out.append(nm)
-            else:
-                out.append(p)
-        return "".join(out), owner, (owner_name if owner is not None else "")
-
     cur.execute(
         "SELECT comp_name, object_id, record FROM comps WHERE parent_id=? ORDER BY seq_number",
         (coll,))
@@ -3872,7 +3894,7 @@ def _build_alarm_conditions(cur, short_header):
             ct = rec[0x86:0x86 + ctlen].decode("ascii")
             attrs = CompsRecord.full_attrs(cur, oid, short_header)
             in_s = attrs.get(0x6a, b"").decode("utf-16-le", errors="ignore").split("\x00")[0]
-            inp, owner_oid, owner_name = _resolve(in_s)
+            inp, owner_oid, owner_name = _resolve_alarm_hex(in_s, oid2name)
             if owner_name and inp.startswith(owner_name):
                 inp = inp[len(owner_name):]
             if inp == "":
@@ -3880,7 +3902,7 @@ def _build_alarm_conditions(cur, short_header):
             assoc = None
             a66 = attrs.get(0x66, b"").decode("utf-16-le", errors="ignore").split("\x00")[0]
             if a66:
-                ar, _, _ = _resolve(a66)
+                ar, _, _ = _resolve_alarm_hex(a66, oid2name)
                 if owner_name and ar.startswith(owner_name):
                     ar = ar[len(owner_name):]
                 assoc = ar if ar else "."
@@ -3903,13 +3925,8 @@ def _build_alarm_conditions(cur, short_header):
                     cac = rs
             cond = {
                 "Name": name, "AlarmConditionDefinition": acd, "Input": inp,
-                "ConditionType": ct, "Limit": _f32(rec, 0x19c),
-                "Severity": str(struct.unpack_from("<H", rec, 0x1a0)[0]),
-                "OnDelay": str(struct.unpack_from("<I", rec, 0x1a4)[0]),
-                "OffDelay": str(struct.unpack_from("<I", rec, 0x1a8)[0]),
-                "ShelveDuration": str(struct.unpack_from("<I", rec, 0x1ac)[0]),
-                "MaxShelveDuration": str(struct.unpack_from("<I", rec, 0x1b0)[0]),
-                "Deadband": _f32(rec, 0x1b4),
+                "ConditionType": ct,
+                **_alarm_common_fields(rec, 0x19c),
                 "Used": "true" if flagB & 1 else "false",
                 "AlarmSetOperIncluded": "true" if flagB & 2 else "false",
                 "AlarmSetRollupIncluded": "true" if flagB & 4 else "false",
@@ -4113,23 +4130,6 @@ def _alarm_definitions_xml(cur, short_header):
     oid2name = {o: n for o, n in cur.execute(
         "SELECT object_id, comp_name FROM comps").fetchall()}
 
-    def resolve(s):
-        owner = [None]
-        out = []
-        for i, part in enumerate(re.split(r'@([0-9A-Fa-f]+)@', s)):
-            if i % 2 == 1:
-                nm = oid2name.get(int(part, 16), "")
-                if owner[0] is None:
-                    owner[0] = nm
-                out.append(nm)
-            else:
-                out.append(part)
-        return "".join(out), owner[0]
-
-    def f32(rec, o):
-        v = struct.unpack_from("<f", rec, o)[0]
-        return f"{v:.1f}" if v == int(v) else repr(v)
-
     bydt: Dict[str, list] = {}
     dt_order: List[str] = []
     for cname, oid, rec in cur.execute(
@@ -4145,13 +4145,13 @@ def _alarm_definitions_xml(cur, short_header):
         ct = rec[0x86:0x86 + ctlen].decode("ascii", "replace")
         attrs = CompsRecord.full_attrs(cur, oid, short_header)
         ins = attrs.get(0x6a, b"").decode("utf-16-le", "ignore").split("\x00")[0]
-        inp, ownn = resolve(ins)
+        inp, _, ownn = _resolve_alarm_hex(ins, oid2name)
         if ownn and inp.startswith(ownn):
             inp = inp[len(ownn):]
         a66 = attrs.get(0x66, b"").decode("utf-16-le", "ignore").split("\x00")[0]
         assoc = None
         if a66:
-            ar, _ = resolve(a66)
+            ar, _, _ = _resolve_alarm_hex(a66, oid2name)
             if ownn and ar.startswith(ownn):
                 ar = ar[len(ownn):]
             assoc = ar if ar else "."
@@ -4162,7 +4162,7 @@ def _alarm_definitions_xml(cur, short_header):
         for tr, rs in cur.execute(
                 "SELECT tag_reference, record_string FROM comments "
                 "WHERE parent=? AND record_type=4", (jk,)).fetchall():
-            txt, _ = resolve(rs)
+            txt, _, _ = _resolve_alarm_hex(rs, oid2name)
             if ownn:
                 txt = txt.replace(ownn, "")
             if tr == "ADM":
@@ -4171,13 +4171,7 @@ def _alarm_definitions_xml(cur, short_header):
                 adc = txt
         d = {
             "Name": nm, "Input": inp, "ConditionType": ct,
-            "Limit": f32(rec, 0x194),
-            "Severity": str(struct.unpack_from("<H", rec, 0x198)[0]),
-            "OnDelay": str(struct.unpack_from("<I", rec, 0x19c)[0]),
-            "OffDelay": str(struct.unpack_from("<I", rec, 0x1a0)[0]),
-            "ShelveDuration": str(struct.unpack_from("<I", rec, 0x1a4)[0]),
-            "MaxShelveDuration": str(struct.unpack_from("<I", rec, 0x1a8)[0]),
-            "Deadband": f32(rec, 0x1ac),
+            **_alarm_common_fields(rec, 0x194),
             "Required": "true" if flag_b & 1 else "false",
             "AlarmSetOperIncluded": "true" if flag_b & 2 else "false",
             "AlarmSetRollupIncluded": "true" if flag_b & 4 else "false",
