@@ -838,4 +838,7 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    ExportL5x(args.input[0], args.output[0])
+    # Import here to avoid a module-level cycle (acd.api imports this module).
+    from acd.api import ConvertAcdToL5x
+
+    ConvertAcdToL5x(args.input[0], args.output[0]).extract()

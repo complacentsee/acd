@@ -21,26 +21,20 @@ class AcdDatabase:
         unzip = Unzip(self.input_filename)
         unzip.write_files(self._temp_dir)
 
-        log.info("Getting records from ACD Comps file and storing in sqllite database")
+        log.info("Reading records from ACD Comps file")
         self.comps_db = DbExtract(os.path.join(self._temp_dir, "Comps.Dat")).read()
 
-        log.info(
-            "Getting records from ACD SbRegion file and storing in sqllite database"
-        )
+        log.info("Reading records from ACD SbRegion file")
         self.sb_region_db = DbExtract(
             os.path.join(self._temp_dir, "SbRegion.Dat")
         ).read()
 
-        log.info(
-            "Getting records from ACD Comments file and storing in sqllite database"
-        )
+        log.info("Reading records from ACD Comments file")
         self.comments_db = DbExtract(
             os.path.join(self._temp_dir, "Comments.Dat")
         ).read()
 
-        log.info(
-            "Getting records from ACD Nameless file and storing in sqllite database"
-        )
+        log.info("Reading records from ACD Nameless file")
         self.nameless_db = DbExtract(
             os.path.join(self._temp_dir, "Nameless.Dat")
         ).read()

@@ -26,13 +26,17 @@ from acd.l5x.elements import DumpCompsRecords, RSLogix5000Content
 
 # Clean top-level API
 
-def load_acd(path, temp_dir: str = None) -> RSLogix5000Content:
+def load_acd(path, temp_dir: str = None, faithful: bool = False
+             ) -> RSLogix5000Content:
     """Load an ACD file into a Python object model.
 
     Args:
         path: Path to the .ACD file.
         temp_dir: Directory for SQLite and extracted files.  A temporary
             directory is created and cleaned up automatically if omitted.
+        faithful: When True, reproduce exactly what Studio 5000 exports
+            (e.g. omit source-protected content Studio withholds); when
+            False (default) recover as much as possible.
 
     Returns:
         RSLogix5000Content with a fully populated controller object tree.
@@ -43,7 +47,7 @@ def load_acd(path, temp_dir: str = None) -> RSLogix5000Content:
     if cleanup:
         temp_dir = tempfile.mkdtemp(prefix="acd_load_")
     try:
-        exporter = ExportL5x(str(path), temp_dir)
+        exporter = ExportL5x(str(path), temp_dir, faithful=faithful)
         return exporter.project
     finally:
         if cleanup:
