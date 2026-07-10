@@ -696,12 +696,14 @@ def _build_default_data(data_type: Union[str, None],
                 # Parameter/LocalTag radix (when set to a non-default) overrides the
                 # per-type default, and the zero value is re-formatted to match it
                 # (e.g. Hex -> 16#0000), exactly as Logix renders the DefaultData.
+                # The spelling comes from _decorated_scalar; the radix POLICY here
+                # deliberately differs from the value-image path: an explicit
+                # "Decimal" on a non-BOOL does NOT override the type default (a
+                # REAL declared Decimal keeps Radix="Float"), verified in 559ee27.
                 if dt_base in ("BOOL", "BIT"):
                     eff = (radix if (radix and radix not in ("NullType", "General"))
                            else "Decimal")
-                    decorated_inner = (
-                        f'<DataValue DataType="{dt_base}" Radix="{eff}" Value="0"/>'
-                    )
+                    decorated_inner = _tag_value._decorated_scalar(dt_base, "0", eff)
                 else:
                     eff = (radix if (radix and radix not in
                                      (None, "Decimal", "NullType", "General"))
@@ -712,14 +714,14 @@ def _build_default_data(data_type: Union[str, None],
                     elif eff == "Float":
                         zero = _PRIMITIVE_DECORATED_ZERO.get(dt_base)
                         decorated_inner = (
-                            f'<DataValue DataType="{dt_base}" Radix="Float" '
-                            f'Value="{zero}"/>' if zero is not None else None
+                            _tag_value._decorated_scalar(dt_base, zero, "Float")
+                            if zero is not None else None
                         )
                     else:
-                        val = _tag_value._format_int_radix(dt_base, 0, width, eff)
-                        decorated_inner = (
-                            f'<DataValue DataType="{dt_base}" Radix="{eff}" '
-                            f'Value="{val}"/>'
+                        decorated_inner = _tag_value._decorated_scalar(
+                            dt_base,
+                            _tag_value._format_int_radix(dt_base, 0, width, eff),
+                            eff,
                         )
             else:
                 # Array / struct with NO value image: OEM emits the pair
