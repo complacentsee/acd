@@ -1059,6 +1059,8 @@ def _ascii_string_cdata(b: bytes) -> str:
             out.append("$t")
         elif ch == 0x0A:
             out.append("$l")
+        elif ch == 0x0C:
+            out.append("$p")
         elif ch == 0x0D:
             out.append("$r")
         elif 0x20 <= ch < 0x7F:
