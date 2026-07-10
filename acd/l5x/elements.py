@@ -30,6 +30,11 @@ from acd.l5x.connections import (
     _build_produce_map,
     _strip_input_tag_inner,
 )
+from acd.l5x.controller_ports import (
+    build_comm_ports,
+    build_ethernet_network,
+    build_ethernet_ports,
+)
 from acd.l5x.messages import _msg_build_module_routes, _render_message_data
 from acd.l5x.module_builder import Module, ModuleBuilder, _build_rxdata_holders
 from acd.l5x import tag_value as _tag_value
@@ -1310,6 +1315,13 @@ class Controller(L5xElement):
     _ts_priority2: str = field(default="128")
     # <CST MasterID>, read from the controller's CST config record. Default "0".
     _cst_master_id: str = field(default="0")
+    # Pre-rendered controller communication port elements (see
+    # acd.l5x.controller_ports): <CommPorts> sits immediately before <CST>,
+    # <EthernetPorts> + <EthernetNetwork> follow <TimeSynchronize> (the
+    # reference's invariant placement). "" omits each.
+    _comm_ports_xml: str = field(default="")
+    _ethernet_ports_xml: str = field(default="")
+    _ethernet_network_xml: str = field(default="")
     # The controller-level safety signatures rendered as <SafetyInfo> children, each a
     # (signature, timestamp) pair or None. Populated only on safety-signed projects;
     # all None -> <SafetyInfo/> is emitted as before.
@@ -1375,12 +1387,15 @@ class Controller(L5xElement):
             + '<Security Code="0" ChangesToDetect="16#ffff_ffff_ffff_ffff"/>'
             + self._safety_info_xml()
             + self._alarm_definitions
+            + self._comm_ports_xml
             + f'<CST MasterID="{self._cst_master_id}"/>'
             + '<WallClockTime LocalTimeAdjustment="0" TimeZone="0"/>'
             + '<Trends/>'
             + ('<DataLogs/>' if self._emit_data_logs else '')
             + (f'<TimeSynchronize Priority1="{self._ts_priority1}" '
                f'Priority2="{self._ts_priority2}" PTPEnable="{self._ts_ptp_enable}"/>')
+            + self._ethernet_ports_xml
+            + self._ethernet_network_xml
             + '</Controller>'
         )
 
@@ -5823,6 +5838,12 @@ class ControllerBuilder(L5xElementBuilder):
         modules = self._pass_modules(io_data_map)
         processor_type, major_rev, minor_rev, comm_path = \
             self._pass_processor_identity(modules, _comm_path_prefix, _ctlattrs)
+        comm_ports_xml = build_comm_ports(
+            self._cur, self._object_id, self._short_header)
+        ethernet_ports_xml = build_ethernet_ports(
+            self._cur, self._object_id, self._short_header, major_rev)
+        ethernet_network_xml = build_ethernet_network(
+            self._cur, self._object_id, self._short_header)
         (pass_through, download_docs, download_custom, report_minor_overflow, auto_diags,
          web_server, _v24_plus) = self._pass_project_settings(processor_type, _ctlattrs, _ctlblob)
         aoi_sig, aoi_sig_ts = self._pass_aoi_signature()
@@ -5875,6 +5896,9 @@ class ControllerBuilder(L5xElementBuilder):
             power_loss_program=power_loss_program,
             _io_memory_pad_percentage=io_memory_pad_percentage,
             _data_table_pad_percentage=data_table_pad_percentage,
+            _comm_ports_xml=comm_ports_xml,
+            _ethernet_ports_xml=ethernet_ports_xml,
+            _ethernet_network_xml=ethernet_network_xml,
             _ts_ptp_enable=ts_ptp_enable,
             _ts_priority1=ts_priority1,
             _ts_priority2=ts_priority2,
