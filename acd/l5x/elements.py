@@ -528,6 +528,151 @@ def _generate_decorated(dt_base: str, dimensions: Union[str, None],
     return f'<Data Format="Decorated">\n{body}\n</Data>'
 
 
+def _render_value_blocks(element: str,
+                         data_type: Union[str, None],
+                         dimensions: Union[str, None],
+                         value_bytes: bytes,
+                         data_types_map: Dict[str, "DataType"],
+                         taginfo_layout: Dict[str, object],
+                         radix: Union[str, None],
+                         raw_hex_first: bool,
+                         string_array_as_string: bool,
+                         require_pair: bool,
+                         force_xml: str = "") -> str:
+    """Render a tag's design-value image as its flat + Decorated block pair.
+
+    Shared by Tag.to_xml (element="Data") and _build_default_data
+    (element="DefaultData"): the OEM value spelling is identical for both,
+    only the element name and a few policy gates differ:
+
+      raw_hex_first           the first block is the raw space-separated hex
+                              image (reference style through V24) instead of
+                              Format="L5K".
+      string_array_as_string  a STRING ARRAY renders as a single
+                              Format="String" block of element [0] instead of
+                              the Decorated <Array> tree (scalar STRING always
+                              renders as a String block).
+      require_pair            emit nothing unless BOTH the first block and the
+                              Decorated body rendered (Tag policy); when False
+                              each half is emitted independently (DefaultData
+                              policy).
+      force_xml               optional <ForceData> block inserted between the
+                              first block and the Decorated tree (never
+                              emitted for STRING, matching Logix).
+
+    Returns "" when nothing rendered. Exceptions propagate to the caller's
+    degrade-to-"" wrapper, except where a narrower internal fallback preserves
+    partial output (layout decode, LEN parse).
+    """
+    dt_base = data_type.split("[")[0].upper() if data_type else ""
+    # The rendered <Structure DataType=...> attribute keeps the datatype's
+    # DECLARED case (OEM writes UDT_MixedCase / AB:Embedded_IQ16F:C:0, not the
+    # uppercased form). render_decorated_layout/render_l5k_layout uppercase
+    # internally for the layout lookup, so passing the original-case name is
+    # safe and keeps the Structure attribute byte-faithful for ALL struct tags
+    # (predefined/built-in types are declared all-caps, so they are unchanged).
+    dt_decorated = data_type.split("[")[0] if data_type else dt_base
+
+    # A STRING tag emits a Format="String" Length=N block in place of the
+    # Decorated <Structure>/<Array> (Logix renders STRING specially). Detect by
+    # datatype name OR by the resolved TagInfo layout being the Logix STRING
+    # shape (LEN u32 + DATA SINT[]) -- the latter catches custom string types
+    # (String50, PF525FaultDesc, CustomStr...). The short-header value image
+    # decodes the same LEN+DATA shape, so this runs on both header families
+    # (verified byte-exact pool-wide).
+    is_string = (dt_base == "STRING") and (
+        dimensions is None or string_array_as_string)
+    if not is_string and dimensions is None and taginfo_layout:
+        try:
+            lay = _tag_value._resolve_layout(dt_base, taginfo_layout,
+                                             data_types_map)
+            if lay is not None and _tag_value._is_string_layout(lay):
+                is_string = True
+        except Exception:
+            pass
+
+    decorated_inner = None
+    string_block = None
+    if is_string:
+        try:
+            length = (int.from_bytes(value_bytes[0:4], "little")
+                      if len(value_bytes) >= 4 else 0)
+        except Exception:
+            length = 0
+        if length < 0 or length + 4 > len(value_bytes):
+            # Fall back to a NUL-terminated scan for a malformed LEN.
+            raw = value_bytes[4:] if len(value_bytes) > 4 else b""
+            text = _tag_value._ascii_string_cdata(raw.split(b"\x00", 1)[0])
+        else:
+            text = _tag_value._ascii_string_cdata(value_bytes[4:4 + length])
+        string_block = (
+            f'<{element} Format="String" Length="{length}">\n'
+            f"<![CDATA['{text}']]>\n</{element}>"
+        )
+    elif taginfo_layout:
+        # Layout-driven decode (full member fidelity) first; fall back to the
+        # simpler render_decorated on None/any failure.
+        try:
+            decorated_inner = _tag_value.render_decorated_layout(
+                dt_decorated, dimensions, value_bytes,
+                taginfo_layout, data_types_map, radix=radix
+            )
+        except Exception:
+            decorated_inner = None
+    if not is_string and decorated_inner is None:
+        decorated_inner = _tag_value.render_decorated(
+            dt_base, dimensions, value_bytes, data_types_map, radix=radix
+        )
+
+    # First block: the flat value image, version-styled:
+    #   raw hex : <Data>1D 00 00 00</Data>  (space-separated image)
+    #   L5K     : <Data Format="L5K"><![CDATA[29]]></Data>
+    if raw_hex_first:
+        first = (f"<{element}>" + _tag_value.render_hex(value_bytes)
+                 + f"</{element}>")
+        ok_first = bool(value_bytes)
+    else:
+        # Struct/UDT/built-in-struct (and module I/O) types need the
+        # layout-driven L5K bracket tree (the datatype's MEMBER tree, with
+        # mixed-width members, nested sub-structs and STRING members rendered
+        # properly); the flat int32-word render_l5k is wrong for them. Try the
+        # layout form first whenever a TagInfo layout exists for this
+        # datatype, and fall back to the flat form only when the layout path
+        # returns None (unknown shape).
+        l5k_text = None
+        if taginfo_layout:
+            try:
+                l5k_text = _tag_value.render_l5k_layout(
+                    dt_decorated, dimensions, value_bytes,
+                    taginfo_layout, data_types_map
+                )
+            except Exception:
+                l5k_text = None
+        if l5k_text is None:
+            l5k_text = _tag_value.render_l5k(
+                dt_base, dimensions, value_bytes, data_types_map
+            )
+        first = (f'<{element} Format="L5K">\n<![CDATA[{l5k_text}]]>\n'
+                 f'</{element}>')
+        ok_first = l5k_text is not None
+
+    if string_block is not None:
+        # STRING: first block (raw hex / L5K) then the String block, OEM order.
+        return first + string_block if ok_first else ""
+
+    if require_pair:
+        if ok_first and decorated_inner is not None:
+            return (first + force_xml
+                    + f'<{element} Format="Decorated">\n{decorated_inner}\n'
+                      f'</{element}>')
+        return ""
+    decorated_block = (
+        f'<{element} Format="Decorated">\n{decorated_inner}\n</{element}>'
+        if decorated_inner is not None else ""
+    )
+    return (first if ok_first else "") + decorated_block
+
+
 def _build_default_data(data_type: Union[str, None],
                         dimensions: Union[str, None],
                         value_bytes: Union[bytes, None],
@@ -553,90 +698,19 @@ def _build_default_data(data_type: Union[str, None],
         dt_base = data_type.split("[")[0].upper() if data_type else ""
         if not dt_base or dt_base in _SKIP_DECORATED:
             return ""
-        # Declared-case datatype name for the rendered <Structure DataType=...>
-        # attribute (OEM keeps the author's case, e.g. DateTime not DATETIME).
-        # render_decorated_layout/render_l5k_layout uppercase internally for the
-        # layout lookup, so passing the original case is safe.
-        dt_decorated = data_type.split("[")[0] if data_type else dt_base
-
-        # ---- L5K (first) block ----
-        # render_l5k/render_decorated reuse, exactly as Tag.to_xml: when the
-        # AOI prototype value image is available it is used; otherwise the type's
-        # zero default is rendered.
-        decorated_inner = None
-        l5k_text = None
-
         if value_bytes is not None:
-            # STRING members render block1 as Format="String" Length=N (single-
-            # quoted CDATA), NOT a Decorated <Structure>. Detect by datatype name
-            # or by the resolved layout being the Logix STRING shape (LEN+DATA).
-            is_string = dt_base == "STRING"
-            if not is_string and dimensions is None and taginfo_layout:
-                try:
-                    lay = _tag_value._resolve_layout(
-                        dt_base, taginfo_layout, data_types_map
-                    )
-                    if lay is not None and _tag_value._is_string_layout(lay):
-                        is_string = True
-                except Exception:
-                    pass
-
-            if is_string:
-                # block1 = Format="String" Length="{LEN}" <![CDATA['text']]>
-                try:
-                    length = int.from_bytes(value_bytes[0:4], "little") if len(value_bytes) >= 4 else 0
-                except Exception:
-                    length = 0
-                if length < 0 or length + 4 > len(value_bytes):
-                    # Fall back to NUL-terminated scan for a malformed LEN.
-                    raw = value_bytes[4:] if len(value_bytes) > 4 else b""
-                    text = _tag_value._ascii_string_cdata(raw.split(b"\x00", 1)[0])
-                else:
-                    text = _tag_value._ascii_string_cdata(value_bytes[4:4 + length])
-                decorated_inner = None  # not used for STRING
-                string_block = (
-                    f'<DefaultData Format="String" Length="{length}">\n'
-                    f"<![CDATA['{text}']]>\n</DefaultData>"
-                )
-            else:
-                string_block = None
-                if taginfo_layout:
-                    try:
-                        decorated_inner = _tag_value.render_decorated_layout(
-                            dt_decorated, dimensions, value_bytes,
-                            taginfo_layout, data_types_map, radix=radix
-                        )
-                    except Exception:
-                        decorated_inner = None
-                if decorated_inner is None:
-                    decorated_inner = _tag_value.render_decorated(
-                        dt_base, dimensions, value_bytes, data_types_map, radix=radix
-                    )
-
-            if short_header:
-                l5k_text = _tag_value.render_hex(value_bytes)
-                first = "<DefaultData>" + l5k_text + "</DefaultData>"
-                ok_first = bool(value_bytes)
-            else:
-                l5k_text = None
-                if taginfo_layout:
-                    try:
-                        l5k_text = _tag_value.render_l5k_layout(
-                            dt_decorated, dimensions, value_bytes,
-                            taginfo_layout, data_types_map
-                        )
-                    except Exception:
-                        l5k_text = None
-                if l5k_text is None:
-                    l5k_text = _tag_value.render_l5k(
-                        dt_base, dimensions, value_bytes, data_types_map
-                    )
-                first = f'<DefaultData Format="L5K">\n<![CDATA[{l5k_text}]]>\n</DefaultData>'
-                ok_first = l5k_text is not None
-
-            if string_block is not None:
-                # STRING: emit block0 (hex/L5K) + the String block1, in OEM order.
-                return (first if ok_first else "") + (string_block if ok_first else "")
+            # Value image present: render exactly the pair a Tag would emit,
+            # spelled <DefaultData>. Policy gates match today's DefaultData
+            # behaviour: raw-hex first block only on short-header projects, a
+            # STRING ARRAY renders as a single Format="String" block, and each
+            # half of the pair is emitted independently of the other.
+            return _render_value_blocks(
+                "DefaultData", data_type, dimensions, value_bytes,
+                data_types_map, taginfo_layout, radix,
+                raw_hex_first=short_header,
+                string_array_as_string=True,
+                require_pair=False,
+            )
         else:
             # No value image -> zero default for this data type.
             if dimensions is None and dt_base in _PRIMITIVE_L5K_ZERO:
@@ -1854,129 +1928,30 @@ class Tag(L5xElement):
         # target). Suppress all data emission when this is an alias.
         is_alias = self.tag_type == "Alias" or self.alias_for is not None
         dt_base = self.data_type.split("[")[0].upper() if self.data_type else ""
-        # The rendered <Structure DataType=...> attribute keeps the datatype's
-        # DECLARED case (OEM writes UDT_MixedCase / AB:Embedded_IQ16F:C:0, not the
-        # uppercased form). render_decorated_layout/render_l5k_layout uppercase
-        # internally for the layout lookup, so passing the original-case name is
-        # safe and keeps the Structure attribute byte-faithful for ALL struct tags
-        # (predefined/built-in types are declared all-caps, so they are unchanged).
-        # dt_base (uppercased) is still the lookup key for the _SKIP_DECORATED /
-        # STRING tests and the non-layout fallback paths below.
-        dt_decorated = self.data_type.split("[")[0] if self.data_type else dt_base
 
         # --- Step 6c: real value <Data> from the design-value image (0x66) ---
-        # When the value reader returned an image, emit BOTH the OEM blocks Logix
-        # writes for a Base non-IO tag, then <Data Format="Decorated"> (structured
-        # Value=...). The FIRST block is version-styled:
-        #   LONG (V24+):  <Data Format="L5K"><![CDATA[50]]></Data>
-        #   SHORT(V10-21): <Data>1D 00 00 00</Data>  (raw image, space-sep hex)
-        # Both styles carry the same value; the Decorated block is identical.
+        # When the value reader returned an image, emit the OEM <Data> block
+        # pair via the shared renderer (flat first block styled raw-hex or L5K
+        # per _raw_hex_first_block, then <Data Format="Decorated">; a STRING
+        # renders a Format="String" block instead -- see _render_value_blocks).
         # Wrapped so any failure degrades to today's zero-placeholder behaviour
         # below — no regression.
         data_xml = ""
-        # The Format="String" block is only emitted on long-header (V24+) projects:
-        # there the recovered STRING value image is the verified LEN+DATA shape. The
-        # short-header STRING value image is not reliably decoded yet, so keep the
-        # prior behaviour there (no <Data> for dt_base=="STRING"), avoiding wrong
-        # empty/array output.
         if not is_alias and self._value_bytes is not None and dt_base not in _SKIP_DECORATED:
             try:
-                # A STRING tag emits a Format="String" Length=N block in place of the
-                # Decorated <Structure>/<Array> (Logix renders STRING specially).
-                # Detect by datatype name (STRING, incl. arrays -- OEM emits a single
-                # String block of element[0]) OR by the resolved TagInfo layout being
-                # the Logix STRING shape (LEN u32 + DATA SINT[]) -- the latter catches
-                # custom string types (String50, PF525FaultDesc, CustomStr...). The
-                # short-header value image decodes the same LEN+DATA shape, so this
-                # runs on both header families (verified byte-exact pool-wide).
-                # STRING renders as a Format="String" block when scalar (either
-                # header) and also for short-header ARRAYS (Logix emits a single
-                # String of element[0] there); a long-header STRING ARRAY keeps the
-                # Decorated <Array> form.
-                is_string = (dt_base == "STRING") and (
-                    self.dimensions is None or self._short_header)
-                if not is_string and self.dimensions is None and self._taginfo_layout:
-                    try:
-                        _lay = _tag_value._resolve_layout(
-                            dt_base, self._taginfo_layout, self._data_types_map
-                        )
-                        if _lay is not None and _tag_value._is_string_layout(_lay):
-                            is_string = True
-                    except Exception:
-                        pass
-                # Step 6d: layout-driven decode (full member fidelity) first;
-                # fall back to the simpler render_decorated on None/any failure.
-                decorated_inner = None
-                string_block = None
-                if is_string:
-                    try:
-                        length = (int.from_bytes(self._value_bytes[0:4], "little")
-                                  if len(self._value_bytes) >= 4 else 0)
-                    except Exception:
-                        length = 0
-                    if length < 0 or length + 4 > len(self._value_bytes):
-                        raw = self._value_bytes[4:] if len(self._value_bytes) > 4 else b""
-                        text = _tag_value._ascii_string_cdata(raw.split(b"\x00", 1)[0])
-                    else:
-                        text = _tag_value._ascii_string_cdata(self._value_bytes[4:4 + length])
-                    string_block = (
-                        f'<Data Format="String" Length="{length}">\n'
-                        f"<![CDATA['{text}']]>\n</Data>"
-                    )
-                elif self._taginfo_layout:
-                    try:
-                        decorated_inner = _tag_value.render_decorated_layout(
-                            dt_decorated, self.dimensions, self._value_bytes,
-                            self._taginfo_layout, self._data_types_map,
-                            radix=self.radix
-                        )
-                    except Exception:
-                        decorated_inner = None
-                if not is_string and decorated_inner is None:
-                    decorated_inner = _tag_value.render_decorated(
-                        dt_base, self.dimensions, self._value_bytes,
-                        self._data_types_map, radix=self.radix
-                    )
-                if self._raw_hex_data:
-                    first = "<Data>" + _tag_value.render_hex(self._value_bytes) + "</Data>"
-                    ok_first = bool(self._value_bytes)
-                else:
-                    # Struct/UDT/built-in-struct (and module I/O) types need the
-                    # layout-driven L5K bracket tree (the datatype's MEMBER tree,
-                    # with mixed-width members, nested sub-structs and STRING
-                    # members rendered properly); the flat int32-word render_l5k is
-                    # wrong for them.  Try the layout form first whenever a TagInfo
-                    # layout exists for this datatype, and fall back to the flat
-                    # form only when the layout path returns None (unknown shape).
-                    # Wrapped: any failure -> no L5K (ok_first stays False -> the
-                    # <Data> blocks are suppressed, which is today's behaviour for
-                    # the long path).
-                    l5k_text = None
-                    if self._taginfo_layout:
-                        try:
-                            l5k_text = _tag_value.render_l5k_layout(
-                                dt_decorated, self.dimensions, self._value_bytes,
-                                self._taginfo_layout, self._data_types_map
-                            )
-                        except Exception:
-                            l5k_text = None
-                    if l5k_text is None:
-                        l5k_text = _tag_value.render_l5k(
-                            dt_base, self.dimensions, self._value_bytes, self._data_types_map
-                        )
-                    first = f'<Data Format="L5K">\n<![CDATA[{l5k_text}]]>\n</Data>'
-                    ok_first = l5k_text is not None
-                # <ForceData> for an I/O tag with installed forces sits between the
-                # binary/L5K value block and the Decorated tree (the order Logix uses).
-                force_block = (f'<ForceData>{self._force_data}</ForceData>'
-                               if self._force_data else '')
-                if string_block is not None:
-                    # Scalar STRING: first block (raw hex / L5K) then the String block.
-                    if ok_first:
-                        data_xml = first + string_block
-                elif ok_first and decorated_inner is not None:
-                    data_xml = (first + force_block
-                                + f'<Data Format="Decorated">\n{decorated_inner}\n</Data>')
+                # <ForceData> for an I/O tag with installed forces sits between
+                # the flat value block and the Decorated tree (the order Logix
+                # uses).
+                force_xml = (f'<ForceData>{self._force_data}</ForceData>'
+                             if self._force_data else '')
+                data_xml = _render_value_blocks(
+                    "Data", self.data_type, self.dimensions, self._value_bytes,
+                    self._data_types_map, self._taginfo_layout, self.radix,
+                    raw_hex_first=self._raw_hex_data,
+                    string_array_as_string=self._short_header,
+                    require_pair=True,
+                    force_xml=force_xml,
+                )
             except Exception:
                 data_xml = ""
 
