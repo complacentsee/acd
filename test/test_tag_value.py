@@ -172,3 +172,178 @@ def test_render_l5k_timer_struct_words():
     # TIMER image = status word, PRE, ACC as int32 -> "[status,PRE,ACC]".
     img = struct.pack("<iii", 0, 1000, 500)
     assert T.render_l5k("TIMER", None, img, {}) == "[0,1000,500]"
+
+
+# --------------------------------------------------------------------------- #
+# Layout-walker goldens (P4 C2) -- pin the L5K and Decorated LAYOUT walkers,
+# including their deliberate asymmetries, so the traversal can be unified
+# without moving a byte:
+#   * L5K serialises STORAGE: hidden members included, scalar BOOLs whose byte
+#     falls inside a wider member (bit-aliases) skipped.
+#   * Decorated serialises the VIEW: hidden members skipped, bit-alias BOOLs
+#     included (Radix attr only on byte-aligned BOOLs, i.e. bit is None).
+#   * STRING: L5K emits the FULL DATA capacity ($00-padded); Decorated emits
+#     only the active LEN characters (single-quoted when non-empty).
+#   * A member that fails to decode only fails the walker that includes it.
+# layout_map member tuples: (name, mdt, byte_offset, bit_or_None, hidden,
+# dims_list_or_None); "@size@NAME" carries the struct stride.
+# --------------------------------------------------------------------------- #
+
+
+_U_LAYOUT = {
+    "U": [
+        ("D", "DINT", 0, None, False, None),
+        ("AliasB", "BOOL", 0, 5, False, None),   # overlays D's byte 0
+        ("SA", "SINT", 4, None, False, [2]),
+        ("BA", "BOOL", 6, None, False, None),    # byte-aligned scalar BOOL
+        ("H", "DINT", 8, None, True, None),      # hidden storage member
+        ("BArr", "BOOL", 12, None, False, [10]),
+    ],
+    "@size@U": 16,
+}
+
+# D=120 (byte0 0x78 -> bit5 = 1), SA=[7,-2], BA=1, H=9, BArr bits 0b01010101,0x01
+_U_IMAGE = bytes([0x78, 0, 0, 0, 0x07, 0xFE, 0x01, 0,
+                  9, 0, 0, 0, 0x55, 0x01, 0, 0])
+
+
+def test_l5k_layout_includes_hidden_skips_bit_alias():
+    l5k = T.render_l5k_layout("U", None, _U_IMAGE, _U_LAYOUT, {})
+    assert l5k == "[120,[7,-2],1,9,[1,0,1,0,1,0,1,0,1,0]]"
+
+
+def test_decorated_layout_skips_hidden_includes_bit_alias():
+    xml = T.render_decorated_layout("U", None, _U_IMAGE, _U_LAYOUT, {})
+    assert xml == (
+        '<Structure DataType="U">'
+        '<DataValueMember Name="D" DataType="DINT" Radix="Decimal" Value="120"/>'
+        '<DataValueMember Name="AliasB" DataType="BOOL" Value="1"/>'
+        '<ArrayMember Name="SA" DataType="SINT" Dimensions="2" Radix="Decimal">'
+        '<Element Index="[0]" Value="7"/><Element Index="[1]" Value="-2"/>'
+        '</ArrayMember>'
+        '<DataValueMember Name="BA" DataType="BOOL" Radix="Decimal" Value="1"/>'
+        '<ArrayMember Name="BArr" DataType="BOOL" Dimensions="10" Radix="Decimal">'
+        + "".join(f'<Element Index="[{i}]" Value="{v}"/>'
+                  for i, v in enumerate([1, 0, 1, 0, 1, 0, 1, 0, 1, 0]))
+        + '</ArrayMember>'
+        '</Structure>'
+    )
+
+
+def test_decorated_layout_honors_member_def_radix():
+    class _M:
+        def __init__(self, name, radix):
+            self.name, self.radix = name, radix
+
+    class _DT:
+        members = [_M("D", "Hex")]
+
+    xml = T.render_decorated_layout("U", None, _U_IMAGE, _U_LAYOUT, {"U": _DT()})
+    assert '<DataValueMember Name="D" DataType="DINT" Radix="Hex" ' \
+           'Value="16#0000_0078"/>' in xml
+    # L5K stays plain signed decimal regardless of the member radix.
+    assert T.render_l5k_layout("U", None, _U_IMAGE, _U_LAYOUT, {"U": _DT()}
+                               ).startswith("[120,")
+
+
+_FAIL_LAYOUT = {
+    "U2": [
+        ("D", "DINT", 0, None, False, None),
+        ("SA", "SINT", 4, None, False, [2]),
+        ("BA", "BOOL", 6, None, False, None),
+        ("H", "DINT", 8, None, True, None),   # hidden; needs bytes 8..11
+    ],
+    "@size@U2": 12,
+}
+
+
+def test_walker_failure_is_per_consumer():
+    # 8-byte image: every VISIBLE member decodes, the hidden H does not.
+    img = bytes([0x78, 0, 0, 0, 0x07, 0xFE, 0x01, 0])
+    assert T.render_l5k_layout("U2", None, img, _FAIL_LAYOUT, {}) is None
+    xml = T.render_decorated_layout("U2", None, img, _FAIL_LAYOUT, {})
+    assert xml is not None and 'Name="H"' not in xml
+
+
+_NEST_LAYOUT = {
+    "INNER": [("X", "INT", 0, None, False, None)],
+    "@size@INNER": 4,
+    "OUTER": [
+        ("N", "INNER", 0, None, False, None),
+        ("NA", "INNER", 4, None, False, [2]),
+    ],
+    "@size@OUTER": 12,
+}
+
+_NEST_IMAGE = struct.pack("<hxxhxxhxx", 5, 1, 2)
+
+
+def test_layout_walkers_nested_struct_and_struct_array():
+    assert (T.render_l5k_layout("OUTER", None, _NEST_IMAGE, _NEST_LAYOUT, {})
+            == "[[5],[[1],[2]]]")
+    xml = T.render_decorated_layout("OUTER", None, _NEST_IMAGE, _NEST_LAYOUT, {})
+    assert xml == (
+        '<Structure DataType="OUTER">'
+        '<StructureMember Name="N" DataType="INNER">'
+        '<DataValueMember Name="X" DataType="INT" Radix="Decimal" Value="5"/>'
+        '</StructureMember>'
+        '<ArrayMember Name="NA" DataType="INNER" Dimensions="2">'
+        '<Element Index="[0]"><Structure DataType="INNER">'
+        '<DataValueMember Name="X" DataType="INT" Radix="Decimal" Value="1"/>'
+        '</Structure></Element>'
+        '<Element Index="[1]"><Structure DataType="INNER">'
+        '<DataValueMember Name="X" DataType="INT" Radix="Decimal" Value="2"/>'
+        '</Structure></Element>'
+        '</ArrayMember>'
+        '</Structure>'
+    )
+
+
+def test_layout_walkers_top_level_struct_array():
+    img = struct.pack("<hxxhxx", 1, 2)
+    assert (T.render_l5k_layout("INNER", "2", img, _NEST_LAYOUT, {})
+            == "[[1],[2]]")
+    xml = T.render_decorated_layout("INNER", "2", img, _NEST_LAYOUT, {})
+    assert xml == (
+        '<Array DataType="INNER" Dimensions="2">'
+        '<Element Index="[0]"><Structure DataType="INNER">'
+        '<DataValueMember Name="X" DataType="INT" Radix="Decimal" Value="1"/>'
+        '</Structure></Element>'
+        '<Element Index="[1]"><Structure DataType="INNER">'
+        '<DataValueMember Name="X" DataType="INT" Radix="Decimal" Value="2"/>'
+        '</Structure></Element>'
+        '</Array>'
+    )
+
+
+_STR_LAYOUT = {
+    "S6": [
+        ("LEN", "DINT", 0, None, False, None),
+        ("DATA", "SINT", 4, None, False, [6]),
+    ],
+    "@size@S6": 12,
+}
+
+
+def test_layout_walkers_string_shape():
+    img = struct.pack("<i", 2) + b"Hi\x00\x00\x00\x00"
+    # L5K: LEN + the FULL DATA capacity, NULs $-escaped.
+    assert (T.render_l5k_layout("S6", None, img, _STR_LAYOUT, {})
+            == "[2,'Hi$00$00$00$00']")
+    # Decorated: only the LEN active chars, single-quoted inside the CDATA.
+    xml = T.render_decorated_layout("S6", None, img, _STR_LAYOUT, {})
+    assert xml == (
+        '<Structure DataType="S6">'
+        '<DataValueMember Name="LEN" DataType="DINT" Radix="Decimal" Value="2"/>'
+        '<DataValueMember Name="DATA" DataType="S6" Radix="ASCII">\n'
+        "<![CDATA['Hi']]>\n</DataValueMember>"
+        '</Structure>'
+    )
+
+
+def test_layout_walkers_empty_string_has_no_quotes():
+    img = struct.pack("<i", 0) + b"\x00" * 6
+    assert (T.render_l5k_layout("S6", None, img, _STR_LAYOUT, {})
+            == "[0,'$00$00$00$00$00$00']")
+    xml = T.render_decorated_layout("S6", None, img, _STR_LAYOUT, {})
+    assert "<![CDATA[]]>" in xml
