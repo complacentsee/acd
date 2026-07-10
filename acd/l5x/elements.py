@@ -1562,22 +1562,14 @@ class MemberBuilder(L5xElementBuilder):
         results = self._cur.fetchall()
 
         name = results[0][0]
-        try:
-            r = RxGeneric.from_bytes(results[0][3])
-            # The ext-attr tail parses lazily; materialise it here so an
-            # encrypted (source-protected) tail still raises into the fallback.
-            r.extended_records
-        except Exception:
-            # Source-protected member record: its own ext-attr tail is encrypted,
-            # but every field this builder needs comes from ``self.record`` (the
-            # member descriptor blob, passed in already-decrypted by the datatype
-            # builder). Recover comment_id/cip_type from the plaintext main_record;
-            # the comment text is decrypted in the comments table, so the
-            # member-description key resolves the same as for a plain member. Fall
-            # back to a plain member only when even the main_record is unreadable.
-            r = _rxgeneric_plaintext_main(results[0][3])
-            if r is None:
-                return Member(name, name, "", 0, "Decimal", False, None, None, "Read/Write")
+        # A source-protected member record's own ext-attr tail is encrypted, but
+        # every field this builder needs comes from ``self.record`` (the member
+        # descriptor blob, passed in already-decrypted by the datatype builder),
+        # and the member-description key resolves from the plaintext main_record.
+        # Fall back to a plain member only when even the main_record is unreadable.
+        r = _parse_rec_tolerant(results[0][3])
+        if r is None:
+            return Member(name, name, "", 0, "Decimal", False, None, None, "Read/Write")
 
         extended_records: Dict[int, List[int]] = {}
         for extended_record in getattr(r, "extended_records", []):
@@ -2141,6 +2133,39 @@ def _rxgeneric_plaintext_main(raw_rec: bytes):
     return _PlaintextRxGeneric(raw_rec)
 
 
+def _parse_rec_tolerant(raw_rec: bytes):
+    """Parse a comps record, tolerating a source-protected (encrypted) tail.
+
+    Returns the kaitai RxGeneric when it parses, else a plaintext-main view
+    (cip_type/comment_id/main_record from fixed offsets), else None. Used by the
+    alias detectors so source-protected aliases are still recognised (the
+    kaitai parser throws on their encrypted ext-attr tail).
+    """
+    try:
+        r = RxGeneric.from_bytes(raw_rec)
+        # The ext-attr tail parses lazily; materialise it here so an
+        # encrypted tail still yields the plaintext-main view instead.
+        r.extended_records
+        return r
+    except Exception:
+        return _rxgeneric_plaintext_main(raw_rec)
+
+
+def _parse_rec_and_exts(raw_rec: bytes):
+    """(record view, ext-attr dict, source_protected) for a comps record.
+
+    Kaitai path: (RxGeneric, {attr_id: bytes}, False). A source-protected
+    record's encrypted ext-attr tail defeats the kaitai parser; then the tail
+    is decrypted to recover the attrs and the main_record is read at fixed
+    plaintext offsets: (plaintext view or None, decrypted attrs, True).
+    """
+    try:
+        r = RxGeneric.from_bytes(raw_rec)
+        return r, {er.attribute_id: bytes(er.value) for er in r.extended_records}, False
+    except Exception:
+        return _rxgeneric_plaintext_main(raw_rec), CompsRecord.read_ext_attrs_from_record(raw_rec), True
+
+
 @dataclass
 class TagBuilder(TagAliasResolver, L5xElementBuilder):
     _short_header: bool = field(default=False)
@@ -2186,23 +2211,8 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
         except Exception:
             return None, 0
 
-    @staticmethod
-    def _parse_rec_tolerant(raw_rec: bytes):
-        """Parse a tag comps record, tolerating a source-protected (encrypted) tail.
-
-        Returns the kaitai RxGeneric when it parses, else a plaintext-main view
-        (cip_type/comment_id/main_record from fixed offsets), else None. Used by the
-        alias detectors so source-protected aliases are still recognised (the
-        kaitai parser throws on their encrypted ext-attr tail).
-        """
-        try:
-            r = RxGeneric.from_bytes(raw_rec)
-            # The ext-attr tail parses lazily; materialise it here so an
-            # encrypted tail still yields the plaintext-main view instead.
-            r.extended_records
-            return r
-        except Exception:
-            return _rxgeneric_plaintext_main(raw_rec)
+    # Exposed on the class for the TagAliasResolver mixin's host contract.
+    _parse_rec_tolerant = staticmethod(_parse_rec_tolerant)
 
     def build(self) -> Tag:
         self._cur.execute(
@@ -2384,26 +2394,12 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
                 is_safe_partition = (hi >> 8) == 0x79
             return "Safety" if is_safe_partition else "Standard"
 
-        try:
-            r = RxGeneric.from_bytes(raw_rec)
-            # The ext-attr tail parses lazily; materialise it here so an
-            # encrypted tail still routes to the plaintext-main fallback.
-            r.extended_records
-        except Exception:
-            # A source-protected record's encrypted ext-attr tail defeats the
-            # kaitai parser; recover the (plaintext) main_record at fixed offsets
-            # so the tag still emits its data_type / dimensions / design value.
-            r = _rxgeneric_plaintext_main(raw_rec)
-            if r is None or r.cip_type not in (0x6B, 0x68):
-                _nm = io_name or results[0][0]
-                return Tag(
-                    _nm, _nm, tag_type, None if alias_for else "",
-                    None, external_access, constant, None, 0, [],
-                    alias_for=alias_for, _io=is_io,
-                    _opc_ua=_opc_ua, _class_attr=_cls_attr(),
-                )
-
-        if r.cip_type != 0x6B and r.cip_type != 0x68:
+        # A source-protected record's encrypted ext-attr tail defeats the
+        # kaitai parser; _parse_rec_tolerant recovers the (plaintext) main_record
+        # at fixed offsets so the tag still emits its data_type / dimensions /
+        # design value.
+        r = self._parse_rec_tolerant(raw_rec)
+        if r is None or r.cip_type not in (0x6B, 0x68):
             _nm = io_name or results[0][0]
             return Tag(
                 _nm, _nm, tag_type, None if alias_for else "",
@@ -2768,18 +2764,9 @@ class ParameterBuilder(L5xElementBuilder):
         # read cip/comment_id from the plaintext main_record so the description
         # lookup below still resolves. The decrypted ext blob always uses the
         # LONG-header usage layout regardless of the file's header family.
-        sp = False
-        try:
-            r = RxGeneric.from_bytes(raw_rec)
-            exts: Dict[int, bytes] = {
-                er.attribute_id: bytes(er.value) for er in r.extended_records
-            }
-        except Exception:
-            exts = CompsRecord.read_ext_attrs_from_record(raw_rec)
-            r = _rxgeneric_plaintext_main(raw_rec)
-            if not exts or r is None:
-                return Parameter(name, name, "Base", data_type, "Input", None, "false", "false", "Read/Write", None, dimensions)
-            sp = True
+        r, exts, sp = _parse_rec_and_exts(raw_rec)
+        if sp and (not exts or r is None):
+            return Parameter(name, name, "Base", data_type, "Input", None, "false", "false", "Read/Write", None, dimensions)
 
         ext01 = exts.get(0x01, b"")
         usage, required_b, visible_b = _aoi_tag_usage(ext01, short_header=False if sp else self._short_header)
@@ -2919,18 +2906,9 @@ class LocalTagBuilder(L5xElementBuilder):
         # correct ExternalAccess/Radix (read at fixed ext01 offsets, layout-
         # independent). The comment text is also encrypted on SP projects, so the
         # description lookup is skipped on this path (see below).
-        sp = False
-        try:
-            r = RxGeneric.from_bytes(raw_rec)
-            exts: Dict[int, bytes] = {
-                er.attribute_id: bytes(er.value) for er in r.extended_records
-            }
-        except Exception:
-            exts = CompsRecord.read_ext_attrs_from_record(raw_rec)
-            r = _rxgeneric_plaintext_main(raw_rec)
-            if not exts or r is None:
-                return LocalTag(name, name, data_type, dimensions, None, "Read/Write")
-            sp = True
+        r, exts, sp = _parse_rec_and_exts(raw_rec)
+        if sp and (not exts or r is None):
+            return LocalTag(name, name, data_type, dimensions, None, "Read/Write")
 
         ext01 = exts.get(0x01, b"")
         if len(ext01) > 0x21F:
