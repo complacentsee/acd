@@ -569,12 +569,13 @@ class CompsRecord:
                 return None
 
             cur.execute(
-                "SELECT record FROM comps_full WHERE object_id=?", (dti,)
+                "SELECT record FROM comps WHERE object_id=?", (dti,)
             )
             brow = cur.fetchone()
             if not brow or brow[0] is None:
                 return None
-            attrs = CompsRecord.read_value_attrs(bytes(brow[0]), short_header)
+            attrs = CompsRecord.read_value_attrs(bytes(brow[0]), short_header,
+                                                 body_mode=True)
             return attrs.get(0x66)
         except Exception:
             return None

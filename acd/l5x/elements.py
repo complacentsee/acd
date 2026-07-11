@@ -2214,23 +2214,23 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
     def _read_tag_value(self, data_table_instance: int):
         """Return (value_bytes, type_code) for a tag's design value, or (None, 0).
 
-        Resolves the cip-0x6a backing via data_table_instance, reads its FULL
-        stream payload from the comps_full side table (the deduped comps `record`
-        column is the TRUNCATED FafaComps buffer and cuts off ext attr 0x66), and
-        decodes attr 0x66. Best-effort: any failure yields (None, 0) so the Tag
-        keeps today's zero-placeholder <Data>.
+        Resolves the cip-0x6a backing via data_table_instance and decodes its
+        ext attr 0x66 from the size-eos comps record body. Best-effort: any
+        failure yields (None, 0) so the Tag keeps today's zero-placeholder
+        <Data>.
         """
         try:
             if not data_table_instance:
                 return None, 0
             self._cur.execute(
-                "SELECT record FROM comps_full WHERE object_id=?",
+                "SELECT record FROM comps WHERE object_id=?",
                 (data_table_instance,),
             )
             row = self._cur.fetchone()
             if not row or row[0] is None:
                 return None, 0
-            res = CompsRecord.read_tag_value(bytes(row[0]), self._short_header)
+            res = CompsRecord.read_tag_value(bytes(row[0]), self._short_header,
+                                             body_mode=True)
             if res is None:
                 return None, 0
             return res
