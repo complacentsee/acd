@@ -5740,11 +5740,14 @@ class ControllerBuilder(L5xElementBuilder):
                 _complete = bool(_axis_tags)
                 for _at in _axis_tags:
                     _arow = self._cur.execute(
-                        "SELECT record FROM comps_full WHERE object_id=?",
+                        "SELECT record FROM comps WHERE object_id=?",
                         (_at._data_table_instance,)).fetchone()
                     _buf = bytes(_arow[0]) if _arow and _arow[0] else b""
-                    _cand = (struct.unpack_from("<I", _buf, 250)[0]
-                             if len(_buf) >= 254 else None)
+                    # Body-relative rebase of the full-payload offset 250:
+                    # guarded `not short_header`, so the long header (148) is
+                    # the only offset in play -- 250-148 = 102.
+                    _cand = (struct.unpack_from("<I", _buf, 102)[0]
+                             if len(_buf) >= 106 else None)
                     if _cand in _known:
                         _resolved.add(_cand)
                     else:
