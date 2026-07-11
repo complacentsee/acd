@@ -5543,7 +5543,7 @@ class ControllerBuilder(L5xElementBuilder):
             # built once and shared.
             conn_decode = _build_connection_map(self._cur, self._short_header)
             cfg_mr28, cfg_cid, cfg_pool = _build_config_holders(self._cur)
-            rxdata_by_cid = _build_rxdata_holders(self._cur)
+            rxdata_by_cid = _build_rxdata_holders(self._cur, self._short_header)
             modules = []
             for _, mod_oid, _ in mod_rows:
                 modules.append(

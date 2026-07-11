@@ -585,7 +585,8 @@ def _module_identity_e1(cur, object_id: int, raw_rec: bytes,
     return e1, comment_id, source
 
 
-def _build_rxdata_holders(cur) -> "Dict[int, List[Tuple[int, bytes]]]":
+def _build_rxdata_holders(cur, short_header: bool = False
+                          ) -> "Dict[int, List[Tuple[int, bytes]]]":
     """Ordered RxDataCollection child index, keyed by comment-id link.
 
     Every module points at its backing hash-named RxDataCollection child by
@@ -598,17 +599,32 @@ def _build_rxdata_holders(cur) -> "Dict[int, List[Tuple[int, bytes]]]":
     walks ALL same-cid children until one yields its payload, so dropping
     ambiguous keys would forfeit recoveries. Children too short to carry the
     link (< 14 bytes) can never match and are skipped.
+
+    On a LONG-header project each child's ``raw`` is bounded to its DECLARED
+    record length (the u32 at the full-payload offset 0, minus the 148-byte
+    long header), so the raw-tail scans above (<public>/<UDCN>/<CF>, which read
+    to the buffer end) see only the primary record and never the appended
+    sub-blobs a size-eos comps buffer would expose. This is a no-op on the
+    still-truncated buffer (bound == len) and reconstructs it exactly once the
+    buffer is un-truncated; short-header records are already size-eos and carry
+    no separate truncation, so they are left as-is.
     """
     holders: Dict[int, List[Tuple[int, bytes]]] = {}
     cur.execute("SELECT object_id FROM comps WHERE comp_name='RxDataCollection'")
     coll_oids = [r[0] for r in cur.fetchall()]
     for coll_oid in coll_oids:
         cur.execute(
-            "SELECT object_id, record FROM comps WHERE parent_id=?", (coll_oid,))
-        for child_oid, raw in cur.fetchall():
+            "SELECT c.object_id, c.record, substr(cf.record, 1, 4) "
+            "FROM comps c LEFT JOIN comps_full cf ON c.object_id = cf.object_id "
+            "WHERE c.parent_id=?", (coll_oid,))
+        for child_oid, raw, len_bytes in cur.fetchall():
             raw = bytes(raw) if raw else b""
             if len(raw) < 14:
                 continue
+            if not short_header and len_bytes is not None and len(len_bytes) == 4:
+                body_len = int.from_bytes(bytes(len_bytes), "little") - 148
+                if 0 < body_len < len(raw):
+                    raw = raw[:body_len]
             cid = int.from_bytes(raw[12:14], "little")
             holders.setdefault(cid, []).append((child_oid, raw))
     return holders
