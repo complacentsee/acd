@@ -5497,7 +5497,16 @@ class ControllerBuilder(L5xElementBuilder):
                 + str(coll_oid)
                 + " ORDER BY seq_number"
             )
-            mod_rows = self._cur.fetchall()
+            # Drop dead-relic (FDFD-only) device children BEFORE either pass. These
+            # are deleted-module ghosts Studio never exports (e.g. PROJ_H's six
+            # UC_FAN_A fans, whose live 193-ECM-ETR twins we already emit in full).
+            # Filtering the source list keeps a ghost from BOTH emitting a spurious
+            # <Module> AND writing modid_to_name/modid_to_oid unconditionally below
+            # (a realigned ghost body could otherwise clobber a live module's modid
+            # mapping -> ParentModule / :C ConfigTag cascade). Long-header only;
+            # its own gauntlet (P6.9 C4). Hard prerequisite of the FDFD flip (C5).
+            _dead = CompsRecord.dead_oids(self._cur, self._short_header)
+            mod_rows = [r for r in self._cur.fetchall() if r[1] not in _dead]
 
             # First pass: build modid→name map so child modules can resolve their
             # parent name. Identity resolution runs the shared recovery chain
