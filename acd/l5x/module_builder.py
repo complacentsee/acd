@@ -1476,13 +1476,14 @@ class ModuleBuilder(L5xElementBuilder):
         # and the script are not mutually exclusive); the ConfigData fallback stays
         # gated on config_inner (mutually exclusive with ConfigTag).
         if configscript is None or (config_inner is None and configdata is None):
-            # Stays on the raw comps_full path: reads full=False (not full_attrs).
+            # Reads full=False (not record_attrs) deliberately.
             self._cur.execute(
-                "SELECT record FROM comps_full WHERE object_id=?", (self._object_id,))
+                "SELECT record FROM comps WHERE object_id=?", (self._object_id,))
             _mr = self._cur.fetchone()
             if _mr:
                 try:
-                    _ma = CompsRecord.read_value_attrs(bytes(_mr[0]), self._short_header)
+                    _ma = CompsRecord.read_value_attrs(bytes(_mr[0]), self._short_header,
+                                                       body_mode=True)
                 except Exception:
                     _ma = {}
                 # The 0x13e fallback is a speculative recovery, used only when the

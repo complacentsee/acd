@@ -5172,7 +5172,7 @@ class ControllerBuilder(L5xElementBuilder):
         # self-gates via force_pool and so needs no flag.)
         _forces_installed = False
         try:
-            _ca = CompsRecord.full_attrs(
+            _ca = CompsRecord.record_attrs(
                 self._cur, self._object_id, self._short_header)
             _forces_installed = len(_ca.get(0x1, b"")) in (62, 70)
         except Exception:
@@ -5235,7 +5235,7 @@ class ControllerBuilder(L5xElementBuilder):
                 # the <ForceData>.
                 if tag._value_bytes:
                     self._cur.execute(
-                        "SELECT record FROM comps_full WHERE object_id=?",
+                        "SELECT record FROM comps WHERE object_id=?",
                         (_tag_object_id,),
                     )
                     _fr = self._cur.fetchone()
@@ -5247,7 +5247,8 @@ class ControllerBuilder(L5xElementBuilder):
                             # idle force allocation every tag carries, which would
                             # over-emit on unforced tags, so deliberately do NOT use it.
                             _fv = CompsRecord.read_value_attrs(
-                                _frb, self._short_header).get(0x6B)
+                                _frb, self._short_header,
+                                body_mode=True).get(0x6B)
                         except Exception:
                             _fv = None
                         if _fv and len(_fv) == 4:
@@ -5268,19 +5269,21 @@ class ControllerBuilder(L5xElementBuilder):
                             # -- structurally identical -- never over-emits.
                             try:
                                 _fp = CompsRecord.read_value_attrs(
-                                    _frb, self._short_header, full=True).get(0x6B)
+                                    _frb, self._short_header, full=True,
+                                    body_mode=True).get(0x6B)
                             except Exception:
                                 _fp = None
                             if _fp and len(_fp) == 4:
                                 self._cur.execute(
-                                    "SELECT record FROM comps_full WHERE object_id=?",
+                                    "SELECT record FROM comps WHERE object_id=?",
                                     (struct.unpack("<I", _fp)[0],),
                                 )
                                 _hr = self._cur.fetchone()
                                 if _hr:
                                     try:
                                         _ha = CompsRecord.read_value_attrs(
-                                            bytes(_hr[0]), self._short_header, full=True)
+                                            bytes(_hr[0]), self._short_header,
+                                            full=True, body_mode=True)
                                     except Exception:
                                         _ha = {}
                                     _h1 = _ha.get(0x1, b"")
