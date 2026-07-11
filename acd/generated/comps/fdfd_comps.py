@@ -20,7 +20,7 @@ class FdfdComps(KaitaiStruct):
         self._raw_header = self._io.read_bytes(155)
         _io__raw_header = KaitaiStream(BytesIO(self._raw_header))
         self.header = FdfdComps.Header(_io__raw_header, self, self._root)
-        self.record_buffer = self._io.read_bytes((self.record_length - 155) - 8)
+        self.record_buffer = self._io.read_bytes_full()
 
 
     def _fetch_instances(self):

@@ -8,7 +8,7 @@ seq:
     type: header
     size: 155
   - id: record_buffer
-    size: record_length - 155 - 8
+    size-eos: true
 types:
   header:
     instances:

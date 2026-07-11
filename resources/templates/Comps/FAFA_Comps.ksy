@@ -10,7 +10,7 @@ seq:
     type: header
     size: 144
   - id: record_buffer
-    size: record_length - 144 - 4
+    size-eos: true
 types:
   header:
      instances:
