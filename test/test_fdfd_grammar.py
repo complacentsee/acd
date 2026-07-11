@@ -71,3 +71,31 @@ def test_compsrecord_parse_returns_body_at_148():
                           record=SimpleNamespace(record_buffer=payload))
     t = CompsRecord.parse(dat, short_header=False)
     assert t == (0xAABBCCDD, 0x11223344, "P", 7, 512, body)
+
+
+def test_d11_record_attrs_equals_full_attrs_on_fdfd_controller_child():
+    """P6.9 C7 pin: the body-direct read controller_ports now uses agrees with
+    the comps_full read for an FDFD-winner controller child -- true ONLY because
+    C5 aligned comps.record to full[148:]. Pre-C5 record_attrs read at 155 and
+    returned a garbage key. Uses the ACDTestsEmptyRedundant fixture whose
+    EthernetPort1 (oid 1493048019) is an FDFD-long winner."""
+    import os
+    import tempfile
+    from acd.l5x.export_l5x import ExportL5x
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    acd = os.path.join(here, os.pardir, "resources",
+                       "ACDTestsEmptyRedundant.ACD")
+    exp = ExportL5x(acd, tempfile.mkdtemp())
+    try:
+        cur = exp._cur
+        oid = 1493048019
+        fam = cur.execute(
+            "SELECT winner_family, fafa_seen FROM comps_family "
+            "WHERE object_id=?", (oid,)).fetchone()
+        assert fam == (FDFD, 0), f"expected FDFD-winner relic, got {fam}"
+        ra = CompsRecord.record_attrs(cur, oid, False)
+        fa = CompsRecord.full_attrs(cur, oid, False)
+        assert ra == fa and ra.get(0x1) is not None and len(ra[0x1]) == 178
+    finally:
+        exp.close()

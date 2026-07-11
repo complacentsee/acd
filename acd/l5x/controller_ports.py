@@ -56,7 +56,13 @@ def _attrs(cur: Cursor, controller_oid: int, name: str,
     oid = _rcc_child(cur, controller_oid, name)
     if oid is None:
         return None
-    return CompsRecord.full_attrs(cur, oid, short_header)
+    # Body-direct read of comps.record (D11). Valid since the P6.9 C5 flip made
+    # comps.record == full[148:] for BOTH long-header families, so record_attrs
+    # equals full_attrs even for an FDFD-winner controller child (verified on
+    # ACDTestsEmptyRedundant EthernetPort oid 1493048019). No in-pool FDFD winner
+    # sits under RxControllerCollection, so the fixture pins are the regression
+    # gate, not the pool gauntlet.
+    return CompsRecord.record_attrs(cur, oid, short_header)
 
 
 def build_comm_ports(cur: Cursor, controller_oid: int,

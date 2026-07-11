@@ -91,9 +91,16 @@ WITHAOI_EXACT = [
     "Trends",
     "DataLogs",
     "TimeSynchronize",
+    # EthernetPorts is a byte-exact pin (P6.9 C7). Its EthernetPort is an
+    # FDFD-winner controller child (oid 1493048019, fafa_seen=0); controller_ports
+    # reads it body-direct via record_attrs, which equals full_attrs only because
+    # the C5 flip aligned comps.record to full[148:]. Pinning it exact turns a
+    # silent D11@155 regression (or a revert of C5) into a test failure -- the
+    # pool gauntlet cannot, since no in-pool FDFD winner sits under the controller.
+    "EthernetPorts",
 ]
 # Subtrees entirely missing from our export (probe-only, not implemented):
-WITHAOI_KNOWN_MISSING_SUBTREES = {"EthernetPorts"}
+WITHAOI_KNOWN_MISSING_SUBTREES = set()
 # Subtrees with documented content gaps (compared member-by-member instead):
 #   AddOnInstructionDefinitions -- extra LocalTag DefaultData, missing NOP rung
 WITHAOI_KNOWN_DIFF_SUBTREES = {"DataTypes", "AddOnInstructionDefinitions",
