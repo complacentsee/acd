@@ -6,10 +6,10 @@ topology; ``_render_message_data`` is the single entry point.
 """
 import html
 import re
-import struct
 import xml.etree.ElementTree as ET
 from typing import Dict
 
+from acd.generated.comps.message_config import MessageConfig
 from acd.record.comps import CompsRecord
 
 
@@ -252,10 +252,13 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count, modu
         a1 = attrs.get(0x1)
         if not a1 or len(a1) != 354:
             return None
-        fam = a1[353]
+        # The exact-354 gate above guarantees every MessageConfig field is
+        # present (the grammar's size guards exist for robustness only).
+        mc = MessageConfig.from_bytes(a1)
+        fam = mc.family
         # MessageType family is the struct-trailer byte 353; the sub-type is the
         # service byte 330 (the low byte of the CIP setup struct's ServiceCode).
-        svc = a1[330]
+        svc = mc.service_byte
         if fam == 1:
             mt = "CIP Generic"
         elif fam == 2:
@@ -273,10 +276,9 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count, modu
             mt = None
         if mt is None:
             return None
-        req = struct.unpack_from("<H", a1, 139)[0]
-        cf = a1[143]
-        ps = struct.unpack_from("<H", a1, 144)[0]
-        epath = a1[146:146 + ps] if 0 < ps < 250 and 146 + ps <= len(a1) else b""
+        req = mc.requested_length
+        cf = mc.connected_flag
+        epath = mc.epath if mc.epath is not None else b""
         has_cp = bool(epath)
         cp = None
         if has_cp:
@@ -295,14 +297,13 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count, modu
                 P.append(("ConnectionPath", cp))
 
         if mt == "CIP Generic":
-            svc2, obj, tgt, attrn = struct.unpack_from("<HHIH", a1, 330)
             P += [("RequestedLength", str(req)), ("ConnectedFlag", str(cf))]
             add_cp()
             P += [("CommTypeCode", "0"),
-                  ("ServiceCode", "16#%04x" % svc2),
-                  ("ObjectType", "16#%04x" % obj),
-                  ("TargetObject", str(tgt)),
-                  ("AttributeNumber", "16#%04x" % attrn),
+                  ("ServiceCode", "16#%04x" % mc.service_code),
+                  ("ObjectType", "16#%04x" % mc.object_type),
+                  ("TargetObject", str(mc.target_object)),
+                  ("AttributeNumber", "16#%04x" % mc.attribute_number),
                   ("LocalIndex", "0")]
             if le:
                 P.append(("LocalElement", le))
@@ -310,7 +311,7 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count, modu
                 P.append(("DestinationTag", dt))
             if cf == 1:
                 P.append(("CacheConnections", "TRUE"))
-            lpu = "true" if (len(a1) > 281 and (a1[281] & 0x02)) else "false"
+            lpu = "true" if (mc.large_packet_flags & 0x02) else "false"
             P.append(("LargePacketUsage", lpu))
         elif mt in ("CIP Data Table Read", "CIP Data Table Write"):
             if re_el is None or le is None:

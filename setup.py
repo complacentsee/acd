@@ -144,6 +144,19 @@ class install(_install):
                 "resources/templates/Comps/MemberDescriptor.ksy",
             ]
         )
+        print("Compiling Comps/MessageConfig.ksy")
+        subprocess.run(
+            [
+                kaitai_compiler_executable,
+                "-t",
+                "python",
+                "--outdir",
+                "acd/generated/comps/",
+                "--python-package",
+                "acd.generated.comps",
+                "resources/templates/Comps/MessageConfig.ksy",
+            ]
+        )
         _install.run(self)
         print("--------------------------------------------------------------------")
 
