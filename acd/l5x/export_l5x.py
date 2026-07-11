@@ -42,6 +42,70 @@ def detect_acd_version(acd_filename: os.PathLike) -> Optional[str]:
     return matches[-1] if matches else None
 
 
+_FAFA_IDENTIFIER = 64250  # 0xFAFA stream identifier
+_FDFD_IDENTIFIER = 65021  # 0xFDFD stream identifier
+
+
+def _walk_comps_records(records, short_header: bool):
+    """Dedup walk over the Comps.Dat stream records.
+
+    Returns ``(comps_by_id, full_by_id, winner_family, fafa_seen_ids)``:
+      comps_by_id    oid -> parsed tuple of the dedup winner
+      full_by_id     oid -> LARGEST full stream payload for that oid
+      winner_family  oid -> stream identifier (0xFAFA/0xFDFD) of the winner
+      fafa_seen_ids  oids with >=1 FAFA-family record. A component is
+                     export-live only if a FAFA primary exists for it: an
+                     FDFD-only oid is a deleted relic Studio never exports
+                     (measured pool-wide: FDFD wins zero dual-family dedups
+                     and no FDFD-only oid appears in any OEM export).
+    """
+    comps_by_id = {}
+    comps_len_by_id: Dict[int, int] = {}   # oid -> winning dedup length
+    # Side map object_id -> FULL stream payload (record.record.record_buffer,
+    # = len_record-6, untruncated). The deduped comps `record` column stores
+    # the TRUNCATED FafaComps.record_buffer (long-header) which cuts off the
+    # tail where a tag value backing's ext attr 0x66 lives; the value reader
+    # (Step 6b) needs the full payload. Keep the LARGEST full payload per id.
+    full_by_id: Dict[int, bytes] = {}
+    winner_family: Dict[int, int] = {}
+    fafa_seen_ids: set = set()
+    for record in records:
+        # An anomalous comps record can run its name/StrzUtf16 field past the
+        # buffer end (kaitai read_u2le EOF) and raise inside parse; skip the
+        # bad record rather than aborting the whole export (mirrors the guarded
+        # full-payload read just below).
+        try:
+            t = CompsRecord.parse(record, short_header)
+        except Exception:  # noqa: BLE001
+            continue
+        if t is not None:
+            oid = t[0]
+            if record.identifier == _FAFA_IDENTIFIER:
+                fafa_seen_ids.add(oid)
+            try:
+                full = bytes(record.record.record_buffer)
+            except Exception:  # noqa: BLE001
+                full = None
+            # Dedup both maps on the FULL stream-payload length
+            # (record.record.record_buffer, untruncated), NOT len(t[5]): the
+            # latter is the TRUNCATED FafaComps.record_buffer today but
+            # becomes the whole size-eos body after the P6.7a un-truncation,
+            # so keying on it lets the kept duplicate flip once payload length
+            # != record_length-148. The full payload length is what the flip
+            # cannot change, and it picks the SAME winner as len(t[5]) across
+            # all 14,804 duplicated oids pool-wide (verified). Declared
+            # record_length@0 is NOT usable here -- it is 0 on FDFD records.
+            dedup_len = len(full) if full is not None else len(t[5])
+            if oid not in comps_by_id or dedup_len > comps_len_by_id[oid]:
+                comps_by_id[oid] = t
+                comps_len_by_id[oid] = dedup_len
+                winner_family[oid] = record.identifier
+            if full is not None and (
+                    oid not in full_by_id or len(full) > len(full_by_id[oid])):
+                full_by_id[oid] = full
+    return comps_by_id, full_by_id, winner_family, fafa_seen_ids
+
+
 @dataclass
 class ExportL5x:
     input_filename: os.PathLike
@@ -188,45 +252,8 @@ class ExportL5x:
             "SHORT(<=V21)" if self._comps_short_header else "LONG(V24+)",
         )
 
-        comps_by_id = {}
-        comps_len_by_id: Dict[int, int] = {}   # oid -> winning dedup length
-        # Side map object_id -> FULL stream payload (record.record.record_buffer,
-        # = len_record-6, untruncated). The deduped comps `record` column stores
-        # the TRUNCATED FafaComps.record_buffer (long-header) which cuts off the
-        # tail where a tag value backing's ext attr 0x66 lives; the value reader
-        # (Step 6b) needs the full payload. Keep the LARGEST full payload per id.
-        full_by_id: Dict[int, bytes] = {}
-        for record in comps_db.records.record:
-            # An anomalous comps record can run its name/StrzUtf16 field past the
-            # buffer end (kaitai read_u2le EOF) and raise inside parse; skip the
-            # bad record rather than aborting the whole export (mirrors the guarded
-            # full-payload read just below).
-            try:
-                t = CompsRecord.parse(record, self._comps_short_header)
-            except Exception:  # noqa: BLE001
-                continue
-            if t is not None:
-                oid = t[0]
-                try:
-                    full = bytes(record.record.record_buffer)
-                except Exception:  # noqa: BLE001
-                    full = None
-                # Dedup both maps on the FULL stream-payload length
-                # (record.record.record_buffer, untruncated), NOT len(t[5]): the
-                # latter is the TRUNCATED FafaComps.record_buffer today but
-                # becomes the whole size-eos body after the P6.7a un-truncation,
-                # so keying on it lets the kept duplicate flip once payload length
-                # != record_length-148. The full payload length is what the flip
-                # cannot change, and it picks the SAME winner as len(t[5]) across
-                # all 14,804 duplicated oids pool-wide (verified). Declared
-                # record_length@0 is NOT usable here -- it is 0 on FDFD records.
-                dedup_len = len(full) if full is not None else len(t[5])
-                if oid not in comps_by_id or dedup_len > comps_len_by_id[oid]:
-                    comps_by_id[oid] = t
-                    comps_len_by_id[oid] = dedup_len
-                if full is not None and (
-                        oid not in full_by_id or len(full) > len(full_by_id[oid])):
-                    full_by_id[oid] = full
+        comps_by_id, full_by_id, winner_family, fafa_seen_ids = \
+            _walk_comps_records(comps_db.records.record, self._comps_short_header)
         self._cur.executemany("INSERT INTO comps VALUES (?,?,?,?,?,?)", comps_by_id.values())
 
         # Collision-safe operand-comment keying (long-header). An operand comment
@@ -308,6 +335,20 @@ class ExportL5x:
         )
         self._cur.executemany(
             "INSERT INTO comps_full VALUES (?,?)", full_by_id.items()
+        )
+
+        # Per-oid header-family side table. fafa_seen is the liveness signal
+        # (see _walk_comps_records); winner_family is the stream identifier of
+        # the deduped comps row, for consumers that must know which grammar
+        # produced the kept body.
+        self._cur.execute(
+            "CREATE TABLE comps_family(object_id INTEGER PRIMARY KEY,"
+            " winner_family INTEGER, fafa_seen INTEGER)"
+        )
+        self._cur.executemany(
+            "INSERT INTO comps_family VALUES (?,?,?)",
+            [(oid, winner_family[oid], 1 if oid in fafa_seen_ids else 0)
+             for oid in comps_by_id],
         )
         self._db.commit()
 
