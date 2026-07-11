@@ -3770,57 +3770,79 @@ def _render_alarm_digital_data(cur, short_header, dti):
         return None
 
 
-# A source-protected AOI is exported by Studio as an <EncodedData> blob, never a
-# plaintext <AddOnInstructionDefinition>; our decoder would emit a spurious plaintext
-# definition (element_extra). The protection state lives in the AOI definition comp
-# (record_type=256 under RxUDIDefinitionCollection): the long key-bearing layout
-# (len 525) holds a 16-byte protection-key hash at offset 362 -- a fixed sentinel
-# for unprotected AOIs, a per-license hash (e.g. an OEM's source-protection key) when
-# protected; the V32 wholesale-encrypted layout (len 450) is always protected.
-# Validated pool-wide: 0 false positives (every kept AOI is len!=450 and, when 525,
-# carries the sentinel). A few Rockwell library seals (PackMLv3) are byte-identical to
-# unprotected AOIs here and are NOT detectable -- a known floor.
+# A source-protected AOI/ROUTINE is exported by Studio as an <EncodedData> blob
+# (EncodedType "AddOnInstructionDefinition"/"Routine") rather than the plaintext
+# element; in faithful mode our decoder must suppress the definition it recovers,
+# or it over-emits (element_extra). The per-definition protection state lives in
+# the definition's comps record (AOI: record_type 256 under
+# RxUDIDefinitionCollection; routine: under RxRoutineCollection) in two layouts,
+# and is decided STRUCTURALLY so the verdict is independent of where the comps
+# record buffer is truncated (the size-eos un-truncation only appends bytes past
+# the tail; every field read here sits early in the record).
+#
+#   * Encrypted-tail layout (V21 source-protected-at-rest): the ext-attr tail is
+#     AES-encrypted and its plaintext count at body+78 is replaced by _SP_MARKER.
+#     The 6 bytes at marker+14 flag a genuinely protected definition
+#     (00 00 01 00 10 00) versus a plaintext-at-rest look-alike whose rungs Studio
+#     re-decrypts and exports as plaintext (00 00 00 07 ..) -- the
+#     AreaD/VendorE/AreaA/AreaB/AreaC files, never suppressed.
+#   * Plaintext key-bearing layout: a security-descriptor block inside ext-attr
+#     0x1 carries a 16-byte protection-key hash -- a real per-license hash when
+#     protected, the fixed no-protection sentinel when source-protection is
+#     enabled-but-off, and all-zero (or absent, on a definition layout without
+#     source-protection support) otherwise. The block sits at a fixed offset
+#     within attr 0x1 regardless of the attribute's order in the record.
+#
+# Validated 0-FP/0-FN pool-wide by differential execution against the previous
+# length-keyed detectors over all 588 AOI + 6,680 routine definition records, on
+# both the truncated comps buffer and the untruncated comps_full buffer (1,074
+# protected; zero verdict differences either way). A few Rockwell library seals
+# (PackMLv3) are byte-identical to unprotected definitions and are NOT detectable
+# -- a known floor.
 _AOI_NO_PROTECTION_HASH = bytes.fromhex("4d53d3ff6f158fc1cbf49bcdc8d2f9a7")
+_SP_MARKER_OFF = 78                                # SP-at-rest marker at body+78
+_SP_PROTECTED_FLAG = bytes.fromhex("000001001000")  # marker+14..+20 -> protected
+_AOI_KEYHASH_OFF = 272   # protection-key hash offset within ext-attr 0x1 (AOI)
+_RT_KEYHASH_OFF = 202    # ... and for a routine definition record
+_SP_ZERO_HASH = b"\x00" * 16
+
+
+def _ext_attr01(rec: bytes):
+    """Return ext-attr 0x1's value from a plaintext RxGeneric body (the comps
+    ``record`` column), or None. Walks ``(u32 id, u32 len, bytes)`` records from
+    body+82 (past the 14B prelude + 60B main_record + len/count words)."""
+    pos, n = 82, len(rec)
+    while pos + 8 <= n:
+        attr_id = int.from_bytes(rec[pos:pos + 4], "little")
+        ln = int.from_bytes(rec[pos + 4:pos + 8], "little")
+        pos += 8
+        if ln < 0 or pos + ln > n:
+            break
+        if attr_id == 1:
+            return rec[pos:pos + ln]
+        pos += ln
+    return None
+
+
+def _definition_is_source_protected(rec: bytes, keyhash_off: int) -> bool:
+    """Structural source-protection test shared by AOI and routine definitions
+    (see the layout note above). ``keyhash_off`` is the family's protection-key
+    hash offset within ext-attr 0x1."""
+    if rec[_SP_MARKER_OFF:_SP_MARKER_OFF + 4] == _SP_MARKER:
+        return rec[_SP_MARKER_OFF + 14:_SP_MARKER_OFF + 20] == _SP_PROTECTED_FLAG
+    a1 = _ext_attr01(rec)
+    if a1 is None or len(a1) < keyhash_off + 16:
+        return False
+    key_hash = a1[keyhash_off:keyhash_off + 16]
+    return key_hash != _SP_ZERO_HASH and key_hash != _AOI_NO_PROTECTION_HASH
 
 
 def _aoi_is_source_protected(rec: bytes) -> bool:
-    n = len(rec)
-    if n == 450:
-        return True
-    if n == 525 and rec[362:378] != _AOI_NO_PROTECTION_HASH:
-        return True
-    return False
-
-
-# A source-protected ROUTINE is exported by Studio as <EncodedData EncodedType=
-# "Routine"> while our decoder recovers the plaintext (-> element_extra:Routine in
-# faithful mode). The per-routine protection signal lives in the routine's comps
-# record, in two layout families (validated 0-FP/0-FN over 601 protected routines
-# pool-wide). Family B (the V21 _SP_MARKER framing): the 2 bytes at marker+16
-# distinguish a genuinely source-protected routine (01 00) from a plaintext-at-rest
-# look-alike (00 07) whose rungs Studio re-decrypts and exports as plaintext (the
-# AreaD/VendorE/AreaA/AreaB/AreaC files -- never suppress those). Family A
-# (no marker): the unprotected record carries the no-protection sentinel; a protected
-# one carries a real key-hash instead (sentinel absent), in the standard 457-byte
-# record. Reuses _AOI_NO_PROTECTION_HASH and _SP_MARKER.
-_RT_SP_PROTECTED = bytes.fromhex("000001001000")   # marker+14 .. +20 -> protected
-_RT_SP_PLAINTEXT = bytes.fromhex("00000007")       # marker+14 .. +18 -> keep plaintext
+    return _definition_is_source_protected(rec, _AOI_KEYHASH_OFF)
 
 
 def _routine_is_source_protected(rec: bytes) -> bool:
-    i = rec.find(_SP_MARKER)
-    if i >= 0:
-        if rec[i + 14:i + 20] == _RT_SP_PROTECTED:
-            return True
-        if rec[i + 14:i + 18] == _RT_SP_PLAINTEXT:
-            return False
-        # Overhang fallback: ciphertext extends past the framed length -> protected.
-        plen = int.from_bytes(rec[i + 4:i + 6], "little") if len(rec) >= i + 6 else 0
-        ct_end = i + 18 + ((plen + 15) // 16) * 16
-        return len(rec) - ct_end > 0
-    if _AOI_NO_PROTECTION_HASH in rec:
-        return False
-    return len(rec) == 457
+    return _definition_is_source_protected(rec, _RT_KEYHASH_OFF)
 
 
 _ALARM_FALSE_BOOLS = (
