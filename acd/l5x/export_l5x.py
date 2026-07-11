@@ -256,6 +256,17 @@ class ExportL5x:
             _walk_comps_records(comps_db.records.record, self._comps_short_header)
         self._cur.executemany("INSERT INTO comps VALUES (?,?,?,?,?,?)", comps_by_id.values())
 
+        # Dead-relic (FDFD-only) oids to exclude from the cross-row derived tables
+        # below so those tables are FAFA-only and therefore INVARIANT to the FDFD
+        # body realignment (P6.9): a dead body's realigned bytes must not shift a
+        # comment key or set a project flag. Long-header only (empty on
+        # short-header, matching CompsRecord.dead_oids; short-header derivation is
+        # unchanged here and handled by C6). Built in-memory because comps_family
+        # is not persisted until below.
+        _dead_derived: frozenset = (
+            frozenset() if self._comps_short_header
+            else frozenset(set(comps_by_id) - fafa_seen_ids))
+
         # Collision-safe operand-comment keying (long-header). An operand comment
         # is keyed by parent == comment_id*0x10000 + cip_type, but that key is NOT
         # unique for every comp: cip-0x68 tags all carry a constant comment_id, and
@@ -267,7 +278,9 @@ class ExportL5x:
         # (RxGeneric prelude); read directly to avoid a full parse per comp.
         self._cur.execute("CREATE TABLE unique_comment_key(k INTEGER PRIMARY KEY)")
         _key_counts: Dict[int, int] = {}
-        for _t in comps_by_id.values():
+        for _oid, _t in comps_by_id.items():
+            if _oid in _dead_derived:
+                continue
             _rec = _t[5]
             if len(_rec) >= 14:
                 _cip = int.from_bytes(_rec[10:12], "little")
@@ -298,7 +311,9 @@ class ExportL5x:
             _major = 0
         _opc = 0
         _safety = 0
-        for _t in comps_by_id.values():
+        for _oid, _t in comps_by_id.items():
+            if _oid in _dead_derived:
+                continue
             _rec = _t[5]
             if len(_rec) < 14:
                 continue

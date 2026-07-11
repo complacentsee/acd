@@ -3551,6 +3551,10 @@ class AoiBuilder(L5xElementBuilder):
         parameters: List[Parameter] = []
         local_tags: List[LocalTag] = []
         routines: List[Routine] = []
+        # Dead-relic (FDFD-only) AOI children are deleted params/tags/routines
+        # Studio never exports; skip them in both enums below (P6.9). Defensive
+        # today (zero FDFD-only children under any live AOI subtree pool-wide).
+        dead = CompsRecord.dead_oids(self._cur, self._short_header)
 
         # --- Extract Parameters and LocalTags from RxTagCollection ---
         self._cur.execute(
@@ -3568,6 +3572,8 @@ class AoiBuilder(L5xElementBuilder):
                 + " ORDER BY seq_number"
             )
             for child_oid, child_rec in self._cur.fetchall():
+                if child_oid in dead:
+                    continue
                 child_rec = bytes(child_rec)
                 # Determine whether this is a parameter or a local tag from the
                 # AOI tag usage (Input/Output/InOut -> parameter; Local -> local
@@ -3652,6 +3658,8 @@ class AoiBuilder(L5xElementBuilder):
                 "SELECT object_id FROM comps WHERE parent_id=" + str(routine_coll_oid)
             )
             for (child_oid,) in self._cur.fetchall():
+                if child_oid in dead:
+                    continue
                 try:
                     routines.append(RoutineBuilder(
                         self._cur, child_oid,
@@ -4368,8 +4376,14 @@ class ProgramBuilder(L5xElementBuilder):
             )
             routine_results = self._cur.fetchall()
 
+        dead = CompsRecord.dead_oids(self._cur, self._short_header)
         routines = []
         for child in routine_results:
+            # A dead-relic (FDFD-only) routine is a deleted routine Studio never
+            # exports; skip it (P6.9). This is the visible C3 win: PROJ_H's SPARE/
+            # Spare2 programs carry such relics we currently over-emit.
+            if child[1] in dead:
+                continue
             # In faithful mode, a source-protected routine is exported by Studio as
             # <EncodedData>, not a plaintext <Routine>; skip it (the keyed ciphertext
             # is unrecoverable -> under-emit rather than fabricate). Recovery mode
@@ -4401,6 +4415,8 @@ class ProgramBuilder(L5xElementBuilder):
                 if self._short_header and len(prog_record) >= 14 else 0
             )
             for result in self._cur.fetchall():
+                if result[1] in dead:  # dead-relic (FDFD-only) tag -> skip (P6.9)
+                    continue
                 _tb = TagBuilder(self._cur, result[1], _short_header=self._short_header,
                                  _acd_major=self._acd_major, _program_cid=_prog_cid,
                                  _taginfo_layout=self._taginfo_layout)
@@ -5049,6 +5065,10 @@ class ControllerBuilder(L5xElementBuilder):
             + str(_data_type_id)
         )
         results = self._cur.fetchall()
+        # Dead-relic (FDFD-only) datatype children -- e.g. the
+        # ZZZ_TEMPORARY_IMPORT_DATATYPE_NAME import leftovers -- are deleted
+        # types Studio never exports; skip them below (P6.9).
+        dead = CompsRecord.dead_oids(self._cur, self._short_header)
 
         # Names of add-on-instruction definitions: these own datatype records too,
         # but the OEM L5X emits them only as AddOnInstructionDefinitions, never as
@@ -5063,11 +5083,11 @@ class ControllerBuilder(L5xElementBuilder):
         _aoi_coll_row = self._cur.fetchone()
         if _aoi_coll_row is not None:
             self._cur.execute(
-                "SELECT comp_name FROM comps WHERE parent_id="
+                "SELECT object_id, comp_name FROM comps WHERE parent_id="
                 + str(_aoi_coll_row[0])
                 + " AND record_type=256"
             )
-            aoi_names = {row[0] for row in self._cur.fetchall()}
+            aoi_names = {nm for oid, nm in self._cur.fetchall() if oid not in dead}
 
         data_types: List[DataType] = []
         # all_data_types_map includes ProductDefined types (excluded from L5X output but
@@ -5075,6 +5095,8 @@ class ControllerBuilder(L5xElementBuilder):
         all_data_types_map: Dict[str, DataType] = {}
         for result in results:
             _data_type_object_id = result[1]
+            if _data_type_object_id in dead:
+                continue
             dt = DataTypeBuilder(
                 self._cur, _data_type_object_id, _short_header=self._short_header
             ).build()
@@ -5202,8 +5224,11 @@ class ControllerBuilder(L5xElementBuilder):
             )
         except Exception:
             short_routine_desc = {}
+        dead = CompsRecord.dead_oids(self._cur, self._short_header)
         for result in results:
             _tag_object_id = result[1]
+            if _tag_object_id in dead:  # dead-relic (FDFD-only) tag -> skip (P6.9)
+                continue
             _tb = TagBuilder(self._cur, _tag_object_id, _short_header=self._short_header,
                              _acd_major=self._acd_major,
                              _taginfo_layout=self._taginfo_layout)
@@ -5403,7 +5428,10 @@ class ControllerBuilder(L5xElementBuilder):
                 + str(_task_collection_object_id)
                 + " AND record_type=256"
             )
+            dead = CompsRecord.dead_oids(self._cur, self._short_header)
             for task_result in self._cur.fetchall():
+                if task_result[1] in dead:  # dead-relic task -> skip (P6.9)
+                    continue
                 tasks.append(TaskBuilder(
                     self._cur, task_result[1],
                     _short_header=self._short_header).build(comment_id_to_program))
@@ -5426,8 +5454,14 @@ class ControllerBuilder(L5xElementBuilder):
             + " AND record_type=256"
         )
         results = self._cur.fetchall()
+        dead = CompsRecord.dead_oids(self._cur, self._short_header)
         aois: List[AOI] = []
         for result in results:
+            # A dead-relic (FDFD-only) AOI definition is a deleted AOI Studio never
+            # exports; skip it (P6.9). This is the top-level AOI-definition enum
+            # (distinct from AoiBuilder's internal tag/routine child enums).
+            if result[1] in dead:
+                continue
             # In faithful mode, a source-protected AOI is exported by Studio as an
             # <EncodedData> blob, not a plaintext <AddOnInstructionDefinition>; skip
             # it (the keyed ciphertext OEM emits is unrecoverable -> under-emit rather
