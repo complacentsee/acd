@@ -3743,7 +3743,7 @@ def _render_alarm_digital_data(cur, short_header, dti):
     try:
         if not dti:
             return None
-        e1 = CompsRecord.full_attrs(cur, dti, short_header).get(0x01, b"")
+        e1 = CompsRecord.record_attrs(cur, dti, short_header).get(0x01, b"")
         if len(e1) < 153:
             return None
         flags = struct.unpack_from("<I", e1, 141)[0]
@@ -3937,7 +3937,7 @@ def _build_alarm_conditions(cur, short_header):
             name = rec[0x5c:0x5c + nlen].decode("ascii")
             ctlen = struct.unpack_from("<H", rec, 0x84)[0]
             ct = rec[0x86:0x86 + ctlen].decode("ascii")
-            attrs = CompsRecord.full_attrs(cur, oid, short_header)
+            attrs = CompsRecord.record_attrs(cur, oid, short_header)
             in_s = attrs.get(0x6a, b"").decode("utf-16-le", errors="ignore").split("\x00")[0]
             inp, owner_oid, owner_name = _resolve_alarm_hex(in_s, oid2name)
             if owner_name and inp.startswith(owner_name):
@@ -4187,7 +4187,7 @@ def _alarm_definitions_xml(cur, short_header):
         nm = rec[0x5c:0x5c + nlen].decode("ascii", "replace")
         ctlen = struct.unpack_from("<H", rec, 0x84)[0]
         ct = rec[0x86:0x86 + ctlen].decode("ascii", "replace")
-        attrs = CompsRecord.full_attrs(cur, oid, short_header)
+        attrs = CompsRecord.record_attrs(cur, oid, short_header)
         ins = attrs.get(0x6a, b"").decode("utf-16-le", "ignore").split("\x00")[0]
         inp, _, ownn = _resolve_alarm_hex(ins, oid2name)
         if ownn and inp.startswith(ownn):
