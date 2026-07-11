@@ -641,18 +641,18 @@ class TagAliasResolver:
         can also carry a 0x65 template, but a stale one that disagrees with the live
         (offset-decoded) target, so it must not be trusted there.
         """
-        # Stays on the raw comps_full path: the SP-marker gate below needs the
-        # payload bytes, not just the attr dict.
+        # Reads the raw comps record body: the SP-marker gate below needs the
+        # body bytes, not just the attr dict.
         row = self._cur.execute(
-            "SELECT record FROM comps_full WHERE object_id=?",
+            "SELECT record FROM comps WHERE object_id=?",
             (self._object_id,)).fetchone()
         if not row or not row[0]:
             return None
         rec = bytes(row[0])
-        body_off = CompsRecord.body_offset(self._short_header)
-        if rec[body_off:].find(_SP_MARKER, 74) < 0:
+        if rec.find(_SP_MARKER, 74) < 0:
             return None
-        attrs = CompsRecord.read_value_attrs(rec, self._short_header, full=True)
+        attrs = CompsRecord.read_value_attrs(rec, self._short_header, full=True,
+                                             body_mode=True)
         raw = attrs.get(0x65)
         if not raw or len(raw) < 4:
             return None
