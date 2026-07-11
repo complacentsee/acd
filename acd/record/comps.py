@@ -22,6 +22,7 @@ _FDFD_IDENTIFIER = 65021  # 0xFDFD secondary / sub records
 # consecutive exports in one process never share state.
 _FULL_RECORD_CACHE: "weakref.WeakKeyDictionary[Cursor, dict]" = weakref.WeakKeyDictionary()
 _FULL_ATTRS_CACHE: "weakref.WeakKeyDictionary[Cursor, dict]" = weakref.WeakKeyDictionary()
+_RECORD_ATTRS_CACHE: "weakref.WeakKeyDictionary[Cursor, dict]" = weakref.WeakKeyDictionary()
 
 # --- Source-protection-at-rest (V24 "source-protected" projects) -------------
 # A source-protected project keeps each comps record's main_record PLAINTEXT but
@@ -383,6 +384,27 @@ class CompsRecord:
         return cache[key]
 
     @staticmethod
+    def record_attrs(cur: Cursor, object_id: int, short_header: bool) -> dict:
+        """{attribute_id: bytes} from ``read_value_attrs(full=True,
+        body_mode=True)`` on the ``comps.record`` body for ``object_id``; {}
+        when there is no row. Body-direct analog of ``full_attrs``: since the
+        size-eos flip ``comps.record`` carries the whole body, so no
+        ``comps_full`` round-trip is needed. Memoized per cursor -- treat the
+        returned dict as read-only."""
+        cache = _RECORD_ATTRS_CACHE.setdefault(cur, {})
+        key = (object_id, bool(short_header))
+        if key not in cache:
+            row = cur.execute(
+                "SELECT record FROM comps WHERE object_id=?", (object_id,)
+            ).fetchone()
+            rec = bytes(row[0]) if row and row[0] is not None else None
+            cache[key] = ({} if rec is None else
+                          CompsRecord.read_value_attrs(rec, short_header,
+                                                       full=True,
+                                                       body_mode=True))
+        return cache[key]
+
+    @staticmethod
     def read_ext_attrs_from_record(record: bytes, full: bool = False) -> dict:
         """Recover {attribute_id: bytes} from a source-protected component record.
 
@@ -406,11 +428,14 @@ class CompsRecord:
             return {}
 
     @staticmethod
-    def read_value_attrs(full_payload: bytes, short_header: bool, full: bool = False) -> dict:
+    def read_value_attrs(full_payload: bytes, short_header: bool, full: bool = False,
+                         body_mode: bool = False) -> dict:
         """Walk a cip-0x6a backing's body and return {attribute_id: bytes}.
 
-        ``full_payload`` MUST be the untruncated stream payload
-        (DatRecord.record.record_buffer), NOT FafaComps.record_buffer. Returns
+        ``full_payload`` MUST be the untruncated stream payload (a comps_full
+        row), NOT the header-stripped ``comps.record`` -- unless
+        ``body_mode=True``, which declares the bytes ARE already the body
+        (``comps.record`` post size-eos) so no header slice is taken. Returns
         an empty dict on any structural problem so callers fall back to today's
         zero-placeholder behaviour.
 
@@ -425,7 +450,7 @@ class CompsRecord:
         """
         out: dict = {}
         try:
-            off = CompsRecord.body_offset(short_header)
+            off = 0 if body_mode else CompsRecord.body_offset(short_header)
             body = full_payload[off:]
             # Source-protection-at-rest: the ext-attr tail is AES-encrypted, with
             # a fixed marker replacing the plaintext count at body+78. Decrypt it
@@ -466,14 +491,16 @@ class CompsRecord:
         return out
 
     @staticmethod
-    def read_tag_value(full_payload: bytes, short_header: bool):
+    def read_tag_value(full_payload: bytes, short_header: bool, body_mode: bool = False):
         """Return (value_bytes, cip_type_code) from a cip-0x6a backing, or None.
 
         value_bytes = ext attr 0x66 (the design value); cip_type_code = ext attr
         0x65 (u16, 0 if absent). Returns None when 0x66 is missing so callers
-        keep today's zero-placeholder behaviour.
+        keep today's zero-placeholder behaviour. ``body_mode`` as in
+        ``read_value_attrs``.
         """
-        attrs = CompsRecord.read_value_attrs(full_payload, short_header)
+        attrs = CompsRecord.read_value_attrs(full_payload, short_header,
+                                             body_mode=body_mode)
         if 0x66 not in attrs:
             return None
         type_code = 0

@@ -237,3 +237,87 @@ def test_full_attrs_memoizes_per_cursor():
     cur2 = cur.connection.cursor()
     cur2.execute("SELECT 1").fetchone()
     assert CompsRecord.full_attrs(cur2, 7, False) == {}
+
+
+# --------------------------------------------------------------------------- #
+# body_mode / record_attrs (body-direct comps.record readers, P6.7)
+# --------------------------------------------------------------------------- #
+# Post size-eos flip, comps.record == comps_full.record[body_offset:] for every
+# FAFA/short record, so consumers can read the body directly with body_mode=True
+# (offset 0) instead of round-tripping through comps_full.
+
+
+def test_body_mode_equals_header_sliced_walk():
+    """body_mode=True on the bare body must decode exactly what the header-
+    sliced path decodes from the full payload -- for both header families."""
+    attrs = [(0x01, b"\x3e\x00" + b"\x11" * 8), (0x65, b"\xc4\x00"),
+             (0x66, b"\x2a\x00\x00\x00")]
+    for short in (False, True):
+        payload = _payload(attrs, short_header=short)
+        body = payload[SHORT_OFF if short else LONG_OFF:]
+        via_full = CompsRecord.read_value_attrs(payload, short)
+        via_body = CompsRecord.read_value_attrs(body, short, body_mode=True)
+        assert via_body == via_full
+        assert via_body[0x66] == b"\x2a\x00\x00\x00"
+
+
+def test_body_mode_sp_decrypt():
+    """The SP marker gate and decrypt are body-relative already; body_mode must
+    reach them unchanged."""
+    attrs = [(0x01, b"\x3e\x00\x11\x11"), (0x66, b"\x39\x05\x00\x00")]
+    ct = _cbc_encrypt(_sp_table(attrs), _SP_KEY)
+    body = _sp_body(ct)
+    out = CompsRecord.read_value_attrs(body, False, body_mode=True)
+    assert out.get(0x66) == b"\x39\x05\x00\x00"
+
+
+def test_read_tag_value_body_mode():
+    attrs = [(0x01, b"\x3e\x00"), (0x65, b"\xc4\x00"), (0x66, b"\x2a\x00\x00\x00")]
+    body = _body(attrs)
+    result = CompsRecord.read_tag_value(body, False, body_mode=True)
+    assert result == (b"\x2a\x00\x00\x00", 0xC4)
+
+
+def _comps_cursor(rows):
+    import sqlite3
+
+    cur = sqlite3.connect(":memory:").cursor()
+    cur.execute("CREATE TABLE comps(object_id INTEGER PRIMARY KEY, record BLOB)")
+    cur.executemany("INSERT INTO comps VALUES (?, ?)", rows)
+    return cur
+
+
+def test_record_attrs_reads_comps_body():
+    body = _body([(0x01, b"\x3e\x00"), (0x66, b"\x2a\x00\x00\x00")])
+    cur = _comps_cursor([(7, body)])
+    out = CompsRecord.record_attrs(cur, 7, False)
+    assert out[0x66] == b"\x2a\x00\x00\x00"
+
+
+def test_record_attrs_matches_full_attrs():
+    """The migration invariant: record_attrs on the body == full_attrs on the
+    header-included payload."""
+    attrs = [(0x01, b"\x3e\x00"), (0x65, b"\xc4\x00"), (0x66, b"\x99\x00\x00\x00"),
+             (0x6E, b"member-descriptor-bytes")]
+    payload = _payload(attrs)
+    cur = _comps_full_cursor([(7, payload)])
+    cur.execute("CREATE TABLE comps(object_id INTEGER PRIMARY KEY, record BLOB)")
+    cur.execute("INSERT INTO comps VALUES (?, ?)", (7, payload[LONG_OFF:]))
+    assert (CompsRecord.record_attrs(cur, 7, False)
+            == CompsRecord.full_attrs(cur, 7, False))
+
+
+def test_record_attrs_missing_row_yields_empty():
+    cur = _comps_cursor([])
+    assert CompsRecord.record_attrs(cur, 42, False) == {}
+
+
+def test_record_attrs_memoizes_per_cursor():
+    body = _body([(0x66, b"\x07\x00\x00\x00")])
+    cur = _comps_cursor([(7, body)])
+    first = CompsRecord.record_attrs(cur, 7, False)
+    cur.execute("DELETE FROM comps")
+    assert CompsRecord.record_attrs(cur, 7, False) is first
+    cur2 = cur.connection.cursor()
+    cur2.execute("SELECT 1").fetchone()
+    assert CompsRecord.record_attrs(cur2, 7, False) == {}
