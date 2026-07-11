@@ -535,15 +535,15 @@ def _module_identity_e1(cur, object_id: int, raw_rec: bytes,
        only trusted on a record that parsed as a cip-0x69 module -- a garbage
        buffer that happens to contain the marker must not mask tier 3.
     3. When both miss (including a buffer that does not parse at all), recover
-       from the untruncated comps_full stream: cip-checked at body+10, attrs
-       read with read_value_attrs(full=True) (memoized by
-       CompsRecord.full_attrs), adopted only when >= 0x30.
+       from the size-eos comps record body: cip-checked at body offset 10,
+       attrs read with read_value_attrs(full=True, body_mode=True) (memoized
+       by CompsRecord.record_attrs), adopted only when >= 0x30.
 
     Returns ``(e1, comment_id, source)``:
       e1         -- identity bytes; may still be shorter than 0x30 (callers gate)
-      comment_id -- from the parsed prelude, else from comps_full body+12 (only
-                    when comps_full yielded a usable blob); None when the record
-                    is not provably a cip-0x69 module
+      comment_id -- from the parsed prelude, else from the comps body offset 12
+                    (only when the body yielded a usable blob); None when the
+                    record is not provably a cip-0x69 module
       source     -- "record" | "marker" | "full"; callers with per-source map
                     policies dispatch on it
     """
@@ -569,17 +569,19 @@ def _module_identity_e1(cur, object_id: int, raw_rec: bytes,
             source = "marker"
     if len(e1) < 0x30:
         try:
-            full = CompsRecord.full_record(cur, object_id)
-            bo = CompsRecord.body_offset(short_header)
-            if (full and len(full) >= bo + 14
-                    and struct.unpack_from("<H", full, bo + 10)[0] == 0x69):
-                fe1 = CompsRecord.full_attrs(
+            row = cur.execute(
+                "SELECT record FROM comps WHERE object_id=?", (object_id,)
+            ).fetchone()
+            body = bytes(row[0]) if row and row[0] is not None else None
+            if (body and len(body) >= 14
+                    and struct.unpack_from("<H", body, 10)[0] == 0x69):
+                fe1 = CompsRecord.record_attrs(
                     cur, object_id, short_header).get(0x001, b"")
                 if len(fe1) >= 0x30:
                     e1 = fe1
                     source = "full"
                     if comment_id is None:
-                        comment_id = struct.unpack_from("<H", full, bo + 12)[0]
+                        comment_id = struct.unpack_from("<H", body, 12)[0]
         except Exception:
             pass
     return e1, comment_id, source
@@ -721,7 +723,7 @@ class ModuleBuilder(L5xElementBuilder):
                 # DECRYPTED ext-attr 0x66 image (the raw record body is ciphertext,
                 # so the plaintext scan above finds nothing). Same decrypt path the
                 # UserDefinedCatalogNumber recovery uses for these records.
-                img = CompsRecord.full_attrs(
+                img = CompsRecord.record_attrs(
                     self._cur, child_oid, self._short_header).get(0x66, b"")
                 ds = img.find(b'<public>')
                 if ds >= 0:
@@ -751,7 +753,7 @@ class ModuleBuilder(L5xElementBuilder):
         for oid, raw in self._rxdata_by_cid.get(data_link & 0xFFFF, []):
             m = re.search(rb"<UDCN>([^<]*)</UDCN>", raw)
             if not m:
-                img = CompsRecord.full_attrs(
+                img = CompsRecord.record_attrs(
                     self._cur, oid, self._short_header).get(0x66, b"")
                 m = re.search(rb"<UDCN>([^<]*)</UDCN>", img)
             if m:
@@ -777,7 +779,7 @@ class ModuleBuilder(L5xElementBuilder):
                     return cf_m.group(1)
             # Source-protected child: the <CF> is in the decrypted ext-attr image
             # (0x66, else 0x65/0x64), not the plaintext body.
-            attrs = CompsRecord.full_attrs(
+            attrs = CompsRecord.record_attrs(
                 self._cur, child_oid, self._short_header)
             for _aid in (0x66, 0x65, 0x64):
                 img = attrs.get(_aid)
@@ -847,7 +849,7 @@ class ModuleBuilder(L5xElementBuilder):
             # (local-chassis I/O cards and many CompactLogix CPUs). Same SP-aware
             # fallback the sibling _*_from_data_collection methods use.
             try:
-                img = CompsRecord.full_attrs(
+                img = CompsRecord.record_attrs(
                     self._cur, child_oid, self._short_header).get(0x66)
                 if img:
                     txt = img.decode("latin-1", errors="replace")
@@ -876,7 +878,7 @@ class ModuleBuilder(L5xElementBuilder):
         non-safety modules. Returns {port_id: "16#0000_xxxx_xxxx_xxxx"} or {}.
         """
         try:
-            e0 = CompsRecord.full_attrs(
+            e0 = CompsRecord.record_attrs(
                 self._cur, self._object_id, self._short_header).get(0x001, b"")
         except Exception:
             return {}
@@ -1215,7 +1217,7 @@ class ModuleBuilder(L5xElementBuilder):
             # notably for the root controller; the untruncated comps_full stream
             # carries it. Recover it before giving up on the port topology.
             try:
-                _dl = ModuleIdentity.from_bytes(CompsRecord.full_attrs(
+                _dl = ModuleIdentity.from_bytes(CompsRecord.record_attrs(
                     self._cur, self._object_id, self._short_header
                 ).get(0x001, b"")).data_link
                 if _dl is not None:
@@ -1567,7 +1569,7 @@ class ModuleBuilder(L5xElementBuilder):
         drives_adc_enabled = drives_adc_mode = safety_network = None
         safety_signature = safety_signature_timestamp = None
         try:
-            _fe1 = CompsRecord.full_attrs(
+            _fe1 = CompsRecord.record_attrs(
                 self._cur, self._object_id, self._short_header).get(0x001, b"")
             _fmi = ModuleIdentity.from_bytes(_fe1)
             if _fmi.class_word in (0x0200, 0x0201):

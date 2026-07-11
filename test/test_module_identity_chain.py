@@ -2,12 +2,12 @@
 
 ``_module_identity_e1`` is the single implementation of the three recovery
 copies that had drifted apart (ModuleBuilder.build, the _pass_modules modid
-map, the :C-owner map). Tier order: (1) parse the truncated comps ``record``
-buffer and take ext-attr 0x001; (2) alias the identity stored inline behind
-the 44 02 00 00 marker, trusted only on a record that parsed as a cip-0x69
-module; (3) recover from the untruncated comps_full stream (cip-checked at
-body+10). comment_id comes from the parsed prelude, else from comps_full but
-only when comps_full yielded a usable (>= 0x30) blob -- callers map a None
+map, the :C-owner map). Tier order: (1) parse the comps ``record`` buffer and
+take ext-attr 0x001; (2) alias the identity stored inline behind the
+44 02 00 00 marker, trusted only on a record that parsed as a cip-0x69
+module; (3) recover from the stored comps record body (cip-checked at body
+offset 10). comment_id comes from the parsed prelude, else from the comps
+body but only when it yielded a usable (>= 0x30) blob -- callers map a None
 comment_id to the all-zero fallback Module.
 """
 
@@ -37,11 +37,16 @@ def _record(cip_type=0x69, comment_id=7, attrs=()) -> bytes:
 
 
 def _cur(full_rows=()):
+    """A cursor seeded the way the extractor stages a full payload: the
+    comps_full row keeps the whole stream payload, the comps row keeps the
+    size-eos body (payload past the 148-byte long header)."""
     con = sqlite3.connect(":memory:")
     cur = con.cursor()
     cur.execute("CREATE TABLE comps_full (object_id INTEGER, record BLOB)")
+    cur.execute("CREATE TABLE comps (object_id INTEGER, record BLOB)")
     for oid, rec in full_rows:
         cur.execute("INSERT INTO comps_full VALUES (?, ?)", (oid, rec))
+        cur.execute("INSERT INTO comps VALUES (?, ?)", (oid, rec[LONG_OFF:]))
     return cur
 
 
