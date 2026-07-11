@@ -12,6 +12,7 @@ import re
 import struct
 from typing import Dict
 
+from acd.record.blobs import ConnectionParams
 from acd.record.comps import CompsRecord
 
 
@@ -36,14 +37,6 @@ def _consume_conn_tuple(rec: bytes):
 
 
 _CONSUME_CONN_FMT = 9           # connection-format word marking a consumed tag
-# Fixed byte offsets within a consumed connection's parameter blob (ext-attr
-# 0x01); version-stable across the V10..V36 reference corpus. Used by the
-# fallback decoder when the plaintext body tuple is unavailable (a protected
-# record) -- the blob layout differs from the body-record layout the primary
-# scan walks.
-_CI_RPI_OFF = 2                 # u32 RPI (microseconds)
-_CI_REMOTE_LEN_OFF = 34        # u16 RemoteTag length, ASCII follows at +2
-_CI_TRANSPORT_OFF = 323         # u8 transport type (2 == unicast, 1 == multicast)
 
 
 def _build_consume_map(cur, short_header: bool) -> Dict[int, dict]:
@@ -148,23 +141,24 @@ def _build_consume_map(cur, short_header: bool) -> Dict[int, dict]:
             if tag_oid in out or tag_oid in (0, 0xFFFFFFFF):
                 continue
             blob = ea.get(_PRODUCE_EXT_PARAMS)
-            if (not blob or len(blob) <= _CI_TRANSPORT_OFF
-                    or struct.unpack_from("<H", blob, 0)[0] != _CONSUME_CONN_FMT):
+            if not blob:
                 continue
-            ln = struct.unpack_from("<H", blob, _CI_REMOTE_LEN_OFF)[0]
-            rp = _CI_REMOTE_LEN_OFF + 2
-            if not (1 <= ln <= 60) or rp + ln > len(blob):
+            cp = ConnectionParams.from_bytes(blob)
+            # transport present reproduces the old len > 323 completeness gate.
+            if cp.transport is None or cp.fmt != _CONSUME_CONN_FMT:
+                continue
+            if not (1 <= cp.remote_len <= 60) or cp.remote_tag_bytes is None:
                 continue
             try:
-                remote_tag = blob[rp:rp + ln].decode("ascii")
+                remote_tag = cp.remote_tag_bytes.decode("ascii")
             except Exception:
                 continue
             out[tag_oid] = {
                 "Producer": o2name.get(o2parent.get(pid)) or "",
                 "RemoteTag": remote_tag,
                 "RemoteInstance": "0",
-                "RPI": str(struct.unpack_from("<I", blob, _CI_RPI_OFF)[0] // 1000),
-                "Unicast": "true" if blob[_CI_TRANSPORT_OFF] == 2 else "false",
+                "RPI": str(cp.rpi_us // 1000),
+                "Unicast": "true" if cp.transport == 2 else "false",
             }
     except Exception:
         return out
@@ -188,14 +182,6 @@ _PRODUCE_EXT_PRODUCED = 0x191   # produced-tag object_id (on the connection reco
 _PRODUCE_EXT_CONSUMED = 0x190   # present on consumed / module I/O connections
 _PRODUCE_EXT_PARAMS = 0x01      # connection parameter blob
 _PRODUCE_EXT_PLCMAP = 0x67      # PLCMappingFile (u32) on the tag's own record
-# Fixed byte offsets within the parameter blob (ext-attr 0x01); version-stable
-# across the V10..V36 reference corpus.
-_PI_PSET_OFF = 308              # u32 ProgrammaticallySendEventTrigger (0/1)
-_PI_COUNT_OFF = 321             # u16 ProduceCount (number of consumers)
-_PI_UNICAST_OFF = 324          # u32 UnicastPermitted (0/1)
-_PI_MIN_RPI_OFF = 774          # u32 MinimumRPI (microseconds)
-_PI_MAX_RPI_OFF = 778          # u32 MaximumRPI (microseconds)
-_PI_DEFAULT_RPI_OFF = 782      # u32 DefaultRPI (microseconds)
 
 
 def _produce_rpi_ms(us: int) -> str:
@@ -246,26 +232,26 @@ def _build_produce_map(cur, short_header: bool) -> Dict[int, dict]:
                 if not a191 or len(a191) < 4 or _PRODUCE_EXT_CONSUMED in ea:
                     continue
                 blob = ea.get(_PRODUCE_EXT_PARAMS)
-                if not blob or len(blob) < _PI_DEFAULT_RPI_OFF + 4:
+                if not blob:
                     continue
-                if struct.unpack_from("<I", blob, 0)[0] != _PRODUCE_CONN_FMT:
+                cp = ConnectionParams.from_bytes(blob)
+                # default_rpi_us present reproduces the old len >= 786 gate; the
+                # produced-tag format gate compares the full leading dword.
+                if cp.default_rpi_us is None:
+                    continue
+                if cp.fmt_dword != _PRODUCE_CONN_FMT:
                     continue
                 tag_oid = struct.unpack_from("<I", a191, 0)[0]
                 if tag_oid in (0, 0xFFFFFFFF):
                     continue
-                pset = struct.unpack_from("<I", blob, _PI_PSET_OFF)[0]
-                count = struct.unpack_from("<H", blob, _PI_COUNT_OFF)[0]
-                uni = struct.unpack_from("<I", blob, _PI_UNICAST_OFF)[0]
-                mn = struct.unpack_from("<I", blob, _PI_MIN_RPI_OFF)[0]
-                mx = struct.unpack_from("<I", blob, _PI_MAX_RPI_OFF)[0]
-                df = struct.unpack_from("<I", blob, _PI_DEFAULT_RPI_OFF)[0]
                 out[tag_oid] = {
-                    "ProduceCount": str(count),
-                    "ProgrammaticallySendEventTrigger": "true" if pset else "false",
-                    "UnicastPermitted": "true" if uni else "false",
-                    "MinimumRPI": _produce_rpi_ms(mn),
-                    "MaximumRPI": _produce_rpi_ms(mx),
-                    "DefaultRPI": _produce_rpi_ms(df),
+                    "ProduceCount": str(cp.produce_count),
+                    "ProgrammaticallySendEventTrigger":
+                        "true" if cp.send_event_trigger else "false",
+                    "UnicastPermitted": "true" if cp.unicast_permitted else "false",
+                    "MinimumRPI": _produce_rpi_ms(cp.min_rpi_us),
+                    "MaximumRPI": _produce_rpi_ms(cp.max_rpi_us),
+                    "DefaultRPI": _produce_rpi_ms(cp.default_rpi_us),
                 }
             elif cip == 0x6B and plc_sig in bytes(full):
                 if oid in out:
@@ -294,23 +280,11 @@ _CONN_TYPE_BY_FMT = {
     48: "StandardDataDriven", 49: "SafetyInputDataDriven",
     50: "SafetyOutputDataDriven",
 }
-_CONN_FMT_OFF = 0           # u16 connection-format word (-> _CONN_TYPE_BY_FMT)
-_CONN_RPI_OFF = 2           # u32 requested packet interval (microseconds)
-_CONN_ICXN_OFF = 6          # u16 InputCxnPoint
-_CONN_ISIZE_OFF = 12        # u16 InputSize
-_CONN_OCXN_OFF = 20         # u16 OutputCxnPoint
-_CONN_OSIZE_OFF = 26        # u16 OutputSize
-_CONN_EVENT_OFF = 298       # u8 EventID
-_CONN_TRANSPORT_OFF = 323   # u8 transport type (2 == unicast, else multicast)
-# Modern (data-driven / safety) connection attributes, recovered from the same
-# param blob (validated byte-exact pool-wide against the OEM <Connection>):
-_CONN_IPT_OFF = 302         # u8 InputProductionTrigger (0=Cyclic, 2=Application)
-_CONN_MOND_OFF = 314        # u16 MaxObservedNetworkDelay raw (count * 0.128 us)
-_CONN_TMULT_OFF = 316       # u8 TimeoutMultiplier
-_CONN_NDMULT_OFF = 317      # u16 NetworkDelayMultiplier
-_CONN_PRIORITY_OFF = 357    # u8 Priority (1=High, 2=Scheduled)
-_CONN_ICT_OFF = 366         # u8 InputConnectionType (2=Unicast, 1=Multicast)
-_CONN_CPATH_WC_OFF = 370    # u8 ConnectionPath length in 16-bit words; path @ +1
+# The blob's fixed byte offsets (version-stable across the V10..V36 reference
+# corpus) are documented on acd.record.blobs.ConnectionParams, which decodes
+# them; the maps below give the decoded values their L5X meaning. The modern
+# (data-driven / safety) attribute set was validated byte-exact pool-wide
+# against the OEM <Connection>.
 _CONN_DATADRIVEN_FMTS = frozenset({48, 49, 50})
 _CONN_SAFETY_FMTS = frozenset({28, 29, 50, 49})
 _CONN_PRIORITY_MAP = {1: "High", 2: "Scheduled"}
@@ -324,29 +298,27 @@ def _conn_num(x: float) -> str:
     return str(int(round(x))) if abs(x - round(x)) < 1e-9 else "%.3f" % x
 
 
-def _conn_path_from_blob(blob: bytes):
+def _conn_path_from_blob(cp: ConnectionParams):
     """The verbatim CIP ConnectionPath EPATH ('20 04 24 ..') or None.
 
-    Stored literally in the param blob: a u8 word-count at _CONN_CPATH_WC_OFF
-    then word_count*2 path bytes; rendered as space-separated lowercase hex.
+    Rendered as space-separated lowercase hex, and only when the declared
+    word-count's full path is contained in the blob (a truncated path yields
+    None, matching the old bounds check).
     """
-    if len(blob) <= _CONN_CPATH_WC_OFF:
+    if not cp.cpath_words or cp.cpath_raw is None:
         return None
-    wc = blob[_CONN_CPATH_WC_OFF]
-    n = wc * 2
-    start = _CONN_CPATH_WC_OFF + 1
-    if wc == 0 or start + n > len(blob):
+    if len(cp.cpath_raw) != cp.cpath_words * 2:
         return None
-    return " ".join("%02x" % x for x in blob[start:start + n])
+    return " ".join("%02x" % x for x in cp.cpath_raw)
 
 
-def _conn_first_instance(blob: bytes):
-    """First Assembly logical-segment instance of the embedded EPATH, or None."""
-    if len(blob) <= _CONN_CPATH_WC_OFF:
-        return None
-    wc = blob[_CONN_CPATH_WC_OFF]
-    start = _CONN_CPATH_WC_OFF + 1
-    p = blob[start:start + wc * 2]
+def _conn_first_instance(cp: ConnectionParams):
+    """First Assembly logical-segment instance of the embedded EPATH, or None.
+
+    Unlike _conn_path_from_blob this reads the clamped path prefix, so a
+    truncated path can still yield its leading Assembly segment.
+    """
+    p = cp.cpath_raw if cp.cpath_raw is not None else b""
     if len(p) < 4 or p[0] != 0x20 or p[1] != 0x04:
         return None
     if p[2] == 0x24:
@@ -356,20 +328,22 @@ def _conn_first_instance(blob: bytes):
     return None
 
 
-def _conn_modern_attrs(blob: bytes, fmt: int) -> dict:
+def _conn_modern_attrs(cp: ConnectionParams, fmt: int) -> dict:
     """Recover the data-driven / safety <Connection> attributes from the blob."""
     out: dict = {}
     if fmt in _CONN_DATADRIVEN_FMTS:
-        if len(blob) > _CONN_PRIORITY_OFF:
-            out["Priority"] = _CONN_PRIORITY_MAP.get(blob[_CONN_PRIORITY_OFF])
-        if len(blob) > _CONN_ICT_OFF:
-            out["InputConnectionType"] = _CONN_ICT_MAP.get(blob[_CONN_ICT_OFF])
-        if len(blob) > _CONN_IPT_OFF:
-            out["InputProductionTrigger"] = _CONN_IPT_MAP.get(blob[_CONN_IPT_OFF])
-        cp = _conn_path_from_blob(blob)
-        if cp is not None:
-            out["ConnectionPath"] = cp
-        inst = _conn_first_instance(blob)
+        if cp.priority is not None:
+            out["Priority"] = _CONN_PRIORITY_MAP.get(cp.priority)
+        if cp.input_connection_type is not None:
+            out["InputConnectionType"] = _CONN_ICT_MAP.get(
+                cp.input_connection_type)
+        if cp.input_production_trigger is not None:
+            out["InputProductionTrigger"] = _CONN_IPT_MAP.get(
+                cp.input_production_trigger)
+        path_hex = _conn_path_from_blob(cp)
+        if path_hex is not None:
+            out["ConnectionPath"] = path_hex
+        inst = _conn_first_instance(cp)
         if inst is not None:
             safe = inst in _CONN_SAFETY_ASM_INSTANCES
             # A suffix names that direction's I/O tag, so it is emitted only when
@@ -377,24 +351,21 @@ def _conn_modern_attrs(blob: bytes, fmt: int) -> dict:
             # StandardDataDriven (fmt 48) input-only module has out_size 0 and the
             # reference omits OutputTagSuffix there; gating each side on its size
             # matches the reference (no suffix ever appears without its tag).
-            in_size = (struct.unpack_from("<H", blob, _CONN_ISIZE_OFF)[0]
-                       if len(blob) >= _CONN_ISIZE_OFF + 2 else 0)
-            out_size = (struct.unpack_from("<H", blob, _CONN_OSIZE_OFF)[0]
-                        if len(blob) >= _CONN_OSIZE_OFF + 2 else 0)
+            in_size = cp.input_size if cp.input_size is not None else 0
+            out_size = cp.output_size if cp.output_size is not None else 0
             if fmt in (48, 49) and in_size:   # has an input side
                 out["InputTagSuffix"] = "I1" if inst == 1 else ("SI" if safe else "I")
             if fmt in (48, 50) and out_size:  # has an output side
                 out["OutputTagSuffix"] = "O1" if inst == 1 else ("SO" if safe else "O")
     if fmt in _CONN_SAFETY_FMTS:
-        if len(blob) > _CONN_TMULT_OFF:
-            out["TimeoutMultiplier"] = str(blob[_CONN_TMULT_OFF])
-        if len(blob) >= _CONN_NDMULT_OFF + 2:
-            out["NetworkDelayMultiplier"] = str(
-                struct.unpack_from("<H", blob, _CONN_NDMULT_OFF)[0])
-        if len(blob) >= _CONN_MOND_OFF + 2:
+        if cp.timeout_multiplier is not None:
+            out["TimeoutMultiplier"] = str(cp.timeout_multiplier)
+        if cp.network_delay_multiplier is not None:
+            out["NetworkDelayMultiplier"] = str(cp.network_delay_multiplier)
+        if cp.max_observed_delay_raw is not None:
             out["MaxObservedNetworkDelay"] = _conn_num(
-                struct.unpack_from("<H", blob, _CONN_MOND_OFF)[0] * 0.128)
-        rpi_us = struct.unpack_from("<I", blob, _CONN_RPI_OFF)[0] / 1000.0
+                cp.max_observed_delay_raw * 0.128)
+        rpi_us = cp.rpi_us / 1000.0
         if fmt in (28, 49):  # input
             out["ReactionTimeLimit"] = _conn_num(
                 math.ceil(4 * rpi_us / 0.128) * 0.128)
@@ -465,31 +436,35 @@ def _build_connection_map(cur, short_header: bool) -> Dict[int, dict]:
                 continue
             ea = CompsRecord.read_value_attrs(bytes(full), short_header, full=True)
             blob = ea.get(_PRODUCE_EXT_PARAMS)
-            if not blob or len(blob) <= _CONN_TRANSPORT_OFF:
+            if not blob:
                 continue
-            fmt = struct.unpack_from("<H", blob, _CONN_FMT_OFF)[0]
+            cp = ConnectionParams.from_bytes(blob)
+            # transport (u8 @323) present is the old len > 323 completeness gate.
+            if cp.transport is None:
+                continue
+            fmt = cp.fmt
             if fmt not in _CONN_TYPE_BY_FMT:
                 continue
             entry = {
                 "fmt": fmt,
                 "Type": _CONN_TYPE_BY_FMT[fmt],
-                "RPI": str(struct.unpack_from("<I", blob, _CONN_RPI_OFF)[0]),
+                "RPI": str(cp.rpi_us),
                 # Unicast PRESENCE is a per-module property not encoded here:
                 # safety connections always carry it, plain Input/Output carry it
                 # only when point-to-point (transport==2); every other connection
                 # type omits it. The value, when present, is transport==2.
                 "_unicast_present": (
                     fmt in (28, 29)
-                    or (fmt in (5, 6) and blob[_CONN_TRANSPORT_OFF] == 2)
+                    or (fmt in (5, 6) and cp.transport == 2)
                 ),
-                "Unicast": "true" if blob[_CONN_TRANSPORT_OFF] == 2 else "false",
-                "EventID": str(blob[_CONN_EVENT_OFF]),
-                "InputCxnPoint": struct.unpack_from("<H", blob, _CONN_ICXN_OFF)[0],
-                "InputSize": struct.unpack_from("<H", blob, _CONN_ISIZE_OFF)[0],
-                "OutputCxnPoint": struct.unpack_from("<H", blob, _CONN_OCXN_OFF)[0],
-                "OutputSize": struct.unpack_from("<H", blob, _CONN_OSIZE_OFF)[0],
+                "Unicast": "true" if cp.transport == 2 else "false",
+                "EventID": str(cp.event_id),
+                "InputCxnPoint": cp.input_cxn_point,
+                "InputSize": cp.input_size,
+                "OutputCxnPoint": cp.output_cxn_point,
+                "OutputSize": cp.output_size,
             }
-            entry.update(_conn_modern_attrs(blob, fmt))
+            entry.update(_conn_modern_attrs(cp, fmt))
             # Safety connections carry a per-connection SafetySignature: the GSS
             # record keyed (otype 105, cid=u32@rec[12], disc=u32@rec[16]).
             if fmt in (28, 29, 49, 50) and len(rec) >= 20:
