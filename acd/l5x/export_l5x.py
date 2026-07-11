@@ -189,6 +189,7 @@ class ExportL5x:
         )
 
         comps_by_id = {}
+        comps_len_by_id: Dict[int, int] = {}   # oid -> winning dedup length
         # Side map object_id -> FULL stream payload (record.record.record_buffer,
         # = len_record-6, untruncated). The deduped comps `record` column stores
         # the TRUNCATED FafaComps.record_buffer (long-header) which cuts off the
@@ -206,14 +207,26 @@ class ExportL5x:
                 continue
             if t is not None:
                 oid = t[0]
-                if oid not in comps_by_id or len(t[5]) > len(comps_by_id[oid][5]):
-                    comps_by_id[oid] = t
                 try:
                     full = bytes(record.record.record_buffer)
-                    if oid not in full_by_id or len(full) > len(full_by_id[oid]):
-                        full_by_id[oid] = full
                 except Exception:  # noqa: BLE001
-                    pass
+                    full = None
+                # Dedup both maps on the FULL stream-payload length
+                # (record.record.record_buffer, untruncated), NOT len(t[5]): the
+                # latter is the TRUNCATED FafaComps.record_buffer today but
+                # becomes the whole size-eos body after the P6.7a un-truncation,
+                # so keying on it lets the kept duplicate flip once payload length
+                # != record_length-148. The full payload length is what the flip
+                # cannot change, and it picks the SAME winner as len(t[5]) across
+                # all 14,804 duplicated oids pool-wide (verified). Declared
+                # record_length@0 is NOT usable here -- it is 0 on FDFD records.
+                dedup_len = len(full) if full is not None else len(t[5])
+                if oid not in comps_by_id or dedup_len > comps_len_by_id[oid]:
+                    comps_by_id[oid] = t
+                    comps_len_by_id[oid] = dedup_len
+                if full is not None and (
+                        oid not in full_by_id or len(full) > len(full_by_id[oid])):
+                    full_by_id[oid] = full
         self._cur.executemany("INSERT INTO comps VALUES (?,?,?,?,?,?)", comps_by_id.values())
 
         # Collision-safe operand-comment keying (long-header). An operand comment
