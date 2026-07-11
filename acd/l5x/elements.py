@@ -11,6 +11,7 @@ from os import PathLike
 from pathlib import Path
 from typing import List, Tuple, Dict, Union
 
+from acd.generated.comps.member_descriptor import MemberDescriptor
 from acd.generated.comps.module_identity import ModuleIdentity
 from acd.generated.comps.rx_generic import RxGeneric
 from acd.l5x.alias import TagAliasResolver
@@ -1598,26 +1599,30 @@ class MemberBuilder(L5xElementBuilder):
         for extended_record in getattr(r, "extended_records", []):
             extended_records[extended_record.attribute_id] = extended_record.value
 
-        dimension = struct.unpack_from("<I", self.record, 0x5C)[0]
+        md = MemberDescriptor.from_bytes(self.record)
+        # A descriptor too short to hold the 0x74 word could never complete the
+        # old fixed-offset reads either; raising preserves the caller's
+        # skip-the-member behaviour (struct.error used to do the same).
+        if md.legacy_access_word is None:
+            raise ValueError("member descriptor truncated")
+        dimension = md.dimension
         # A bogus dimension (e.g. 0x20000) appears in the 0x5C slot for some
         # non-array scalar members of predefined types; clamp implausible values
         # to 0 so we don't emit a garbage Dimension attribute. (BIT members
         # override dimension to 0 below regardless.)
         if dimension > 0x10000:
             dimension = 0
-        radix = radix_enum(struct.unpack_from("<I", self.record, 0x54)[0])
-        data_type_id = struct.unpack_from("<I", self.record, 0x58)[0]
-        hidden = bool(struct.unpack_from("<I", self.record, 0x70)[0])
+        radix = radix_enum(md.radix)
+        data_type_id = md.data_type_id
+        hidden = bool(md.hidden)
         # ExternalAccess is the single byte at 0xA0 of the member-descriptor
         # ext-record (0=Read/Write, 2=Read Only, 3=None), NOT the u32 at 0x74
         # (which is uniformly 1 and is not ExternalAccess). Fall back to the old
         # 0x74 enum path only when the record is too short to hold 0xA0.
-        if len(self.record) > 0xA0:
-            external_access = external_access_enum(self.record[0xA0])
+        if md.external_access_byte is not None:
+            external_access = external_access_enum(md.external_access_byte)
         else:
-            external_access = external_access_enum(
-                struct.unpack_from("<I", self.record, 0x74)[0]
-            )
+            external_access = external_access_enum(md.legacy_access_word)
 
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
@@ -1642,8 +1647,8 @@ class MemberBuilder(L5xElementBuilder):
         target: Union[str, None] = None
         bit_number: Union[int, None] = None
         if data_type == "BOOL":
-            target_key = struct.unpack_from("<I", self.record, 0x6C)[0]
-            val_68 = struct.unpack_from("<I", self.record, 0x68)[0]
+            target_key = md.target_key
+            val_68 = md.host_ordinal
             # A BOOL member is a BIT overlay unless it is a real standalone BOOL
             # (0x6c == FFFFFFFF and 0x68 == 0x800).
             is_plain_bool = (target_key == 0xFFFFFFFF and val_68 == 0x800)
@@ -1653,7 +1658,7 @@ class MemberBuilder(L5xElementBuilder):
                 # treats this as a scalar rather than emitting many <Element>s.
                 data_type = "BIT"
                 dimension = 0
-                bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
+                bit_number = md.bit_number
                 if target_key != 0xFFFFFFFF:
                     # Pattern 1: explicit backing-field byte offset via 0x6c.
                     target = self._offset60_to_name.get(target_key)
@@ -1669,8 +1674,7 @@ class MemberBuilder(L5xElementBuilder):
                 else:
                     # User datatype: preceding hidden integer backing member.
                     if val_68 == 1:
-                        val_60 = struct.unpack_from("<I", self.record, 0x60)[0]
-                        target = self._offset60_to_name.get(val_60)
+                        target = self._offset60_to_name.get(md.offset)
                     else:
                         target = self._fallback_target
 
@@ -1710,18 +1714,21 @@ class MemberBuilder(L5xElementBuilder):
         """
         name = self._short_name
         try:
-            dimension = struct.unpack_from("<I", self.record, 0x5C)[0]
-            radix = radix_enum(struct.unpack_from("<I", self.record, 0x54)[0])
-            data_type_id = struct.unpack_from("<I", self.record, 0x58)[0]
-            hidden = bool(struct.unpack_from("<I", self.record, 0x70)[0])
+            md = MemberDescriptor.from_bytes(self.record)
+            # Same completeness gate as the long path: a descriptor ending
+            # before the 0x74 word degrades (the old unpacks raised here too).
+            if md.legacy_access_word is None:
+                raise ValueError("member descriptor truncated")
+            dimension = md.dimension
+            radix = radix_enum(md.radix)
+            data_type_id = md.data_type_id
+            hidden = bool(md.hidden)
             # ExternalAccess = byte at 0xA0 (0=Read/Write, 2=Read Only, 3=None),
             # not the u32 at 0x74. Fall back to 0x74 only for short records.
-            if len(self.record) > 0xA0:
-                external_access = external_access_enum(self.record[0xA0])
+            if md.external_access_byte is not None:
+                external_access = external_access_enum(md.external_access_byte)
             else:
-                external_access = external_access_enum(
-                    struct.unpack_from("<I", self.record, 0x74)[0]
-                )
+                external_access = external_access_enum(md.legacy_access_word)
 
             self._cur.execute(
                 "SELECT comp_name FROM comps WHERE object_id=" + str(data_type_id)
@@ -1738,12 +1745,12 @@ class MemberBuilder(L5xElementBuilder):
                 # non-BIT member whose byte range covers 0x6c (or 0x60 when
                 # 0x6c == 0xFFFFFFFF) -> resolved via the byte-range
                 # offset60_to_name map (target+bit 2832/2832 correct).
-                val_68 = struct.unpack_from("<I", self.record, 0x68)[0]
+                val_68 = md.host_ordinal
                 if val_68 != 0x800:
                     data_type = "BIT"
                     dimension = 0
-                    bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
-                    target_key = struct.unpack_from("<I", self.record, 0x6C)[0]
+                    bit_number = md.bit_number
+                    target_key = md.target_key
                     if target_key != 0xFFFFFFFF:
                         # Pattern 1: explicit backing-field byte offset.
                         target = self._offset60_to_name.get(target_key)
@@ -1760,8 +1767,7 @@ class MemberBuilder(L5xElementBuilder):
                         if target is None:
                             target = self._offset60_to_name.get(0)
                     else:
-                        val_60 = struct.unpack_from("<I", self.record, 0x60)[0]
-                        target = self._offset60_to_name.get(val_60)
+                        target = self._offset60_to_name.get(md.offset)
                     if target is None:
                         target = self._fallback_target
             else:
@@ -1912,12 +1918,12 @@ class DataTypeBuilder(L5xElementBuilder):
                 key2 = 0x6E + idx2
                 if key2 not in extended_records:
                     break
-                rec2 = bytes(extended_records[key2])
-                if len(rec2) >= 0x70:
-                    target_key2 = struct.unpack_from("<I", rec2, 0x6C)[0]
-                    val_68_2 = struct.unpack_from("<I", rec2, 0x68)[0]
-                    if target_key2 == 0xFFFFFFFF and val_68_2 == 0x800:
-                        val_60 = struct.unpack_from("<I", rec2, 0x60)[0]
+                md2 = MemberDescriptor.from_bytes(bytes(extended_records[key2]))
+                # target_key present (descriptor reaches 0x70) is the same
+                # completeness gate the old len(rec2) >= 0x70 check applied.
+                if md2.target_key is not None:
+                    if md2.target_key == 0xFFFFFFFF and md2.host_ordinal == 0x800:
+                        val_60 = md2.offset
                         offset60_to_name[val_60] = child2[0]
                         # A BIT member's 0x6c is a BYTE offset that can land in
                         # the high byte of a multi-byte backing word (e.g. an INT
@@ -1925,10 +1931,9 @@ class DataTypeBuilder(L5xElementBuilder):
                         # backing field covers to its name so Pattern-1 lookups by
                         # the exact byte resolve. setdefault keeps the first (the
                         # word's own 0x60) authoritative for collisions.
-                        dt_id_2 = struct.unpack_from("<I", rec2, 0x58)[0]
                         self._cur.execute(
                             "SELECT comp_name FROM comps WHERE object_id="
-                            + str(dt_id_2)
+                            + str(md2.data_type_id)
                         )
                         _row2 = self._cur.fetchone()
                         _base2 = _row2[0] if _row2 else ""
@@ -1948,12 +1953,10 @@ class DataTypeBuilder(L5xElementBuilder):
                 key = 0x6E + idx
                 if key not in extended_records:
                     break
-                rec = bytes(extended_records[key])
                 # Update last_hidden_backing when we see a hidden member
-                if len(rec) >= 0x74:
-                    is_hidden = bool(struct.unpack_from("<I", rec, 0x70)[0])
-                    if is_hidden:
-                        last_hidden_backing = child[0]
+                # (hidden is None when the descriptor ends before 0x74).
+                if MemberDescriptor.from_bytes(bytes(extended_records[key])).hidden:
+                    last_hidden_backing = child[0]
                 try:
                     children.append(
                         MemberBuilder(
@@ -1986,11 +1989,11 @@ class DataTypeBuilder(L5xElementBuilder):
                     break
                 blob = bytes(extended_records[key2])
                 # The inline member name is NUL-terminated UTF-16LE starting at
-                # byte 0; the next member field (radix u32) begins at 0x54, so the
-                # name field spans 0..0x53. Decode up to that boundary (0x40 cut
-                # names longer than 32 chars). _decode_utf16z stops at the first
-                # NUL, so shorter names are unaffected.
-                mname = _decode_utf16z(blob[0:0x54]) if len(blob) >= 2 else ""
+                # byte 0; the grammar clamps the field to its 0..0x53 span (the
+                # radix u32 begins at 0x54) and _decode_utf16z stops at the
+                # first NUL, so shorter names are unaffected.
+                _nm = MemberDescriptor.from_bytes(blob).name_raw
+                mname = _decode_utf16z(_nm) if _nm is not None else ""
                 short_recs.append((mname, blob))
 
             # The counted extended_records stop before the record's FINAL
@@ -2016,21 +2019,22 @@ class DataTypeBuilder(L5xElementBuilder):
             # below). _build_short still tries the exact 0x60 first.
             offset60_to_name = {}
             for mname, blob in short_recs:
-                if len(blob) < 0x78:
+                md_b = MemberDescriptor.from_bytes(blob)
+                # Same completeness gate as the old len(blob) < 0x78 skip.
+                if md_b.legacy_access_word is None:
                     continue
-                dt_id_b = struct.unpack_from("<I", blob, 0x58)[0]
                 self._cur.execute(
-                    "SELECT comp_name FROM comps WHERE object_id=" + str(dt_id_b)
+                    "SELECT comp_name FROM comps WHERE object_id="
+                    + str(md_b.data_type_id)
                 )
                 _row = self._cur.fetchone()
                 base = _row[0] if _row else ""
-                val_68_2 = struct.unpack_from("<I", blob, 0x68)[0]
                 # A BIT alias (BOOL with 0x68 != 0x800) is NOT a backing field;
                 # every other member (atomic scalar, or a real BOOL with
                 # 0x68==0x800) backs the bits that overlay its byte range.
-                if base == "BOOL" and val_68_2 != 0x800:
+                if base == "BOOL" and md_b.host_ordinal != 0x800:
                     continue
-                val_60 = struct.unpack_from("<I", blob, 0x60)[0]
+                val_60 = md_b.offset
                 sz = _BACKING_SIZE.get(base, 1)
                 offset60_to_name[val_60] = mname
                 for b_off in range(val_60, val_60 + sz):
@@ -2044,10 +2048,8 @@ class DataTypeBuilder(L5xElementBuilder):
             for mname, blob in short_recs:
                 if not mname:
                     continue
-                if len(blob) >= 0x74:
-                    is_hidden = bool(struct.unpack_from("<I", blob, 0x70)[0])
-                    if is_hidden:
-                        last_hidden_backing = mname
+                if MemberDescriptor.from_bytes(blob).hidden:
+                    last_hidden_backing = mname
                 try:
                     children.append(
                         MemberBuilder(

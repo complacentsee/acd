@@ -131,6 +131,19 @@ class install(_install):
                 "resources/templates/Comps/ModuleIdentity.ksy",
             ]
         )
+        print("Compiling Comps/MemberDescriptor.ksy")
+        subprocess.run(
+            [
+                kaitai_compiler_executable,
+                "-t",
+                "python",
+                "--outdir",
+                "acd/generated/comps/",
+                "--python-package",
+                "acd.generated.comps",
+                "resources/templates/Comps/MemberDescriptor.ksy",
+            ]
+        )
         _install.run(self)
         print("--------------------------------------------------------------------")
 
