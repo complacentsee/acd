@@ -124,16 +124,16 @@ def _build_consume_map(cur, short_header: bool) -> Dict[int, dict]:
     # which stays plaintext even on a protected record.
     try:
         cur.execute(
-            "SELECT c.object_id, c.parent_id, c.record, f.record "
-            "FROM comps c LEFT JOIN comps_full f ON c.object_id = f.object_id"
+            "SELECT object_id, parent_id, record FROM comps"
         )
-        for oid, pid, rec, full in cur.fetchall():
-            if pid not in coll_oids or not rec or not full:
+        for oid, pid, rec in cur.fetchall():
+            if pid not in coll_oids or not rec:
                 continue
             rec = bytes(rec)
             if len(rec) < 12 or rec[10] != 0x69:
                 continue
-            ea = CompsRecord.read_value_attrs(bytes(full), short_header, full=True)
+            ea = CompsRecord.read_value_attrs(rec, short_header, full=True,
+                                              body_mode=True)
             a190 = ea.get(_PRODUCE_EXT_CONSUMED)
             if not a190 or len(a190) < 4 or _PRODUCE_EXT_PRODUCED in ea:
                 continue
@@ -213,21 +213,21 @@ def _build_produce_map(cur, short_header: bool) -> Dict[int, dict]:
     out: Dict[int, dict] = {}
     try:
         cur.execute(
-            "SELECT c.object_id, c.parent_id, c.comp_name, c.record, f.record "
-            "FROM comps c LEFT JOIN comps_full f ON c.object_id = f.object_id"
+            "SELECT object_id, parent_id, comp_name, record FROM comps"
         )
         rows = cur.fetchall()
         coll_oids = {r[0] for r in rows if r[2] == "RxMapConnectionCollection"}
         plc_sig = struct.pack("<I", _PRODUCE_EXT_PLCMAP)
-        for oid, pid, nm, rec, full in rows:
-            if not rec or not full:
+        for oid, pid, nm, rec in rows:
+            if not rec:
                 continue
             rec = bytes(rec)
             if len(rec) < 12:
                 continue
             cip = rec[10]
             if cip == 0x69 and pid in coll_oids:
-                ea = CompsRecord.read_value_attrs(bytes(full), short_header, full=True)
+                ea = CompsRecord.read_value_attrs(rec, short_header, full=True,
+                                                  body_mode=True)
                 a191 = ea.get(_PRODUCE_EXT_PRODUCED)
                 if not a191 or len(a191) < 4 or _PRODUCE_EXT_CONSUMED in ea:
                     continue
@@ -253,10 +253,11 @@ def _build_produce_map(cur, short_header: bool) -> Dict[int, dict]:
                     "MaximumRPI": _produce_rpi_ms(cp.max_rpi_us),
                     "DefaultRPI": _produce_rpi_ms(cp.default_rpi_us),
                 }
-            elif cip == 0x6B and plc_sig in bytes(full):
+            elif cip == 0x6B and plc_sig in rec:
                 if oid in out:
                     continue
-                ea = CompsRecord.read_value_attrs(bytes(full), short_header, full=True)
+                ea = CompsRecord.read_value_attrs(rec, short_header, full=True,
+                                                  body_mode=True)
                 plc = ea.get(_PRODUCE_EXT_PLCMAP)
                 if not plc or len(plc) < 4:
                     continue
@@ -423,18 +424,18 @@ def _build_connection_map(cur, short_header: bool) -> Dict[int, dict]:
     out: Dict[int, dict] = {}
     try:
         cur.execute(
-            "SELECT c.object_id, c.record, f.record "
+            "SELECT c.object_id, c.record "
             "FROM comps c JOIN comps p ON c.parent_id = p.object_id "
-            "LEFT JOIN comps_full f ON c.object_id = f.object_id "
             "WHERE p.comp_name = 'RxMapConnectionCollection'"
         )
-        for oid, rec, full in cur.fetchall():
-            if not rec or not full:
+        for oid, rec in cur.fetchall():
+            if not rec:
                 continue
             rec = bytes(rec)
             if len(rec) < 12 or rec[10] != 0x69:
                 continue
-            ea = CompsRecord.read_value_attrs(bytes(full), short_header, full=True)
+            ea = CompsRecord.read_value_attrs(rec, short_header, full=True,
+                                              body_mode=True)
             blob = ea.get(_PRODUCE_EXT_PARAMS)
             if not blob:
                 continue
@@ -553,27 +554,24 @@ def _build_config_holders(cur):
 def _config_holder_image(cur, oid, short_header):
     """Return the raw config image bytes stored in holder record ``oid``, or None.
 
-    The image is the ext-attribute 0x66 value (read from comps_full), falling back to
-    the length-prefixed blob at record offset 410 (record[406:410] = byte length).
+    The image is the ext-attribute 0x66 value of the holder's record body,
+    falling back to the length-prefixed blob at record offset 410
+    (record[406:410] = byte length). Reads full=False (not record_attrs)
+    deliberately.
     """
     try:
-        # Stays on the raw comps_full path: needs the payload bytes for the
-        # offset-410 fallback below, and reads full=False (not full_attrs).
-        cur.execute("SELECT record FROM comps_full WHERE object_id=?", (oid,))
+        cur.execute("SELECT record FROM comps WHERE object_id=?", (oid,))
         row = cur.fetchone()
         if row:
-            full = bytes(row[0])
+            rec = bytes(row[0])
             try:
-                attrs = CompsRecord.read_value_attrs(full, short_header)
+                attrs = CompsRecord.read_value_attrs(rec, short_header,
+                                                     body_mode=True)
                 img = attrs.get(_CONFIG_IMG_VALUE)
                 if img and len(img) >= 4:
                     return bytes(img)
             except Exception:
                 pass
-        cur.execute("SELECT record FROM comps WHERE object_id=?", (oid,))
-        row = cur.fetchone()
-        if row:
-            rec = bytes(row[0])
             if len(rec) >= 414:
                 length = struct.unpack_from("<I", rec, 406)[0]
                 if 4 <= length <= len(rec) - 410:
