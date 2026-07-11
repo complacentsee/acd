@@ -9,6 +9,7 @@ from kaitaistruct import KaitaiStream
 
 from acd.generated.comps.fafa_comps import FafaComps
 from acd.generated.comps.fdfd_comps import FdfdComps
+from acd.generated.comps.short_comps import ShortComps
 from acd.record._aes import AES
 
 # Comps record identifiers (little-endian u16).
@@ -214,6 +215,9 @@ def decrypt_sp_nameless(record: bytes) -> Optional[bytes]:
 # correctly today regardless). Verified against acdgen's proven v21 parse on a
 # real short-header project (all FAFA names decode; controller query -> exactly 1)
 # and empirically across V10..V20 sample projects (word@12 != 0 == short header).
+# The layout is declared in the ShortComps grammar (the primary parse); these
+# constants back the lenient fallback for records whose name window the
+# grammar's strz refuses, plus body_offset().
 _SH_SEQ_OFF = 8     # u16 per-collection ordinal (cosmetic for export)
 _SH_RTYPE_OFF = 10  # u16 record_type (256=component, 0=collection)
 _SH_OBJID_OFF = 12  # u32 object_id (self_lcg / CompUId)
@@ -291,12 +295,32 @@ class CompsRecord:
 
     @staticmethod
     def _parse_short(dat_record: DatRecord) -> Optional[tuple]:
-        """Manual V10..V21 FAFA/FDFD header parse (absolute offsets above)."""
+        """V10..V21 FAFA/FDFD header parse via the ShortComps grammar."""
         if dat_record.identifier not in (_FAFA_IDENTIFIER, _FDFD_IDENTIFIER):
             return None
         buf = dat_record.record.record_buffer
         if len(buf) < _SH_BODY_OFF:
             return None
+        try:
+            r = ShortComps.from_bytes(buf)
+            return (r.object_id, r.parent_id, r.record_name.value,
+                    r.seq_number, r.record_type, r.record_buffer)
+        except Exception:
+            # The grammar's strz raises where the hand decode tolerates (a
+            # name window that is truncated, unterminated within its 82
+            # bytes, or not valid UTF-16); re-parse with the manual walk.
+            # (The grammar is the decoder of record for well-formed names, so
+            # a valid UTF-16 surrogate pair decodes to its combined astral
+            # codepoint -- matching the long-header FafaComps/FdfdComps strz --
+            # where the lenient walk below would emit two lone surrogates.
+            # That alignment is deliberate; no pool name exercises it.)
+            return CompsRecord._parse_short_lenient(dat_record)
+
+    @staticmethod
+    def _parse_short_lenient(dat_record: DatRecord) -> Optional[tuple]:
+        """Manual short-header parse (absolute offsets above): the fallback
+        for records whose name window the grammar refuses."""
+        buf = dat_record.record.record_buffer
         record_type = int.from_bytes(buf[_SH_RTYPE_OFF:_SH_RTYPE_OFF + 2], "little")
         object_id = int.from_bytes(buf[_SH_OBJID_OFF:_SH_OBJID_OFF + 4], "little")
         parent_id = int.from_bytes(buf[_SH_PARENT_OFF:_SH_PARENT_OFF + 4], "little")
