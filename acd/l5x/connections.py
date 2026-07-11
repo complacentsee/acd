@@ -63,6 +63,7 @@ def _build_consume_map(cur, short_header: bool) -> Dict[int, dict]:
     o2name: Dict[int, str] = {}
     o2parent: Dict[int, int] = {}
     coll_oids: set = set()
+    dead = CompsRecord.dead_oids(cur, short_header)
     try:
         cur.execute("SELECT object_id, parent_id, comp_name, record FROM comps")
         rows = cur.fetchall()
@@ -70,6 +71,12 @@ def _build_consume_map(cur, short_header: bool) -> Dict[int, dict]:
         o2parent = {r[0]: r[1] for r in rows}
         coll_oids = {r[0] for r in rows if r[2] == "RxMapConnectionCollection"}
         for oid, pid, nm, rec in rows:
+            # Skip dead-relic (FDFD-only) rows: the cip==rec[10] gate below is a
+            # fixed offset, so a realigned relic could pass it post-flip and
+            # OVERWRITE a live tag's ConsumeInfo (last-write-wins). Long-header
+            # only; zero-delta today (relics fail the pre-flip rec[10] gate).
+            if oid in dead:
+                continue
             if pid not in coll_oids or not rec:
                 continue
             rec = bytes(rec)
@@ -127,6 +134,8 @@ def _build_consume_map(cur, short_header: bool) -> Dict[int, dict]:
             "SELECT object_id, parent_id, record FROM comps"
         )
         for oid, pid, rec in cur.fetchall():
+            if oid in dead:
+                continue
             if pid not in coll_oids or not rec:
                 continue
             rec = bytes(rec)
@@ -211,6 +220,7 @@ def _build_produce_map(cur, short_header: bool) -> Dict[int, dict]:
     from the same attributes.
     """
     out: Dict[int, dict] = {}
+    dead = CompsRecord.dead_oids(cur, short_header)
     try:
         cur.execute(
             "SELECT object_id, parent_id, comp_name, record FROM comps"
@@ -219,6 +229,12 @@ def _build_produce_map(cur, short_header: bool) -> Dict[int, dict]:
         coll_oids = {r[0] for r in rows if r[2] == "RxMapConnectionCollection"}
         plc_sig = struct.pack("<I", _PRODUCE_EXT_PLCMAP)
         for oid, pid, nm, rec in rows:
+            # Skip dead-relic (FDFD-only) rows: cip==rec[10] and the 0x6B PLC
+            # branch's fixed-offset gate could admit a realigned relic post-flip
+            # and overwrite a live tag's ProduceInfo. Long-header only; zero-delta
+            # today (relics fail the pre-flip rec[10] gate).
+            if oid in dead:
+                continue
             if not rec:
                 continue
             rec = bytes(rec)
@@ -422,6 +438,7 @@ def _build_connection_map(cur, short_header: bool) -> Dict[int, dict]:
     any failure.
     """
     out: Dict[int, dict] = {}
+    dead = CompsRecord.dead_oids(cur, short_header)
     try:
         cur.execute(
             "SELECT c.object_id, c.record "
@@ -429,6 +446,11 @@ def _build_connection_map(cur, short_header: bool) -> Dict[int, dict]:
             "WHERE p.comp_name = 'RxMapConnectionCollection'"
         )
         for oid, rec in cur.fetchall():
+            # Defensive family gate (long-header): its consumer binds by exact
+            # tree-oid so a relic entry is never read, but gating keeps every
+            # RxMapConnectionCollection scan uniformly liveness-filtered (P6.9).
+            if oid in dead:
+                continue
             if not rec:
                 continue
             rec = bytes(rec)
@@ -510,7 +532,7 @@ _CONFIGSCRIPT_ONLY_PT = 123
 _CONFIG_IMG_VALUE = 0x66          # ext-attr holding the config/script image
 
 
-def _build_config_holders(cur):
+def _build_config_holders(cur, short_header: bool = False):
     """Index RxDataCollection holder records for ConfigData/ConfigScript lookup.
 
     Returns (by_mr28, by_cid, pool_oids):
@@ -522,18 +544,26 @@ def _build_config_holders(cur):
         trailer pointer).
     Only unique keys are kept so an ambiguous (byte-identical-sibling) link is simply
     skipped rather than mislinked. Returns empty maps on any failure.
+
+    Dead-relic (FDFD-only) holders are excluded (long-header only): their bodies
+    contribute no live link today, and skipping them keeps the unique-only cid/mr28
+    sets flip-invariant (a realigned dead body would otherwise shift the key it
+    contributes, changing which live keys survive the unique-only filter -- P6.9).
     """
     by_mr28: Dict[int, object] = {}
     by_cid: Dict[int, object] = {}
     pool_oids = set()
     seen28: Dict[int, int] = {}
     seencid: Dict[int, int] = {}
+    dead = CompsRecord.dead_oids(cur, short_header)
     try:
         cur.execute(
             "SELECT c.object_id, c.record FROM comps c JOIN comps p "
             "ON c.parent_id = p.object_id WHERE p.comp_name = 'RxDataCollection'"
         )
         for oid, rec in cur.fetchall():
+            if oid in dead:
+                continue
             rec = bytes(rec)
             pool_oids.add(oid)
             if len(rec) >= 58:
@@ -558,7 +588,16 @@ def _config_holder_image(cur, oid, short_header):
     falling back to the length-prefixed blob at record offset 410
     (record[406:410] = byte length). Reads full=False (not record_attrs)
     deliberately.
+
+    A dead-relic (FDFD-only) holder is never a live module's config source, so
+    its image is not read: this is the single gate that also covers the module
+    0x13e DIRECT-pointer path (module_builder.py), which resolves a holder oid
+    without consulting the family-gated _build_config_holders index. Long-header
+    only (see CompsRecord.dead_oids); zero-delta today (no live module resolves a
+    dead holder) and flip-safe (the realigned dead body is never decoded).
     """
+    if oid in CompsRecord.dead_oids(cur, short_header):
+        return None
     try:
         cur.execute("SELECT record FROM comps WHERE object_id=?", (oid,))
         row = cur.fetchone()

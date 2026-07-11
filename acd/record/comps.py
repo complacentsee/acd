@@ -23,6 +23,7 @@ _FDFD_IDENTIFIER = 65021  # 0xFDFD secondary / sub records
 _FULL_RECORD_CACHE: "weakref.WeakKeyDictionary[Cursor, dict]" = weakref.WeakKeyDictionary()
 _FULL_ATTRS_CACHE: "weakref.WeakKeyDictionary[Cursor, dict]" = weakref.WeakKeyDictionary()
 _RECORD_ATTRS_CACHE: "weakref.WeakKeyDictionary[Cursor, dict]" = weakref.WeakKeyDictionary()
+_DEAD_OIDS_CACHE: "weakref.WeakKeyDictionary[Cursor, frozenset]" = weakref.WeakKeyDictionary()
 
 # --- Source-protection-at-rest (V24 "source-protected" projects) -------------
 # A source-protected project keeps each comps record's main_record PLAINTEXT but
@@ -357,6 +358,31 @@ class CompsRecord:
     def body_offset(short_header: bool) -> int:
         """Full-payload offset of the RxGeneric body (prelude) for the family."""
         return _SH_BODY_OFF if short_header else CompsRecord._LONG_BODY_OFF
+
+    @staticmethod
+    def dead_oids(cur: Cursor, short_header: bool) -> frozenset:
+        """object_ids of export-DEAD components: comps rows with no FAFA-family
+        record (``comps_family.fafa_seen == 0``). Such an oid is a deleted relic
+        Studio keeps in Comps.Dat but never exports; every component-enumeration
+        and every by-value comps scan drops these so a relic is neither emitted
+        nor allowed to overwrite a live component. See P6.9.
+
+        Returns an EMPTY set on short-header projects: the long-header FDFD body
+        realignment does not apply there (short bodies are always size-eos at 94),
+        so short-header liveness is gated separately (P6.9 C6). Cached per cursor;
+        empty if the comps_family side table is absent (older staging schema)."""
+        if short_header:
+            return frozenset()
+        cache = _DEAD_OIDS_CACHE.get(cur)
+        if cache is None:
+            try:
+                cache = frozenset(
+                    oid for (oid,) in cur.execute(
+                        "SELECT object_id FROM comps_family WHERE fafa_seen=0"))
+            except Exception:
+                cache = frozenset()
+            _DEAD_OIDS_CACHE[cur] = cache
+        return cache
 
     @staticmethod
     def full_record(cur: Cursor, object_id: int) -> Optional[bytes]:

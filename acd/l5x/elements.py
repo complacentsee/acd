@@ -4565,6 +4565,8 @@ def _task_ref_list(record: bytes) -> Dict[int, bytes]:
 
 @dataclass
 class TaskBuilder(L5xElementBuilder):
+    _short_header: bool = False
+
     def _build_event_info(self, e01: bytes, record: bytes) -> Union[EventInfo, None]:
         """Build the <EventInfo> for an EVENT task from its ext-attr 0x01 payload.
 
@@ -4592,8 +4594,16 @@ class TaskBuilder(L5xElementBuilder):
                 "SELECT object_id FROM comps WHERE comp_name='MOTION_GROUP'").fetchone()
             if mg:
                 needle = struct.pack("<I", mg[0])
-                for cn, cr in self._cur.execute(
-                        "SELECT comp_name, record FROM comps WHERE record_type=256").fetchall():
+                # Family-gate this by-VALUE scan: a dead-relic (FDFD-only) rt=256
+                # row must not match the needle (its realigned body could gain a
+                # spurious match post-flip). Long-header only; the general rule --
+                # every comps.record VALUE scan is liveness-gated (P6.9).
+                dead = CompsRecord.dead_oids(self._cur, self._short_header)
+                for coid, cn, cr in self._cur.execute(
+                        "SELECT object_id, comp_name, record FROM comps "
+                        "WHERE record_type=256").fetchall():
+                    if coid in dead:
+                        continue
                     if cn and needle in bytes(cr):
                         event_tag = cn
                         break
@@ -5394,7 +5404,9 @@ class ControllerBuilder(L5xElementBuilder):
                 + " AND record_type=256"
             )
             for task_result in self._cur.fetchall():
-                tasks.append(TaskBuilder(self._cur, task_result[1]).build(comment_id_to_program))
+                tasks.append(TaskBuilder(
+                    self._cur, task_result[1],
+                    _short_header=self._short_header).build(comment_id_to_program))
         return tasks
 
     def _pass_aois(self, data_types_map, short_routine_desc):
@@ -5543,7 +5555,8 @@ class ControllerBuilder(L5xElementBuilder):
             # holder indexes and the ordered RxDataCollection child index are
             # built once and shared.
             conn_decode = _build_connection_map(self._cur, self._short_header)
-            cfg_mr28, cfg_cid, cfg_pool = _build_config_holders(self._cur)
+            cfg_mr28, cfg_cid, cfg_pool = _build_config_holders(
+                self._cur, self._short_header)
             rxdata_by_cid = _build_rxdata_holders(self._cur, self._short_header)
             modules = []
             for _, mod_oid, _ in mod_rows:

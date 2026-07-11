@@ -612,6 +612,7 @@ def _build_rxdata_holders(cur, short_header: bool = False
     no separate truncation, so they are left as-is.
     """
     holders: Dict[int, List[Tuple[int, bytes]]] = {}
+    dead = CompsRecord.dead_oids(cur, short_header)
     cur.execute("SELECT object_id FROM comps WHERE comp_name='RxDataCollection'")
     coll_oids = [r[0] for r in cur.fetchall()]
     for coll_oid in coll_oids:
@@ -620,6 +621,11 @@ def _build_rxdata_holders(cur, short_header: bool = False
             "FROM comps c LEFT JOIN comps_full cf ON c.object_id = cf.object_id "
             "WHERE c.parent_id=?", (coll_oid,))
         for child_oid, raw, len_bytes in cur.fetchall():
+            # A dead-relic (FDFD-only) child never backs a live module; skipping
+            # it keeps this cid index flip-invariant (its realigned body would
+            # otherwise change the cid it contributes). Long-header only.
+            if child_oid in dead:
+                continue
             raw = bytes(raw) if raw else b""
             if len(raw) < 14:
                 continue
