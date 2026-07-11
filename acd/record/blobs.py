@@ -25,6 +25,40 @@ def _u32(b: bytes, off: int) -> Optional[int]:
 
 
 @dataclass(frozen=True)
+class ControllerProps:
+    """The controller properties blob: ext-attr 0x1 of the controller record.
+
+    Decodes both copies of the attribute -- the kaitai extended_records value
+    (used for RedundancyEnabled, whose source is deliberately the truncated
+    record) and the decrypted comps_full value read via full_attrs (used for
+    the classic time-slice block on short-header and protected projects).
+    ``size`` doubles as a family discriminator: exactly 62 bytes marks the
+    pre-V21 classic save format (CompatibilityMode V20.01), and the
+    controller-scope ForceData gate keys on size in {62, 70}.
+    """
+    size: int                          # blob length (see the doc above)
+    time_slice: Optional[int]          # u16 @4   continuous-task time slice
+    redundancy_flag: Optional[int]     # u8  @14  nonzero = RedundancyEnabled
+    classic_marker: Optional[int]      # u8  @16  0x5A marks the classic block
+    io_memory_pad: Optional[int]       # u16 @16  IOMemoryPadPercentage (the
+    #   0x5A marker byte reads as 90 in the low half)
+    data_table_pad: Optional[int]      # u16 @18  DataTablePadPercentage
+    share_flags: Optional[int]         # u8  @25  bit 0 = ShareUnusedTimeSlice
+
+    @classmethod
+    def from_bytes(cls, blob: bytes) -> "ControllerProps":
+        return cls(
+            size=len(blob),
+            time_slice=_u16(blob, 4),
+            redundancy_flag=_u8(blob, 14),
+            classic_marker=_u8(blob, 16),
+            io_memory_pad=_u16(blob, 16),
+            data_table_pad=_u16(blob, 18),
+            share_flags=_u8(blob, 25),
+        )
+
+
+@dataclass(frozen=True)
 class ConnectionParams:
     """The connection parameter blob: ext-attr 0x01 of a cip-0x69 connection
     record under a RxMapConnectionCollection (371..786 bytes observed).

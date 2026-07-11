@@ -45,6 +45,7 @@ from acd.l5x.module_builder import (
     _module_identity_e1,
 )
 from acd.l5x import tag_value as _tag_value
+from acd.record.blobs import ControllerProps
 from acd.record.comps import CompsRecord, _SP_MARKER, decrypt_sp_nameless
 
 
@@ -4887,9 +4888,10 @@ class ControllerBuilder(L5xElementBuilder):
 
         # RedundancyEnabled: controller extended record 0x001, byte offset 0x0E.
         # This byte is 0x01 for redundant controllers (e.g. 1756-L85E in redundancy mode)
-        # and 0x00 for non-redundant controllers.
-        _ctrl_ext001 = extended_records.get(0x001, b"")
-        redundancy_enabled: bool = bool(_ctrl_ext001[0x0E]) if len(_ctrl_ext001) > 0x0E else False
+        # and 0x00 for non-redundant controllers. Deliberately read from the
+        # kaitai extended_records (the truncated record), not full_attrs.
+        redundancy_enabled: bool = bool(ControllerProps.from_bytes(
+            extended_records.get(0x001, b"")).redundancy_flag)
         return (sfc_execution_control, sfc_restart_position, sfc_last_scan, project_sn,
                 project_creation_date, last_modified_date, _comm_path_prefix,
                 major_fault_program, redundancy_enabled)
@@ -4924,21 +4926,23 @@ class ControllerBuilder(L5xElementBuilder):
         if not sfc_last_scan:
             sfc_last_scan = _ct_utf16(0x71)
         _ctlblob = _ctlattrs.get(0x1, b"")
+        _props = ControllerProps.from_bytes(_ctlblob)
         # The continuous-task slice is carried by classic controllers, marked by
-        # blob[16]==0x5a; 5x80 controllers (blob[16]==0) carry EtherNetIPMode instead.
+        # blob[16]==0x5a; 5x80 controllers (blob[16]==0) carry EtherNetIPMode
+        # instead. share_flags present == the old len > 25 completeness gate.
         io_memory_pad_percentage = None
         data_table_pad_percentage = None
-        if len(_ctlblob) > 25 and _ctlblob[16] == 0x5A:
-            time_slice = str(struct.unpack_from("<H", _ctlblob, 4)[0])
-            share_unused_time_slice = str(_ctlblob[25] & 1)
+        if _props.share_flags is not None and _props.classic_marker == 0x5A:
+            time_slice = str(_props.time_slice)
+            share_unused_time_slice = str(_props.share_flags & 1)
             # RedundancyInfo pad percentages live just past the classic marker:
             # IOMemoryPadPercentage = u16 @ 16 (the 0x5A marker reads 90), and
             # DataTablePadPercentage = u16 @ 18 (a per-controller value, 50 or 0).
-            io_memory_pad_percentage = str(struct.unpack_from("<H", _ctlblob, 16)[0])
-            data_table_pad_percentage = str(struct.unpack_from("<H", _ctlblob, 18)[0])
+            io_memory_pad_percentage = str(_props.io_memory_pad)
+            data_table_pad_percentage = str(_props.data_table_pad)
         # CompatibilityMode "V20.01" marks the pre-V21 classic save format, whose
         # controller-properties blob is exactly 62 bytes.
-        if len(_ctlblob) == 62:
+        if _props.size == 62:
             compatibility_mode = "V20.01"
         # EtherNetIPMode: ext-attr 0x7c is a u16 dual-port mode index on 5x80
         # controllers (1 -> Dual-IP, 2 -> Linear/DLR).
