@@ -4,15 +4,9 @@ meta:
   tags:
     - version: 33
 seq:
-  # The header's last field is the 124-byte record_name window at 0x18, so the
-  # header ends at 0x18 + 124 = 148 -- the same body offset as the FAFA form
-  # (u4 record_length + 144-byte header). The record_buffer that follows is the
-  # RxGeneric body; reading it at 148 yields the ordinary
-  # prelude/main_record/ext-attr layout (the historical 155 over-counted by 7
-  # and shifted every FDFD body).
   - id: header
     type: header
-    size: 148
+    size: 155
   - id: record_buffer
     size-eos: true
 types:
