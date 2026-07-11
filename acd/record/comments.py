@@ -394,9 +394,9 @@ class CommentsRecord:
         try:
             r = FafaComents.from_bytes(dat_record.record.record_buffer)
             # Type-12 (0x0C) records carry UDI metadata such as the AOI RevisionNote.
-            # The body is raw bytes; parse it to extract the text.
+            # The body is a raw-bytes record; parse it to extract the text.
             if r.header.record_type == 12:
-                parsed = CommentsRecord._parse_udi_body(bytes(r.body))
+                parsed = CommentsRecord._parse_udi_body(bytes(r.body.data))
                 if parsed is None:
                     return None
                 udi_type, text = parsed
@@ -414,6 +414,16 @@ class CommentsRecord:
                     0,              # rung_content
                     0,              # member_ref
                 )
+            # The grammar's switch default now parses every other record_type as
+            # a utf_16_record too (formalizing that they share the operand
+            # layout), but those types remain the domain of the validated hand
+            # walkers above -- a record of one of them reaching this point
+            # already failed the operand gates, and before the default existed
+            # it fell to the raw-bytes branch and dropped here on the missing
+            # body attributes. Keep dropping it explicitly.
+            if r.header.record_type not in (0x01, 0x02, 0x03, 0x04,
+                                            0x0D, 0x0E, 0x17, 0x19):
+                return None
             if r.header.record_type in (0x03, 0x04, 0x0D, 0x0E):
                 tag_ref = r.body.tag_reference.value
             else:

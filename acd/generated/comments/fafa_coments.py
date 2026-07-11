@@ -26,6 +26,11 @@ class FafaComents(KaitaiStruct):
             self._raw_body = self._io.read_bytes(self.record_length - 10)
             _io__raw_body = KaitaiStream(BytesIO(self._raw_body))
             self.body = FafaComents.AsciiRecord(_io__raw_body, self, self._root)
+        elif _on == 12:
+            pass
+            self._raw_body = self._io.read_bytes(self.record_length - 10)
+            _io__raw_body = KaitaiStream(BytesIO(self._raw_body))
+            self.body = FafaComents.RawRecord(_io__raw_body, self, self._root)
         elif _on == 13:
             pass
             self._raw_body = self._io.read_bytes(self.record_length - 10)
@@ -63,7 +68,9 @@ class FafaComents(KaitaiStruct):
             self.body = FafaComents.Utf16Record(12, _io__raw_body, self, self._root)
         else:
             pass
-            self.body = self._io.read_bytes(self.record_length - 10)
+            self._raw_body = self._io.read_bytes(self.record_length - 10)
+            _io__raw_body = KaitaiStream(BytesIO(self._raw_body))
+            self.body = FafaComents.Utf16Record(12, _io__raw_body, self, self._root)
 
 
     def _fetch_instances(self):
@@ -71,6 +78,9 @@ class FafaComents(KaitaiStruct):
         self.header._fetch_instances()
         _on = self.header.record_type
         if _on == 1:
+            pass
+            self.body._fetch_instances()
+        elif _on == 12:
             pass
             self.body._fetch_instances()
         elif _on == 13:
@@ -96,6 +106,7 @@ class FafaComents(KaitaiStruct):
             self.body._fetch_instances()
         else:
             pass
+            self.body._fetch_instances()
         _ = self.lookup_id
         if hasattr(self, '_m_lookup_id'):
             pass
@@ -237,6 +248,85 @@ class FafaComents(KaitaiStruct):
             return getattr(self, '_m_sub_record_length', None)
 
 
+    class RawRecord(KaitaiStruct):
+        """UDI metadata (record_type 12, e.g. the AOI RevisionNote): kept as raw
+        bytes -- the body layout ([8B unknown][u32 id][u32 flags][UTF-16LE
+        NUL-terminated UDI type][NUL padding][NUL-terminated ASCII text]) is
+        parsed by acd.record.comments._parse_udi_body.
+        """
+        def __init__(self, _io, _parent=None, _root=None):
+            super(FafaComents.RawRecord, self).__init__(_io)
+            self._parent = _parent
+            self._root = _root
+            self._read()
+
+        def _read(self):
+            self.data = self._io.read_bytes_full()
+
+
+        def _fetch_instances(self):
+            pass
+
+
+    class ShortDescRecord(KaitaiStruct):
+        """V10..V21 short-header own-description body (record_type 1/2): the
+        component's own Description in UTF-16LE (the V24+ ascii_record decodes
+        UTF-8, which mangles these). Decoded by the tolerant hand walker
+        acd.record.comments._parse_short_desc_body; declared here to document
+        the layout. The text starts at the odd body offset 15.
+        """
+        def __init__(self, _io, _parent=None, _root=None):
+            super(FafaComents.ShortDescRecord, self).__init__(_io)
+            self._parent = _parent
+            self._root = _root
+            self._read()
+
+        def _read(self):
+            self.member_ref = self._io.read_u4le()
+            self.rung_content = self._io.read_u4le()
+            self.object_id_region = self._io.read_bytes(7)
+            self.record_string = FafaComents.StrzUtf16(self._io, self, self._root)
+
+
+        def _fetch_instances(self):
+            pass
+            self.record_string._fetch_instances()
+
+
+    class ShortOperandRecord(KaitaiStruct):
+        """V10..V21 short-header operand comment body (record_type is an ordinal
+        3..36 within the parent group, not an enum). Not wired into the body
+        switch -- short-vs-long is decided per project, and the tolerant hand
+        walker acd.record.comments._parse_short_operand_body (with its
+        structural validation gates) decodes these; declared here to document
+        the layout. The operand and comment text are UTF-16LE NUL-terminated,
+        starting at the odd offset 13.
+        """
+        def __init__(self, _io, _parent=None, _root=None):
+            super(FafaComents.ShortOperandRecord, self).__init__(_io)
+            self._parent = _parent
+            self._root = _root
+            self._read()
+
+        def _read(self):
+            self.zero_prefix = self._io.read_bytes(6)
+            if not self.zero_prefix == b"\x00\x00\x00\x00\x00\x00":
+                raise kaitaistruct.ValidationNotEqualError(b"\x00\x00\x00\x00\x00\x00", self.zero_prefix, self._io, u"/types/short_operand_record/seq/0")
+            self.member_key = self._io.read_u2le()
+            self.object_id = self._io.read_u4le()
+            self.pad = self._io.read_bytes(1)
+            if not self.pad == b"\x00":
+                raise kaitaistruct.ValidationNotEqualError(b"\x00", self.pad, self._io, u"/types/short_operand_record/seq/3")
+            self.operand = FafaComents.StrzUtf16(self._io, self, self._root)
+            self.record_string = FafaComents.StrzUtf16(self._io, self, self._root)
+
+
+        def _fetch_instances(self):
+            pass
+            self.operand._fetch_instances()
+            self.record_string._fetch_instances()
+
+
     class StrzUtf16(KaitaiStruct):
         def __init__(self, _io, _parent=None, _root=None):
             super(FafaComents.StrzUtf16, self).__init__(_io)
@@ -292,11 +382,6 @@ class FafaComents(KaitaiStruct):
             self.unknown_1 = self._io.read_bytes(8)
             self.object_id = self._io.read_u4le()
             self.unknown_2 = self._io.read_bytes(4)
-            # No u2 length field here (see FAFA_Comments.ksy): tag_reference (the
-            # operand string) begins immediately after unknown_2, identical to
-            # controller_record. A prior spurious `len_record: u2` read shifted
-            # tag_reference 2 bytes (dropping the leading operand char and
-            # emptying record_string).
             self.tag_reference = FafaComents.StrzUtf16(self._io, self, self._root)
             self.unknown_3 = self._io.read_bytes(self.len_unknown_3)
             self.record_string = (self._io.read_bytes_term(0, False, True, True)).decode(u"UTF-8")
