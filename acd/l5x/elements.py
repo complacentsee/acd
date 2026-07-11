@@ -3802,7 +3802,7 @@ def _render_alarm_digital_data(cur, short_header, dti):
 #
 # Validated 0-FP/0-FN pool-wide by differential execution against the previous
 # length-keyed detectors over all 588 AOI + 6,680 routine definition records, on
-# both the truncated comps buffer and the untruncated comps_full buffer (1,074
+# both the truncated comps buffer and the untruncated comps.record body (1,074
 # protected; zero verdict differences either way). A few Rockwell library seals
 # (PackMLv3) are byte-identical to unprotected definitions and are NOT detectable
 # -- a known floor.
@@ -4935,7 +4935,7 @@ class ControllerBuilder(L5xElementBuilder):
         # RedundancyEnabled: controller extended record 0x001, byte offset 0x0E.
         # This byte is 0x01 for redundant controllers (e.g. 1756-L85E in redundancy mode)
         # and 0x00 for non-redundant controllers. Deliberately read from the
-        # kaitai extended_records (the truncated record), not full_attrs.
+        # kaitai extended_records (the truncated record), not record_attrs.
         redundancy_enabled: bool = bool(ControllerProps.from_bytes(
             extended_records.get(0x001, b"")).redundancy_flag)
         return (sfc_execution_control, sfc_restart_position, sfc_last_scan, project_sn,
@@ -5511,8 +5511,8 @@ class ControllerBuilder(L5xElementBuilder):
             # First pass: build modid→name map so child modules can resolve their
             # parent name. Identity resolution runs the shared recovery chain
             # (_module_identity_e1: truncated-record parse -> 44 02 00 00 marker
-            # alias -> comps_full); the map-write policy differs per source, so
-            # dispatch on it.
+            # alias -> the comps.record body); the map-write policy differs per
+            # source, so dispatch on it.
             modid_to_name: Dict[int, str] = {}
             # modid→object_id map for ConfigTag keying. On short-header (V10..V20)
             # projects it applies the 44 02 00 00 marker fallback so it is complete.
@@ -5555,8 +5555,8 @@ class ControllerBuilder(L5xElementBuilder):
                 else:
                     # Module whose truncated record omits the 0x001 identity
                     # (or does not parse at all): the modid was recovered from
-                    # comps_full so the adapter is mapped and its child cards
-                    # resolve their :C ConfigTag (e.g. VendorD point_IO_adapter / Local,
+                    # the comps.record body so the adapter is mapped and its child
+                    # cards resolve their :C ConfigTag (e.g. VendorD point_IO_adapter / Local,
                     # whose own modid is the comment_id). Collision-safe:
                     # never overwrite a modid already mapped from a
                     # normally-parsed record.
@@ -5579,9 +5579,9 @@ class ControllerBuilder(L5xElementBuilder):
                          if io_data_map.get((oid, _s), {}).get("C") is not None}
             for _owner in _c_owners:
                 # Same shared recovery chain: a remote DeviceNet/EN chassis whose
-                # truncated comps record omits the identity surfaces its modid
-                # only in comps_full; short-header owners carry it inline behind
-                # the 44 02 00 00 marker.
+                # truncated caller copy omits the identity surfaces its modid
+                # only in the comps.record body; short-header owners carry it
+                # inline behind the 44 02 00 00 marker.
                 _orow = self._cur.execute(
                     "SELECT record FROM comps WHERE object_id=?", (_owner,)).fetchone()
                 _oe1, _ocid, _osrc = _module_identity_e1(

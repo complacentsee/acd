@@ -73,12 +73,14 @@ def test_compsrecord_parse_returns_body_at_148():
     assert t == (0xAABBCCDD, 0x11223344, "P", 7, 512, body)
 
 
-def test_d11_record_attrs_equals_full_attrs_on_fdfd_controller_child():
-    """P6.9 C7 pin: the body-direct read controller_ports now uses agrees with
-    the comps_full read for an FDFD-winner controller child -- true ONLY because
+def test_d11_record_attrs_decodes_fdfd_controller_child_at_148():
+    """P6.9 C7 pin: the body-direct read controller_ports now uses decodes the
+    real ext-attr table of an FDFD-winner controller child -- true ONLY because
     C5 aligned comps.record to full[148:]. Pre-C5 record_attrs read at 155 and
-    returned a garbage key. Uses the ACDTestsEmptyRedundant fixture whose
-    EthernetPort1 (oid 1493048019) is an FDFD-long winner."""
+    returned the garbage key {0}; at 148 it returns {0x1: 178-byte PortEnabled}.
+    Uses the ACDTestsEmptyRedundant fixture whose EthernetPort1 (oid 1493048019)
+    is an FDFD-long winner. (Post-C8 there is no full_attrs/comps_full to compare
+    against; the decoded value is the pin.)"""
     import os
     import tempfile
     from acd.l5x.export_l5x import ExportL5x
@@ -95,7 +97,6 @@ def test_d11_record_attrs_equals_full_attrs_on_fdfd_controller_child():
             "WHERE object_id=?", (oid,)).fetchone()
         assert fam == (FDFD, 0), f"expected FDFD-winner relic, got {fam}"
         ra = CompsRecord.record_attrs(cur, oid, False)
-        fa = CompsRecord.full_attrs(cur, oid, False)
-        assert ra == fa and ra.get(0x1) is not None and len(ra[0x1]) == 178
+        assert set(ra) == {0x1} and len(ra[0x1]) == 178
     finally:
         exp.close()

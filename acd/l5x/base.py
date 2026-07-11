@@ -125,7 +125,7 @@ def connection_signature_row(cur: Cursor, rec: bytes, body_offset: int):
     Names collide across the 2-key safety_signatures table, so per-object
     signatures join the 3-key connection_signatures side table (which holds
     every GSS signature) by the (otype u16 @ body+10, cid u32 @ body+12,
-    disc u32 @ body+16) triple embedded in the decrypted comps_full body.
+    disc u32 @ body+16) triple embedded in the decrypted comps.record body.
     Returns the raw row; callers keep their own truthiness gates.
     """
     return cur.execute(

@@ -555,7 +555,7 @@ def _module_identity_e1(cur, object_id: int, raw_rec: bytes,
         r = RxGeneric.from_bytes(raw_rec)
         if r.cip_type == 0x69:
             # The ext-attr tail parses lazily; materialise it here so a
-            # garbage count_record still routes to the comps_full recovery.
+            # garbage count_record still routes to the comps.record recovery.
             e1 = {er.attribute_id: bytes(er.value)
                   for er in r.extended_records}.get(0x001, b"")
             comment_id = r.comment_id
@@ -603,13 +603,12 @@ def _build_rxdata_holders(cur, short_header: bool = False
     link (< 14 bytes) can never match and are skipped.
 
     On a LONG-header project each child's ``raw`` is bounded to its DECLARED
-    record length (the u32 at the full-payload offset 0, minus the 148-byte
-    long header), so the raw-tail scans above (<public>/<UDCN>/<CF>, which read
-    to the buffer end) see only the primary record and never the appended
-    sub-blobs a size-eos comps buffer would expose. This is a no-op on the
-    still-truncated buffer (bound == len) and reconstructs it exactly once the
-    buffer is un-truncated; short-header records are already size-eos and carry
-    no separate truncation, so they are left as-is.
+    record length (comps_family.record_length, the u32 at the full-payload
+    offset 0, minus the 148-byte long header), so the raw-tail scans above
+    (<public>/<UDCN>/<CF>, which read to the buffer end) see only the primary
+    record and never the appended sub-blobs the size-eos comps buffer exposes.
+    Short-header records are already size-eos and carry no separate truncation,
+    so they are left as-is.
     """
     holders: Dict[int, List[Tuple[int, bytes]]] = {}
     dead = CompsRecord.dead_oids(cur, short_header)
@@ -617,10 +616,10 @@ def _build_rxdata_holders(cur, short_header: bool = False
     coll_oids = [r[0] for r in cur.fetchall()]
     for coll_oid in coll_oids:
         cur.execute(
-            "SELECT c.object_id, c.record, substr(cf.record, 1, 4) "
-            "FROM comps c LEFT JOIN comps_full cf ON c.object_id = cf.object_id "
+            "SELECT c.object_id, c.record, f.record_length "
+            "FROM comps c LEFT JOIN comps_family f ON c.object_id = f.object_id "
             "WHERE c.parent_id=?", (coll_oid,))
-        for child_oid, raw, len_bytes in cur.fetchall():
+        for child_oid, raw, rec_len in cur.fetchall():
             # A dead-relic (FDFD-only) child never backs a live module; skipping
             # it keeps this cid index flip-invariant (its realigned body would
             # otherwise change the cid it contributes). Long-header only.
@@ -629,8 +628,8 @@ def _build_rxdata_holders(cur, short_header: bool = False
             raw = bytes(raw) if raw else b""
             if len(raw) < 14:
                 continue
-            if not short_header and len_bytes is not None and len(len_bytes) == 4:
-                body_len = int.from_bytes(bytes(len_bytes), "little") - 148
+            if not short_header and rec_len:
+                body_len = rec_len - 148
                 if 0 < body_len < len(raw):
                     raw = raw[:body_len]
             cid = int.from_bytes(raw[12:14], "little")
@@ -647,7 +646,7 @@ class ModuleBuilder(L5xElementBuilder):
     # comment_id-link decoders (ports / CommMethod / ExtendedProperties / UDCN)
     # walk their cid's list in the original collection scan order. The decrypted
     # ext-attr dicts those decoders fall back to are memoized per cursor by
-    # CompsRecord.full_attrs.
+    # CompsRecord.record_attrs.
     _rxdata_by_cid: "Dict[int, List[Tuple[int, bytes]]]" = field(default_factory=dict)
     # Map connection record object_id → decoded {RPI, Unicast, EventID}, built once
     # by ControllerBuilder (see _build_connection_map). Empty -> connection values
@@ -1053,13 +1052,13 @@ class ModuleBuilder(L5xElementBuilder):
         name = "?" if (db_name.startswith("$") and db_name.endswith("$")) else db_name
 
         # Identity recovery chain (truncated-record parse -> inline 44 02 00 00
-        # marker alias -> untruncated comps_full), shared with the controller
-        # module passes -- see _module_identity_e1 for the tier semantics.
+        # marker alias -> the untruncated comps.record body), shared with the
+        # controller module passes -- see _module_identity_e1 for the tiers.
         e1, comment_id, _src = _module_identity_e1(
             self._cur, self._object_id, raw_rec, self._short_header)
         if comment_id is None:
             # Not provably a cip-0x69 module (neither the record buffer nor
-            # comps_full yields one): the all-zero fallback Module.
+            # the comps.record body yields one): the all-zero fallback Module.
             return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false",
                           "false")
         if len(e1) < 0x30:
@@ -1219,8 +1218,8 @@ class ModuleBuilder(L5xElementBuilder):
         extended_properties = ""
         data_link = mi.data_link
         if not data_link:
-            # The truncated comps `record` copy can zero the data_link (e1[0x24]),
-            # notably for the root controller; the untruncated comps_full stream
+            # The caller's truncated e1 copy can zero the data_link (e1[0x24]),
+            # notably for the root controller; the untruncated comps.record body
             # carries it. Recover it before giving up on the port topology.
             try:
                 _dl = ModuleIdentity.from_bytes(CompsRecord.record_attrs(
@@ -1543,7 +1542,7 @@ class ModuleBuilder(L5xElementBuilder):
         # static catalog). e1[0x24] is the comment_id of the module's backing
         # RxDataCollection child (a 1:1 link); None when it has no <in> blob.
         # The root controller is decoded the same way: its data_link is recovered
-        # from comps_full (above) and the full <in> blob from the child's decrypted
+        # from the comps.record body (above) and the full <in> blob from the child's decrypted
         # 0x66 image when the plaintext body is truncated. _ports_from_data_collection
         # returns None when there is no blob (e.g. a 5069 root with a degenerate
         # data_link), so such roots still fall back to the static catalog / empty.
@@ -1567,8 +1566,8 @@ class ModuleBuilder(L5xElementBuilder):
         safety_enabled = self._cur.fetchone() is not None
 
         # Drive ADC + Safety Network Number live in the FULL identity ext-attr 0x001
-        # (read from comps_full; the record copy can be truncated before these
-        # offsets). A drive module's 0x001 starts with the class word 0x0200; the
+        # (read from the comps.record body; the caller's e1 copy can be truncated
+        # before these offsets). A drive module's 0x001 starts with class word 0x0200; the
         # ADC bits are the u32 before its lone 0xFFFFFFFF sentinel (bit 6 = Enabled,
         # bit 1 = Mode). The 6-byte little-endian Safety Network Number is at offset
         # 305, present (high byte nonzero) only on a safety module.

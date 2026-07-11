@@ -37,15 +37,14 @@ def _record(cip_type=0x69, comment_id=7, attrs=()) -> bytes:
 
 
 def _cur(full_rows=()):
-    """A cursor seeded the way the extractor stages a full payload: the
-    comps_full row keeps the whole stream payload, the comps row keeps the
-    size-eos body (payload past the 148-byte long header)."""
+    """A cursor seeded the way the extractor stages a comps row post size-eos:
+    the comps record column keeps the whole untruncated body (the stream payload
+    past the 148-byte long header). The tier-3 identity recovery reads this
+    body-direct (comps_full was retired in P6.9 C8)."""
     con = sqlite3.connect(":memory:")
     cur = con.cursor()
-    cur.execute("CREATE TABLE comps_full (object_id INTEGER, record BLOB)")
     cur.execute("CREATE TABLE comps (object_id INTEGER, record BLOB)")
     for oid, rec in full_rows:
-        cur.execute("INSERT INTO comps_full VALUES (?, ?)", (oid, rec))
         cur.execute("INSERT INTO comps VALUES (?, ?)", (oid, rec[LONG_OFF:]))
     return cur
 

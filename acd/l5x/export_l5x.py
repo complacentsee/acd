@@ -49,24 +49,30 @@ _FDFD_IDENTIFIER = 65021  # 0xFDFD stream identifier
 def _walk_comps_records(records, short_header: bool):
     """Dedup walk over the Comps.Dat stream records.
 
-    Returns ``(comps_by_id, full_by_id, winner_family, fafa_seen_ids)``:
-      comps_by_id    oid -> parsed tuple of the dedup winner
-      full_by_id     oid -> LARGEST full stream payload for that oid
-      winner_family  oid -> stream identifier (0xFAFA/0xFDFD) of the winner
-      fafa_seen_ids  oids with >=1 FAFA-family record. A component is
-                     export-live only if a FAFA primary exists for it: an
-                     FDFD-only oid is a deleted relic Studio never exports
-                     (measured pool-wide: FDFD wins zero dual-family dedups
-                     and no FDFD-only oid appears in any OEM export).
+    Returns ``(comps_by_id, record_length_by_id, winner_family, fafa_seen_ids)``:
+      comps_by_id        oid -> parsed tuple of the dedup winner
+      record_length_by_id oid -> declared record_length (u32 @ offset 0) of the
+                         LARGEST full stream payload for that oid; 0 when the
+                         payload is unreadable or shorter than 4 bytes (and on
+                         FDFD winners, whose @0 length is 0). This is the only
+                         datum the module-builder truncation shim needs from the
+                         (now-retired) comps_full table.
+      winner_family      oid -> stream identifier (0xFAFA/0xFDFD) of the winner
+      fafa_seen_ids      oids with >=1 FAFA-family record. A component is
+                         export-live only if a FAFA primary exists for it: an
+                         FDFD-only oid is a deleted relic Studio never exports
+                         (measured pool-wide: FDFD wins zero dual-family dedups
+                         and no FDFD-only oid appears in any OEM export).
     """
     comps_by_id = {}
     comps_len_by_id: Dict[int, int] = {}   # oid -> winning dedup length
-    # Side map object_id -> FULL stream payload (record.record.record_buffer,
-    # = len_record-6, untruncated). The deduped comps `record` column stores
-    # the TRUNCATED FafaComps.record_buffer (long-header) which cuts off the
-    # tail where a tag value backing's ext attr 0x66 lives; the value reader
-    # (Step 6b) needs the full payload. Keep the LARGEST full payload per id.
-    full_by_id: Dict[int, bytes] = {}
+    # Per oid, the LARGEST full stream-payload length seen and that payload's
+    # declared record_length (u32 @0). Since the P6.7a size-eos flip the comps
+    # `record` column already carries the whole untruncated body, so only the
+    # declared length is still needed downstream (the module-builder shim
+    # re-imposes it on the raw-tail scans). We no longer retain the full bytes.
+    full_len_by_id: Dict[int, int] = {}
+    record_length_by_id: Dict[int, int] = {}
     winner_family: Dict[int, int] = {}
     fafa_seen_ids: set = set()
     for record in records:
@@ -101,9 +107,11 @@ def _walk_comps_records(records, short_header: bool):
                 comps_len_by_id[oid] = dedup_len
                 winner_family[oid] = record.identifier
             if full is not None and (
-                    oid not in full_by_id or len(full) > len(full_by_id[oid])):
-                full_by_id[oid] = full
-    return comps_by_id, full_by_id, winner_family, fafa_seen_ids
+                    oid not in full_len_by_id or len(full) > full_len_by_id[oid]):
+                full_len_by_id[oid] = len(full)
+                record_length_by_id[oid] = (
+                    int.from_bytes(full[0:4], "little") if len(full) >= 4 else 0)
+    return comps_by_id, record_length_by_id, winner_family, fafa_seen_ids
 
 
 @dataclass
@@ -223,9 +231,10 @@ class ExportL5x:
                 self._raw_files[record.filename] = acd_fh.read(record.file_length)
 
     def _load_comps(self):
-        """Parse Comps.Dat into the comps/comps_full tables plus their derived
-        side tables (unique_comment_key, project_flags), detecting the header
-        family, and build the object_id -> name map used for write-back.
+        """Parse Comps.Dat into the comps table plus its side tables
+        (comps_family with the liveness/record_length columns, unique_comment_key,
+        project_flags), detecting the header family, and build the object_id ->
+        name map used for write-back.
         Returns (comps_db, name_lookup) for the rung loader."""
         log.info("Getting records from ACD Comps file and storing in sqllite database")
         comps_db = DbExtract(os.path.join(self._temp_dir, "Comps.Dat")).read()
@@ -252,7 +261,7 @@ class ExportL5x:
             "SHORT(<=V21)" if self._comps_short_header else "LONG(V24+)",
         )
 
-        comps_by_id, full_by_id, winner_family, fafa_seen_ids = \
+        comps_by_id, record_length_by_id, winner_family, fafa_seen_ids = \
             _walk_comps_records(comps_db.records.record, self._comps_short_header)
         self._cur.executemany("INSERT INTO comps VALUES (?,?,?,?,?,?)", comps_by_id.values())
 
@@ -343,26 +352,21 @@ class ExportL5x:
             "INSERT INTO project_flags VALUES (?, ?)", (_opc, _safety)
         )
 
-        # Full-payload table for the tag-value reader (Step 6b); separate so the
-        # deduped comps table and every existing query stay byte-for-byte the same.
-        self._cur.execute(
-            "CREATE TABLE comps_full(object_id int PRIMARY KEY, record BLOB NOT NULL)"
-        )
-        self._cur.executemany(
-            "INSERT INTO comps_full VALUES (?,?)", full_by_id.items()
-        )
-
-        # Per-oid header-family side table. fafa_seen is the liveness signal
-        # (see _walk_comps_records); winner_family is the stream identifier of
-        # the deduped comps row, for consumers that must know which grammar
-        # produced the kept body.
+        # Per-oid header-family + record-length side table. fafa_seen is the
+        # liveness signal (see _walk_comps_records); winner_family is the stream
+        # identifier of the deduped comps row; record_length is the declared u32
+        # @0 of the winning full payload, the last datum the module-builder
+        # truncation shim needed from the retired comps_full table. Since the
+        # P6.7a size-eos flip the comps `record` column already carries the whole
+        # untruncated body, so the full payload no longer needs its own table.
         self._cur.execute(
             "CREATE TABLE comps_family(object_id INTEGER PRIMARY KEY,"
-            " winner_family INTEGER, fafa_seen INTEGER)"
+            " winner_family INTEGER, fafa_seen INTEGER, record_length INTEGER)"
         )
         self._cur.executemany(
-            "INSERT INTO comps_family VALUES (?,?,?)",
-            [(oid, winner_family[oid], 1 if oid in fafa_seen_ids else 0)
+            "INSERT INTO comps_family VALUES (?,?,?,?)",
+            [(oid, winner_family[oid], 1 if oid in fafa_seen_ids else 0,
+              record_length_by_id.get(oid, 0))
              for oid in comps_by_id],
         )
         self._db.commit()

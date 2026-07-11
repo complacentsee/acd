@@ -44,11 +44,10 @@ def _full_record(attrs) -> bytes:
 
 
 def _render(attrs, oid2name=None):
-    # Seed both tables the way the extractor does post size-eos: the comps
-    # record column carries the body (payload past the 148-byte header).
+    # Post size-eos, the comps record column carries the whole body (payload
+    # past the 148-byte header) -- the single source the reader consults.
     full = _full_record(attrs)
-    cur = seeded_cursor(comps=[(DTI, 0, "$backing$", 0, 256, full[LONG_OFF:])],
-                        comps_full=[(DTI, full)])
+    cur = seeded_cursor(comps=[(DTI, 0, "$backing$", 0, 256, full[LONG_OFF:])])
     return _render_message_data(
         cur, False, DTI, oid2name or {}, {}, {}, set())
 

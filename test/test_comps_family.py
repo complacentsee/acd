@@ -45,11 +45,13 @@ def test_dual_family_oid_is_fafa_seen_and_fafa_wins_on_larger_payload():
         _dat(_payload(1, body=b"\xfd" * 4), FDFD),
         _dat(_payload(1, body=b"\xfa" * 9), FAFA),   # strictly larger payload
     ]
-    comps, fulls, winner, fafa_seen = _walk_comps_records(records, True)
+    comps, rec_lens, winner, fafa_seen = _walk_comps_records(records, True)
     assert set(comps) == {1}
     assert fafa_seen == {1}
     assert winner[1] == FAFA
-    assert fulls[1] == _payload(1, body=b"\xfa" * 9)
+    # record_length is the declared u32@0 of the LARGEST full payload (the
+    # 9-byte-body FAFA winner: 94-byte header + 9 = 103).
+    assert rec_lens[1] == 103
 
 
 def test_fdfd_only_oid_is_not_fafa_seen():
@@ -130,5 +132,5 @@ def test_dead_oids_cached_per_cursor():
     cur = _cur_with_family([(300, FDFD, 0)])
     first = CompsRecord.dead_oids(cur, short_header=False)
     # Mutating the table after the first call must not change the cached answer.
-    cur.execute("INSERT INTO comps_family VALUES (301, ?, 0)", (FDFD,))
+    cur.execute("INSERT INTO comps_family VALUES (301, ?, 0, 0)", (FDFD,))
     assert CompsRecord.dead_oids(cur, short_header=False) is first

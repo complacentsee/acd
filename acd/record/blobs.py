@@ -30,7 +30,7 @@ class ControllerProps:
 
     Decodes both copies of the attribute -- the kaitai extended_records value
     (used for RedundancyEnabled, whose source is deliberately the truncated
-    record) and the decrypted comps_full value read via full_attrs (used for
+    record) and the decrypted body value read via record_attrs (used for
     the classic time-slice block on short-header and protected projects).
     ``size`` doubles as a family discriminator: exactly 62 bytes marks the
     pre-V21 classic save format (CompatibilityMode V20.01), and the

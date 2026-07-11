@@ -198,48 +198,6 @@ def test_read_ext_attrs_no_marker_returns_empty():
 
 
 # --------------------------------------------------------------------------- #
-# full_record / full_attrs (per-cursor memoized comps_full readers)
-# --------------------------------------------------------------------------- #
-
-
-def _comps_full_cursor(rows):
-    import sqlite3
-
-    cur = sqlite3.connect(":memory:").cursor()
-    cur.execute("CREATE TABLE comps_full(object_id INTEGER PRIMARY KEY, record BLOB)")
-    cur.executemany("INSERT INTO comps_full VALUES (?, ?)", rows)
-    return cur
-
-
-def test_full_attrs_reads_comps_full_payload():
-    payload = _payload([(0x01, b"\x3e\x00"), (0x66, b"\x2a\x00\x00\x00")])
-    cur = _comps_full_cursor([(7, payload)])
-    out = CompsRecord.full_attrs(cur, 7, False)
-    assert out[0x66] == b"\x2a\x00\x00\x00"
-    assert CompsRecord.full_record(cur, 7) == payload
-
-
-def test_full_attrs_missing_row_yields_empty():
-    cur = _comps_full_cursor([])
-    assert CompsRecord.full_attrs(cur, 42, False) == {}
-    assert CompsRecord.full_record(cur, 42) is None
-
-
-def test_full_attrs_memoizes_per_cursor():
-    payload = _payload([(0x66, b"\x07\x00\x00\x00")])
-    cur = _comps_full_cursor([(7, payload)])
-    first = CompsRecord.full_attrs(cur, 7, False)
-    # Drop the row: the memo must answer, and the same dict must come back.
-    cur.execute("DELETE FROM comps_full")
-    assert CompsRecord.full_attrs(cur, 7, False) is first
-    assert CompsRecord.full_record(cur, 7) == payload
-    # A different cursor gets no shared state (the table is empty now).
-    cur2 = cur.connection.cursor()
-    cur2.execute("SELECT 1").fetchone()
-    assert CompsRecord.full_attrs(cur2, 7, False) == {}
-
-
-# --------------------------------------------------------------------------- #
 # body_mode / record_attrs (body-direct comps.record readers, P6.7)
 # --------------------------------------------------------------------------- #
 # Post size-eos flip, comps.record == comps_full.record[body_offset:] for every
@@ -294,17 +252,16 @@ def test_record_attrs_reads_comps_body():
     assert out[0x66] == b"\x2a\x00\x00\x00"
 
 
-def test_record_attrs_matches_full_attrs():
-    """The migration invariant: record_attrs on the body == full_attrs on the
-    header-included payload."""
+def test_record_attrs_matches_header_included_read():
+    """The migration invariant that let comps_full retire (P6.9 C8):
+    record_attrs on the body == the full header-included read on the untruncated
+    payload (what full_attrs did before comps_full was removed)."""
     attrs = [(0x01, b"\x3e\x00"), (0x65, b"\xc4\x00"), (0x66, b"\x99\x00\x00\x00"),
              (0x6E, b"member-descriptor-bytes")]
     payload = _payload(attrs)
-    cur = _comps_full_cursor([(7, payload)])
-    cur.execute("CREATE TABLE comps(object_id INTEGER PRIMARY KEY, record BLOB)")
-    cur.execute("INSERT INTO comps VALUES (?, ?)", (7, payload[LONG_OFF:]))
+    cur = _comps_cursor([(7, payload[LONG_OFF:])])
     assert (CompsRecord.record_attrs(cur, 7, False)
-            == CompsRecord.full_attrs(cur, 7, False))
+            == CompsRecord.read_value_attrs(payload, False, full=True))
 
 
 def test_record_attrs_missing_row_yields_empty():

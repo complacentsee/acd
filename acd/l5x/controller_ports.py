@@ -3,7 +3,7 @@
 #
 # Every attribute value is READ from the backing RxControllerCollection child
 # comp record (SerialPort + ASCII + DF1, EthernetPort1/2, EthernetNetwork)
-# through CompsRecord.full_attrs -- the untruncated, source-protection-aware
+# through CompsRecord.record_attrs -- the body-direct, source-protection-aware
 # ext-attr table -- never emitted as a constant. Presence gates are comp
 # existence (0-FP/0-FN over the 116-project reference pool). The one OEM
 # attribute with no in-record source (SerialPort Channel, reference-invariant

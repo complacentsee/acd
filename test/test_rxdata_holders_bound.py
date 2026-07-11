@@ -2,10 +2,12 @@
 acd.l5x.module_builder._build_rxdata_holders (P6.7a(2)).
 
 On a long-header project each RxDataCollection child's raw is trimmed to its
-declared record length (comps_full[0:4] - 148) so the <public>/<UDCN>/<CF>
-raw-tail scans never read the appended sub-blobs a size-eos comps buffer would
-expose. The trim is a no-op while the comps buffer is still truncated and
-reconstructs it exactly once un-truncated; short-header records are left as-is.
+declared record length (comps_family.record_length - 148) so the
+<public>/<UDCN>/<CF> raw-tail scans never read the appended sub-blobs the
+size-eos comps buffer exposes. When no declared length is stored the raw is
+left as-is; short-header records are left as-is. (The declared length used to
+be read from a comps_full side table, retired in P6.9 C8 in favour of the
+comps_family.record_length column.)
 """
 
 import struct
@@ -17,6 +19,8 @@ try:
 except ImportError:
     from test.seeded_db import seeded_cursor
 
+_FAFA = 64250   # a live holder's winner family
+
 
 def _child_body(cid, body_len, extra=b""):
     """A comps `record` (body) at least ``body_len`` bytes, cid at [12:14],
@@ -26,18 +30,10 @@ def _child_body(cid, body_len, extra=b""):
     return bytes(b) + extra
 
 
-def _full_payload(record_length, total):
-    """A comps_full payload whose declared record length (u32 @0) is
-    ``record_length`` and whose total size is ``total``."""
-    p = bytearray(total)
-    p[0:4] = struct.pack("<I", record_length)
-    return bytes(p)
-
-
 def _seed(cid=0x1234, declared_body=200, appended=300):
     """Long-header collection + one child. The comps body carries the declared
     region plus ``appended`` extra bytes (simulating the un-truncated buffer);
-    comps_full declares record_length = 148 + declared_body."""
+    comps_family declares record_length = 148 + declared_body for the child."""
     child_oid = 5001
     body = _child_body(cid, declared_body, extra=b"\x99" * appended)
     record_length = 148 + declared_body
@@ -45,8 +41,9 @@ def _seed(cid=0x1234, declared_body=200, appended=300):
         (100, 0, "RxDataCollection", 0, 0, b"\x00" * 20),
         (child_oid, 100, "$hash$", 0, 256, body),
     ]
-    comps_full = [(child_oid, _full_payload(record_length, len(body) + 148))]
-    return seeded_cursor(comps=comps, comps_full=comps_full), cid, child_oid, declared_body
+    comps_family = [(child_oid, _FAFA, 1, record_length)]
+    return (seeded_cursor(comps=comps, comps_family=comps_family),
+            cid, child_oid, declared_body)
 
 
 def test_long_header_trims_to_declared_length():
@@ -72,13 +69,13 @@ def test_noop_when_buffer_within_declared_length():
     assert len(raw) == declared
 
 
-def test_missing_comps_full_leaves_raw_untouched():
+def test_missing_record_length_leaves_raw_untouched():
     cid, child_oid = 0x1234, 5001
     body = _child_body(cid, 200, extra=b"\x99" * 300)
     cur = seeded_cursor(comps=[
         (100, 0, "RxDataCollection", 0, 0, b"\x00" * 20),
         (child_oid, 100, "$hash$", 0, 256, body),
-    ])  # no comps_full row for the child
+    ])  # no comps_family row -> LEFT JOIN yields NULL record_length
     holders = _build_rxdata_holders(cur, short_header=False)
     (oid, raw), = holders[cid]
     assert len(raw) == 500             # untouched when no declared length available
