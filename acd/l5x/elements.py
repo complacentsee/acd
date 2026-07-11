@@ -4920,14 +4920,14 @@ class ControllerBuilder(L5xElementBuilder):
         # Controller-properties attributes. These live in the controller record's
         # decrypted ext-attrs, which the kaitai extended_records cannot reach on
         # short-header (V10-V21) projects, so read them via read_value_attrs(full=True)
-        # on the comps_full record (the same dict the force gate uses).
+        # on the comps record body (the same dict the force gate uses).
         time_slice = None
         share_unused_time_slice = None
         compatibility_mode = None
         ethernet_ip_mode = None
         power_loss_program = None
         try:
-            _ctlattrs = CompsRecord.full_attrs(
+            _ctlattrs = CompsRecord.record_attrs(
                 self._cur, results[0][1], self._short_header)
         except Exception:
             _ctlattrs = {}
@@ -5006,7 +5006,7 @@ class ControllerBuilder(L5xElementBuilder):
                 (_rcc[0], child)).fetchone()
             if not _r:
                 return b""
-            return CompsRecord.full_attrs(
+            return CompsRecord.record_attrs(
                 self._cur, _r[0], self._short_header).get(0x1, b"")
         try:
             _tb = _rcc_attr("TimeSynchronize")
