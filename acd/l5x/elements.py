@@ -3190,24 +3190,23 @@ class RoutineBuilder(L5xElementBuilder):
             except Exception:
                 description = None
 
-        # Safety routines carry a generated signature. The routine's decrypted
-        # comps_full record embeds an (otype, cid, disc) triple at body+10/+12/+16;
+        # Safety routines carry a generated signature. The routine's comps
+        # record embeds an (otype, cid, disc) triple at body+10/+12/+16;
         # the 3-key connection_signatures side table holds every GSS signature
         # (routines of one collection share (otype, cid) and differ only by disc, so
         # the 2-key safety_signatures table overwrites all but one -- use the 3-key
         # table). The lookup returns nothing for an unsigned routine (0 false-pos).
         safety_sig = safety_sig_ts = None
         try:
-            # Stays on the raw comps_full path: the (otype, cid, disc) triple
-            # sits at fixed body offsets, not in the attr table.
+            # The (otype, cid, disc) triple sits at fixed body offsets, not in
+            # the attr table; the size-eos comps.record IS the body (offset 0).
             _cf = self._cur.execute(
-                "SELECT record FROM comps_full WHERE object_id=?",
+                "SELECT record FROM comps WHERE object_id=?",
                 (self._object_id,)).fetchone()
             if _cf and _cf[0]:
                 _rb = bytes(_cf[0])
-                _bo = CompsRecord.body_offset(self._short_header)
-                if len(_rb) >= _bo + 20:
-                    _sr = connection_signature_row(self._cur, _rb, _bo)
+                if len(_rb) >= 20:
+                    _sr = connection_signature_row(self._cur, _rb, 0)
                     if _sr and _sr[0]:
                         safety_sig, safety_sig_ts = _sr[0], _sr[1]
         except Exception:
@@ -4037,20 +4036,19 @@ def _render_alarm_conditions(conds):
 
 def _tagcoll_sig_attrs(cur, oid, short_header):
     """Rendered SafetySignature/SafetySignatureTimestamp attribute string for a
-    <Tags> collection, or "" when unsigned. The collection's decrypted comps_full
-    record embeds an (otype, cid, disc) triple at body+10/+12/+16 that keys the
+    <Tags> collection, or "" when unsigned. The collection's comps record
+    embeds an (otype, cid, disc) triple at body+10/+12/+16 that keys the
     connection_signatures side table (which holds every GSS signature)."""
     try:
-        # Stays on the raw comps_full path: the triple sits at fixed body
-        # offsets, not in the attr table.
-        cf = cur.execute("SELECT record FROM comps_full WHERE object_id=?", (oid,)).fetchone()
+        # The triple sits at fixed body offsets, not in the attr table; the
+        # size-eos comps.record IS the body (offset 0).
+        cf = cur.execute("SELECT record FROM comps WHERE object_id=?", (oid,)).fetchone()
         if not cf or not cf[0]:
             return ""
         rb = bytes(cf[0])
-        bo = CompsRecord.body_offset(short_header)
-        if len(rb) < bo + 20:
+        if len(rb) < 20:
             return ""
-        sr = connection_signature_row(cur, rb, bo)
+        sr = connection_signature_row(cur, rb, 0)
         if sr and sr[0]:
             a = f' SafetySignature="{sr[0]}"'
             if sr[1]:
