@@ -248,7 +248,7 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count, modu
     try:
         if not dti:
             return None
-        attrs = CompsRecord.full_attrs(cur, dti, short_header)
+        attrs = CompsRecord.record_attrs(cur, dti, short_header)
         a1 = attrs.get(0x1)
         if not a1 or len(a1) != 354:
             return None

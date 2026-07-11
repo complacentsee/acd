@@ -1,10 +1,10 @@
 """Unit tests for the MESSAGE config decode (MessageConfig grammar +
 _render_message_data), driven end-to-end through the seeded staging DB.
 
-The renderer reads the tag's backing record from comps_full (ext-attr 0x1 =
-the 354-byte config struct; 0x65/0x70/0x67 = UTF-16 member references) and
-must emit a <Data Format="Message"> block only for configurations decoded
-with full confidence -- anything else returns None.
+The renderer reads the tag's backing record body from the comps table
+(ext-attr 0x1 = the 354-byte config struct; 0x65/0x70/0x67 = UTF-16 member
+references) and must emit a <Data Format="Message"> block only for
+configurations decoded with full confidence -- anything else returns None.
 """
 
 import struct
@@ -44,7 +44,11 @@ def _full_record(attrs) -> bytes:
 
 
 def _render(attrs, oid2name=None):
-    cur = seeded_cursor(comps_full=[(DTI, _full_record(attrs))])
+    # Seed both tables the way the extractor does post size-eos: the comps
+    # record column carries the body (payload past the 148-byte header).
+    full = _full_record(attrs)
+    cur = seeded_cursor(comps=[(DTI, 0, "$backing$", 0, 256, full[LONG_OFF:])],
+                        comps_full=[(DTI, full)])
     return _render_message_data(
         cur, False, DTI, oid2name or {}, {}, {}, set())
 

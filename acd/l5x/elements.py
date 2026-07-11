@@ -1848,7 +1848,7 @@ class DataTypeBuilder(L5xElementBuilder):
             # only when the record is too short or no key validates.
             r = _rxgeneric_plaintext_main(results[0][3])
             if r is not None:
-                extended_records = CompsRecord.full_attrs(
+                extended_records = CompsRecord.record_attrs(
                     self._cur, self._object_id, self._short_header
                 )
             if r is None or not extended_records:
