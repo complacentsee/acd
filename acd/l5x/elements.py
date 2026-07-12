@@ -1120,6 +1120,9 @@ class Routine(L5xElement):
     # Safety routines carry a generated signature + timestamp; None omits them.
     _safety_signature: Union[str, None] = field(default=None)
     _safety_signature_timestamp: Union[str, None] = field(default=None)
+    # ST routine source lines decoded from the nameless subtree; None emits no
+    # <STContent> (fail-closed -- see _st_content_lines).
+    _st_lines: Union[List[str], None] = field(default=None)
 
     def to_xml(self) -> str:
         rll_content = ""
@@ -1141,6 +1144,10 @@ class Routine(L5xElement):
                 )
             if rung_xmls:
                 rll_content = f'<RLLContent>{"".join(rung_xmls)}</RLLContent>'
+        if self.type == "ST" and self._st_lines is not None:
+            rll_content = "<STContent>" + "".join(
+                f'<Line Number="{i}">\n<![CDATA[{t}]]>\n</Line>'
+                for i, t in enumerate(self._st_lines)) + "</STContent>"
         # A routine's own Description is the first child, before RLLContent.
         desc_xml = (
             f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
@@ -2333,6 +2340,119 @@ class LocalTagBuilder(L5xElementBuilder):
         return LocalTag(name, name, data_type, dimensions, radix, external_access, description)
 
 
+_ST_AT_TOKEN_RE = re.compile(r"@([0-9a-fA-F]+)@")
+_ST_LINE_MARKER = b"\xff\xfe\xff"
+
+
+def _st_content_lines(cur, routine_oid: int) -> "Union[List[str], None]":
+    """Decode an ST routine's source lines from its nameless subtree, or None.
+
+    The routine's nameless subtree contains exactly one GROUP record that ENDS
+    with a contiguous little-endian u32 array listing all of its line-record
+    children in source order (V20 stores a count u16 right before the array,
+    V33 pads differently -- the trailing-array-of-own-children shape is the
+    version-invariant signature). Each line record carries the UTF-16LE source
+    text after an FF FE FF marker + a 1-byte code-unit length (length 0 = an
+    empty line); ``@<hex>@`` tokens are comps object references resolved to
+    comp_name, and unresolvable tokens are left in place rather than
+    fabricated. V33 files also store a compiled DECOY subtree of the same
+    routine (literal-operand MOVs) whose parent record is too short to carry
+    the trailing child array, so the selection rule structurally rejects it.
+    FAIL-CLOSED: zero or multiple candidate groups, or any array entry whose
+    record does not decode as a line, returns None (routine stays empty).
+    """
+    try:
+        candidates = []
+        frontier = [routine_oid]
+        seen = set()
+        while frontier:
+            nxt: List[int] = []
+            for pid in frontier:
+                for coid, crec in cur.execute(
+                        "SELECT object_id, record FROM nameless "
+                        "WHERE parent_id=?", (pid,)).fetchall():
+                    if coid in seen:
+                        continue
+                    seen.add(coid)
+                    nxt.append(coid)
+                    crec = bytes(crec)
+                    kids = [o for (o,) in cur.execute(
+                        "SELECT object_id FROM nameless WHERE parent_id=?",
+                        (coid,)).fetchall()]
+                    k = len(kids)
+                    if k == 0 or len(crec) < 4 * k:
+                        continue
+                    arr = [struct.unpack_from("<I", crec, len(crec) - 4 * k
+                                              + 4 * i)[0] for i in range(k)]
+                    if set(arr) == set(kids) and len(set(arr)) == k:
+                        candidates.append((coid, arr))
+            frontier = nxt
+        def _deref(oid: int, depth: int = 0) -> "Union[str, None]":
+            # Resolve a comps oid to its export name, following the
+            # ``&<parentHex><suffix>`` module-reference convention recursively
+            # (same rule the alias/rung resolvers use): '&04767ecc:2:I'
+            # renders as 'Local:2:I' in OEM source text.
+            if depth > 6:
+                return None
+            row = cur.execute(
+                "SELECT comp_name FROM comps WHERE object_id=?",
+                (oid,)).fetchone()
+            if not row or not row[0]:
+                return None
+            nm = row[0]
+            m = re.match(r"^&([0-9a-fA-F]+)(.*)$", nm)
+            if m:
+                parent = _deref(int(m.group(1), 16), depth + 1)
+                return (parent + m.group(2)) if parent is not None else None
+            return nm
+
+        def _resolve(mo: "re.Match") -> str:
+            nm = _deref(int(mo.group(1), 16))
+            return nm if nm else mo.group(0)
+
+        def _decode_group(order: "List[int]") -> "Union[List[str], None]":
+            lines: List[str] = []
+            for oid in order:
+                row = cur.execute(
+                    "SELECT record FROM nameless WHERE object_id=?",
+                    (oid,)).fetchone()
+                if not row:
+                    return None
+                rec = bytes(row[0])
+                m = rec.find(_ST_LINE_MARKER)
+                if m < 0 or len(rec) < m + 4:
+                    return None
+                # Code-unit count: u8, with 0xFF as the long-form sentinel
+                # followed by a u16 LE count (observed on 267-unit lines).
+                n = rec[m + 3]
+                tpos = m + 4
+                if n == 0xFF:
+                    if len(rec) < m + 6:
+                        return None
+                    n = struct.unpack_from("<H", rec, m + 4)[0]
+                    tpos = m + 6
+                if len(rec) < tpos + 2 * n:
+                    return None
+                text = rec[tpos:tpos + 2 * n].decode("utf-16-le")
+                lines.append(_ST_AT_TOKEN_RE.sub(_resolve, text))
+            return lines
+
+        # A structural candidate whose children do not ALL decode as line
+        # records is an interior index node (its trailing array lists interior
+        # children), not the line group -- decode success is part of the
+        # selection, and only an unambiguous single survivor is emitted.
+        decoded = []
+        for _, order in candidates:
+            lines = _decode_group(order)
+            if lines is not None:
+                decoded.append(lines)
+        if len(decoded) != 1:
+            return None
+        return decoded[0]
+    except Exception:
+        return None
+
+
 def routine_type_enum(idx: int) -> str:
     if idx == 0:
         return "TypeLess"
@@ -2554,9 +2674,12 @@ class RoutineBuilder(L5xElementBuilder):
         except Exception:
             pass
 
+        st_lines = (_st_content_lines(self._cur, self._object_id)
+                    if routine_type == "ST" else None)
         return Routine(name, name, routine_type, rungs, rung_ids, rung_comments,
                        description, _safety_signature=safety_sig,
-                       _safety_signature_timestamp=safety_sig_ts)
+                       _safety_signature_timestamp=safety_sig_ts,
+                       _st_lines=st_lines)
 
 
 def _parse_fffeff(data: bytes, offset: int):
