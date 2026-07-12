@@ -958,9 +958,14 @@ class Tag(L5xElement):
             # Per-point module I/O ALIAS tag — OEM emits:
             #   Name TagType="Alias" Radix="Binary" AliasFor=... ExternalAccess IO="true"
             # No DataType, no <Data> (the value lives on the alias target), but
-            # the point's operand <Comments> (and EU/Maxes/Mins) DO ride on the
-            # alias tag; without them the element is self-closing.
-            inner = comments_xml + eu_xml + maxes_xml + mins_xml
+            # the point's own <Description> and operand <Comments> (and
+            # EU/Maxes/Mins) DO ride on the alias tag; without them the element
+            # is self-closing.
+            _adesc_raw = next((t for _r, t in self._comments if t), None)
+            _adesc = self._sanitize_xml_text(_adesc_raw) if _adesc_raw else None
+            _adesc_xml = (f'<Description>\n<![CDATA[{_adesc}]]>\n</Description>'
+                          if _adesc else "")
+            inner = _adesc_xml + comments_xml + eu_xml + maxes_xml + mins_xml
             head = (
                 f'<Tag Name="{html.escape(self.name, quote=True)}"'
                 f' TagType="Alias" Radix="Binary"'
@@ -4717,12 +4722,14 @@ class ControllerBuilder(L5xElementBuilder):
                                 si = _DESC_BLOCK_RE.sub("", si)
                             slot_entry[io_type] = si
                 # A rack per-point ALIAS tag (<Chassis>:<slot>:I|O) has no value
-                # image, but its operand-comment blocks are duplicated by OEM
-                # inside the point card's <RackConnection> In/OutAliasTag.
-                # Capture the rendered blocks under the same (chassis oid,
-                # slot) key the point module resolves its entry by.
+                # image, but its Description and operand-comment blocks are
+                # duplicated by OEM inside the point card's <RackConnection>
+                # In/OutAliasTag. Capture the rendered inner (which now carries
+                # the Description too) under the same (chassis oid, slot) key the
+                # point module resolves its entry by.
+                _has_desc = any(t for _r, t in tag._comments)
                 if (tag._io and tag.alias_for and not tag._value_bytes
-                        and (tag._operand_comments or tag._eng_units
+                        and (_has_desc or tag._operand_comments or tag._eng_units
                              or tag._maxes or tag._mins)):
                     am = re.match(r"^&([0-9a-fA-F]+):(\d+):([IO])$", result[0])
                     if am:
