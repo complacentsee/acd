@@ -755,11 +755,12 @@ class ExportL5x:
         )[0]
 
         identifier_offset = 78
-        record_length_absolute = identifier_offset + region_length - 4
+        # The entry array spans [78, 78 + region_length); the last entry starts
+        # at 78 + region_length - 16, so the bound must admit it (a former -4
+        # slack dropped the physically-last entry on every long-header file).
+        region_end = min(len(record), identifier_offset + region_length)
         c = 0
-        while identifier_offset <= (record_length_absolute - 16) and (
-            identifier_offset + 16 <= len(record)
-        ):
+        while identifier_offset + 16 <= region_end:
             parent_id_identifier = struct.unpack(
                 "I", record[identifier_offset : identifier_offset + 4]
             )[0]
