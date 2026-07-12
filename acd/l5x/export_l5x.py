@@ -301,6 +301,39 @@ class ExportL5x:
             [(k,) for k, n in _key_counts.items() if n == 1],
         )
 
+        # ``.!<8hex>`` operand-token resolver (long-header). A module/UDT member
+        # token in a comment operand encodes (collection_id << 16) | member_id,
+        # NOT a comps object_id: collection_id is u16 @ record offset 12 of a
+        # live RxTypeMemberCollection record and member_id is u16 @ record
+        # offset 16 of each of its live named member children; the OEM renders
+        # the member's comp_name uppercased. Only keys resolving to exactly ONE
+        # member name are stored (a fabricated member name mis-attributes a
+        # comment, which is worse than leaving it suppressed); builders treat a
+        # missing key as unresolvable and keep the operand suppressed.
+        self._cur.execute(
+            "CREATE TABLE member_resolve(k INTEGER PRIMARY KEY, name TEXT)")
+        _coll_ids: Dict[int, int] = {}
+        for _oid, _t in comps_by_id.items():
+            if _oid in _dead_derived:
+                continue
+            if _t[2] == "RxTypeMemberCollection" and len(_t[5]) >= 14:
+                _coll_ids[_oid] = int.from_bytes(_t[5][12:14], "little")
+        if _coll_ids:
+            _member_names: Dict[int, set] = {}
+            for _oid, _t in comps_by_id.items():
+                if _oid in _dead_derived:
+                    continue
+                _cid = _coll_ids.get(_t[1])
+                if _cid is None or not _t[2] or len(_t[5]) < 18:
+                    continue
+                _mid = int.from_bytes(_t[5][16:18], "little")
+                _member_names.setdefault((_cid << 16) | _mid, set()).add(_t[2])
+            self._cur.executemany(
+                "INSERT INTO member_resolve VALUES (?,?)",
+                [(k, next(iter(v))) for k, v in _member_names.items()
+                 if len(v) == 1],
+            )
+
         # Project-level flags consumed by TagBuilder for OpcUaAccess and Class:
         #   opc_ua  : the project's OPC UA server is enabled -> every <Tag>,
         #             ConfigTag/InputTag/OutputTag carries OpcUaAccess="None".

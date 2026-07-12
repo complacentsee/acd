@@ -160,6 +160,39 @@ def own_description(cur: Cursor, comment_parent: int) -> Union[str, None]:
     return row[0] if row and row[0] else None
 
 
+_HEX_MEMBER_TOKEN_RE = re.compile(r"\.!([0-9A-Fa-f]{8})")
+
+
+def resolve_hex_operand(cur: Cursor, operand: str) -> Union[str, None]:
+    """Resolve every ``.!<8hex>`` member token in a comment operand, or None.
+
+    A ``.!XXXXXXXX`` token is a (collection_id << 16) | member_id key into the
+    member_resolve side table (built from live RxTypeMemberCollection records);
+    the OEM renders the member's comp_name uppercased as an ordinary ``.NAME``
+    segment, with array/bit suffixes passing through verbatim. Multi-level
+    operands carry one token per nesting level. FAIL-CLOSED: if ANY token is
+    missing from the table (unknown or non-unique key) the whole operand is
+    unresolvable and the caller keeps it suppressed -- a partially fabricated
+    operand mis-attributes the comment, which is worse than omitting it.
+    """
+    def _sub(m: "re.Match") -> str:
+        row = cur.execute(
+            "SELECT name FROM member_resolve WHERE k=?",
+            (int(m.group(1), 16),)).fetchone()
+        if not row or not row[0]:
+            raise LookupError(m.group(0))
+        return "." + row[0].upper()
+    try:
+        out = _HEX_MEMBER_TOKEN_RE.sub(_sub, operand)
+    except LookupError:
+        return None
+    except Exception:
+        return None
+    # A leftover '!' means a malformed token the regex did not cover; never
+    # emit it.
+    return out if "!" not in out else None
+
+
 def short_own_description(cur: Cursor, comment_id: int, cip_type: int,
                           require_unique: bool = False) -> Union[str, None]:
     """A component's own Description (short-header V10-V21 form), or None.
