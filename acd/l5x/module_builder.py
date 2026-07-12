@@ -112,6 +112,11 @@ class Module(L5xElement):
     # used to decide a <RackConnection>'s InAliasTag / OutAliasTag presence.
     _rack_has_input: bool = field(default=False)
     _rack_has_output: bool = field(default=False)
+    # A rack point's per-point alias tag (<Chassis>:<slot>:I|O) operand-comment
+    # blocks; OEM duplicates them inside the RackConnection's InAliasTag /
+    # OutAliasTag. None -> the alias tag stays self-closing.
+    _rack_in_alias_inner: Union[str, None] = field(default=None)
+    _rack_out_alias_inner: Union[str, None] = field(default=None)
     # True when the module owns a safety connection -> emit SafetyEnabled="true".
     _safety_enabled: bool = field(default=False)
     # <ConfigData>/<ConfigScript> for a module with a config image but no controller
@@ -308,9 +313,13 @@ class Module(L5xElement):
             if self._comm_method == _RACK_COMM_METHOD:
                 aliases = ""
                 if self._rack_has_input:
-                    aliases += "<InAliasTag/>"
+                    _in = self._rack_in_alias_inner
+                    aliases += (f"<InAliasTag>{_in}</InAliasTag>" if _in
+                                else "<InAliasTag/>")
                 if self._rack_has_output:
-                    aliases += "<OutAliasTag/>"
+                    _out = self._rack_out_alias_inner
+                    aliases += (f"<OutAliasTag>{_out}</OutAliasTag>" if _out
+                                else "<OutAliasTag/>")
                 connections_xml = (
                     f"<Connections><RackConnection>{aliases}"
                     f"</RackConnection></Connections>"
@@ -1359,6 +1368,8 @@ class ModuleBuilder(L5xElementBuilder):
         status_inner = None
         rack_has_input = False
         rack_has_output = False
+        rack_in_alias_inner = None
+        rack_out_alias_inner = None
         entry = self._io_map.get((self._object_id, None))
         parent_oid = None
         if entry is None:
@@ -1393,6 +1404,8 @@ class ModuleBuilder(L5xElementBuilder):
             status_inner = entry.get("S")
             rack_has_input = bool(entry.get("has_I"))
             rack_has_output = bool(entry.get("has_O"))
+            rack_in_alias_inner = entry.get("alias_inner_I")
+            rack_out_alias_inner = entry.get("alias_inner_O")
 
             # InputTagSuffix / OutputTagSuffix for the module's auto-named data-driven
             # connections: the path decode cannot resolve them, but the module's own
@@ -1649,6 +1662,8 @@ class ModuleBuilder(L5xElementBuilder):
             _status_inner=status_inner,
             _rack_has_input=rack_has_input,
             _rack_has_output=rack_has_output,
+            _rack_in_alias_inner=rack_in_alias_inner,
+            _rack_out_alias_inner=rack_out_alias_inner,
             _safety_enabled=safety_enabled,
             _config_data=configdata,
             _config_script=configscript,

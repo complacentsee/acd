@@ -818,18 +818,32 @@ class Tag(L5xElement):
         return f"<{section}>" + "".join(parts) + f"</{section}>"
 
     def to_xml(self) -> str:
+        # Operand-comment blocks are needed by BOTH the alias-IO early return
+        # below (OEM attaches the per-point <Comments> to the alias tag) and
+        # the shared injection at the bottom, so build them up front.
+        comments_xml = self._build_comments_xml()
+        eu_xml = self._build_operand_block_xml(
+            "EngineeringUnits", "EngineeringUnit", self._eng_units, cdata=True)
+        maxes_xml = self._build_operand_block_xml(
+            "Maxes", "Max", self._maxes, cdata=False)
+        mins_xml = self._build_operand_block_xml(
+            "Mins", "Min", self._mins, cdata=False)
+
         if self._io and (self.tag_type == "Alias" or self.alias_for):
-            # Per-point module I/O ALIAS tag — OEM emits a self-closing tag:
+            # Per-point module I/O ALIAS tag — OEM emits:
             #   Name TagType="Alias" Radix="Binary" AliasFor=... ExternalAccess IO="true"
-            # No DataType, no <Data> (the value lives on the alias target). The
-            # whole element is returned here; the Data/Description machinery below
-            # is skipped (an alias carries none of it).
-            return self._inject_tag_attrs(
+            # No DataType, no <Data> (the value lives on the alias target), but
+            # the point's operand <Comments> (and EU/Maxes/Mins) DO ride on the
+            # alias tag; without them the element is self-closing.
+            inner = comments_xml + eu_xml + maxes_xml + mins_xml
+            head = (
                 f'<Tag Name="{html.escape(self.name, quote=True)}"'
                 f' TagType="Alias" Radix="Binary"'
                 f' AliasFor="{html.escape(self.alias_for, quote=True)}"'
-                f' ExternalAccess="{self.external_access}" IO="true"/>'
+                f' ExternalAccess="{self.external_access}" IO="true"'
             )
+            return self._inject_tag_attrs(
+                head + (f'>{inner}</Tag>' if inner else '/>'))
         if self._io:
             # Module I/O tag — emit the exact OEM attribute set and order:
             #   Name TagType DataType ExternalAccess IO="true"
@@ -859,19 +873,6 @@ class Tag(L5xElement):
             if self.radix == "NullType":
                 self.radix = None
             base = self._inject_tag_attrs(super().to_xml())
-
-        # --- Comments child element (operand-keyed member/bit/array comments) ---
-        comments_xml = self._build_comments_xml()
-
-        # --- EngineeringUnits / Maxes / Mins blocks (analog-point metadata) ---
-        # OEM order is EngineeringUnits, then Maxes, then Mins (Maxes ALWAYS
-        # precedes Mins pool-wide).
-        eu_xml = self._build_operand_block_xml(
-            "EngineeringUnits", "EngineeringUnit", self._eng_units, cdata=True)
-        maxes_xml = self._build_operand_block_xml(
-            "Maxes", "Max", self._maxes, cdata=False)
-        mins_xml = self._build_operand_block_xml(
-            "Mins", "Min", self._mins, cdata=False)
 
         # --- Description child element ---
         # _comments now carries at most the tag's OWN description (member_ref==0),
@@ -4371,6 +4372,25 @@ class ControllerBuilder(L5xElementBuilder):
                             if getattr(tag, "_class_attr", None) == "Safety":
                                 si = _DESC_BLOCK_RE.sub("", si)
                             slot_entry[io_type] = si
+                # A rack per-point ALIAS tag (<Chassis>:<slot>:I|O) has no value
+                # image, but its operand-comment blocks are duplicated by OEM
+                # inside the point card's <RackConnection> In/OutAliasTag.
+                # Capture the rendered blocks under the same (chassis oid,
+                # slot) key the point module resolves its entry by.
+                if (tag._io and tag.alias_for and not tag._value_bytes
+                        and (tag._operand_comments or tag._eng_units
+                             or tag._maxes or tag._mins)):
+                    am = re.match(r"^&([0-9a-fA-F]+):(\d+):([IO])$", result[0])
+                    if am:
+                        rendered = tag.to_xml()
+                        gt = rendered.find(">")
+                        inner = rendered[gt + 1:]
+                        if inner.endswith("</Tag>"):
+                            inner = inner[:-len("</Tag>")]
+                        if inner:
+                            io_data_map.setdefault(
+                                (int(am.group(1), 16), int(am.group(2))), {}
+                            )["alias_inner_" + am.group(3)] = inner
         return tags, io_data_map, alarm_map, short_routine_desc, _ctrl_tags_sig
 
     def _pass_programs(self, data_types_map, redundancy_enabled, alarm_map, short_routine_desc):
