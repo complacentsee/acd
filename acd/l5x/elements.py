@@ -30,6 +30,7 @@ from acd.l5x.base import (
     external_access_enum,
     own_description,
     radix_enum,
+    resolve_aoi_alias_target,
     resolve_hex_operand,
     safety_signature_row,
     short_own_description,
@@ -828,6 +829,9 @@ class Tag(L5xElement):
     # Pre-rendered <Data Format="Axis"> block for an AXIS_VIRTUAL tag, resolved by
     # ControllerBuilder once every MOTION_GROUP tag is known. None -> no <Data>.
     _axis_data_xml: Union[str, None] = field(default=None)
+    # A rack chassis-image alias (structure target) carries no Radix, unlike the
+    # atomic per-point alias which OEM always writes Radix="Binary" on.
+    _alias_no_radix: bool = False
 
     def _inject_tag_attrs(self, base: str) -> str:
         """Insert OpcUaAccess / Class attributes into the opening <Tag ...> of base.
@@ -966,9 +970,10 @@ class Tag(L5xElement):
             _adesc_xml = (f'<Description>\n<![CDATA[{_adesc}]]>\n</Description>'
                           if _adesc else "")
             inner = _adesc_xml + comments_xml + eu_xml + maxes_xml + mins_xml
+            _radix_attr = "" if self._alias_no_radix else ' Radix="Binary"'
             head = (
                 f'<Tag Name="{html.escape(self.name, quote=True)}"'
-                f' TagType="Alias" Radix="Binary"'
+                f' TagType="Alias"{_radix_attr}'
                 f' AliasFor="{html.escape(self.alias_for, quote=True)}"'
                 f' ExternalAccess="{self.external_access}" IO="true"'
             )
@@ -1194,10 +1199,13 @@ class LocalTag(L5xElement):
 class Parameter(L5xElement):
     """Represents a public parameter of an AOI (<Parameter> in L5X)."""
     name: str
-    tag_type: str       # always "Base"
+    tag_type: str       # "Base", or "Alias" for an AOI alias parameter
     data_type: str
     usage: str          # "Input", "Output", or "InOut"
     radix: Union[str, None]   # None for complex types (omitted from XML)
+    # AliasFor target for an AOI alias parameter (None omits the attribute); it
+    # renders between @Radix and @Required, matching OEM's attribute order.
+    alias_for: Union[str, None]
     required: str       # "true" or "false"
     visible: str        # "true" or "false"
     external_access: Union[str, None]  # None for InOut (omitted, replaced by Constant)
@@ -1218,9 +1226,17 @@ class Parameter(L5xElement):
 
     @property
     def _l5x_exclude(self) -> bool:
+        # OEM never emits a __-prefixed scratch tag (SFC/ST step-temporaries
+        # __SL<n>, hex placeholders __l0, import scratch __CLONE) as a
+        # Parameter; the compact-AOI ext01 recovery can hand such a tag a usage
+        # byte that would otherwise route it here, so exclude them exactly as
+        # LocalTag does.
         return (
             not self.name
             or not (self.name[0].isalpha() or self.name[0] == "_")
+            or self.name.startswith("__SL")
+            or self.name.startswith("__l0")
+            or self.name.startswith("__CLONE")
         )
 
     def to_xml(self) -> str:
@@ -1926,6 +1942,24 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
                 constant = None
             else:
                 is_io = False
+        # Rack chassis-image per-point alias (structure-typed IO point, e.g.
+        # Rack_2:1:I of type AB:1756_ENET_17SLOT:I:0): OEM emits it as
+        # TagType="Alias" AliasFor="Rack_2:I.Slot[1]" with NO DataType and NO
+        # Radix (structure target). The tight presence gate (unique slotless
+        # chassis sibling with one matching Slot[] member) fires only on these,
+        # never a genuine ':'-typed module-IO point.
+        _alias_no_radix = False
+        if is_io and not alias_for and data_type and ":" in data_type:
+            try:
+                _raf = self._rack_slot_alias_for(results[0][0], io_name, data_type)
+            except Exception:
+                _raf = None
+            if _raf:
+                alias_for = _raf
+                tag_type = "Alias"
+                data_type = ""
+                constant = None
+                _alias_no_radix = True
 
         # Tag-level Description: a tag must only carry its OWN description, which
         # the comments table identifies by member_ref==0 (sub-element/member
@@ -2205,6 +2239,7 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
             _raw_hex_data=self._raw_hex_first_block(),
             _no_data=suppress_value,
             _io=is_io,
+            _alias_no_radix=_alias_no_radix,
             _opc_ua=_opc_ua, _class_attr=_cls_attr(),
         )
 
@@ -2299,7 +2334,7 @@ class ParameterBuilder(L5xElementBuilder):
         # LONG-header usage layout regardless of the file's header family.
         r, exts, sp = _parse_rec_and_exts(raw_rec)
         if sp and (not exts or r is None):
-            return Parameter(name, name, "Base", data_type, "Input", None, "false", "false", "Read/Write", None, dimensions)
+            return Parameter(name, name, "Base", data_type, "Input", None, None, "false", "false", "Read/Write", None, dimensions)
 
         ext01 = exts.get(0x01, b"")
         usage, required_b, visible_b = _aoi_tag_usage(ext01, short_header=False if sp else self._short_header)
@@ -2339,16 +2374,22 @@ class ParameterBuilder(L5xElementBuilder):
             radix_idx = ext01[0x20F] >> 4
             radix = radix_enum(radix_idx) if radix_idx != 0 else None
 
-        # AOI ALIAS parameter: OEM emits TagType="Alias" with no DataType and no
-        # <DefaultData>. The direction byte ext01[0x20E] bit 0x02 marks exactly
-        # these (14/14 OEM-alias params pool-wide carry it; zero Base/Local
-        # params do). Null the DataType so the base to_xml omits @DataType (None
-        # fields are skipped) and _build_default_data suppresses the DefaultData
-        # pair (empty dt_base); the alias-target path is not yet decoded, so the
-        # tag stays TagType="Base" (its @AliasFor/@TagType residuals are
-        # pre-existing and untouched -- this only removes over-emission).
+        # AOI ALIAS parameter: OEM emits TagType="Alias" AliasFor="<target>" with
+        # no DataType and no <DefaultData>. The direction byte ext01[0x20E] bit
+        # 0x02 marks exactly these (14/14 OEM-alias params pool-wide carry it;
+        # zero Base/Local params do). Null the DataType (base to_xml omits None
+        # attrs and _build_default_data suppresses the DefaultData pair) and
+        # resolve the AliasFor target from ext-attr 0x65 (a @hex@.@hex@ template
+        # of comps oids). Fail-closed: an unresolved template keeps the param
+        # TagType="Base" with no AliasFor, i.e. today's over-emission-only fix.
+        tag_type = "Base"
+        alias_for: Union[str, None] = None
         if not sp and len(ext01) > 0x20E and (ext01[0x20E] & 0x02):
             data_type = None
+            _tgt = resolve_aoi_alias_target(self._cur, raw_rec, self._short_header)
+            if _tgt:
+                tag_type = "Alias"
+                alias_for = _tgt
 
         # --- Description ---
         # Source-protected projects also encrypt the comment text, so for an
@@ -2402,10 +2443,11 @@ class ParameterBuilder(L5xElementBuilder):
         return Parameter(
             name,
             name,
-            "Base",
+            tag_type,
             data_type,
             usage,
             radix,
+            alias_for,
             required,
             visible,
             external_access,
@@ -3234,6 +3276,15 @@ class AoiBuilder(L5xElementBuilder):
                         er.attribute_id: bytes(er.value)
                         for er in r_child.extended_records
                     }
+                    # Compact AOI-tag format (rt 260/1284): the 0x01 identity attr
+                    # is the ext-attr tail's TERMINAL record, which
+                    # extended_records excludes. Recover it so the usage
+                    # classifier sees the real direction byte instead of an empty
+                    # blob (which routes every param to a LocalTag).
+                    if 0x01 not in exts_child:
+                        _lc = getattr(r_child, "last_attribute_record", None)
+                        if _lc is not None and getattr(_lc, "attribute_id", None) == 1:
+                            exts_child[0x01] = bytes(_lc.value)
                     ext01 = exts_child.get(0x01, b"")
                     usage, _, _ = _aoi_tag_usage(ext01, self._short_header)
                     is_param = usage in ("Input", "Output", "InOut")

@@ -166,6 +166,53 @@ def own_description(cur: Cursor, comment_parent: int) -> Union[str, None]:
     return row[0] if row and row[0] else None
 
 
+_AT_TOKEN_RE = re.compile(r"@([0-9a-fA-F]+)@")
+
+
+def resolve_aoi_alias_target(cur: Cursor, raw_rec: bytes,
+                             short_header: bool) -> Union[str, None]:
+    """The AliasFor target of an AOI alias parameter, or None.
+
+    The target is stored in ext-attr 0x65 as a UTF-16LE ``@<hex>@.@<hex>@``
+    template where each ``@<hex>@`` is a comps object_id (following the
+    ``&<parentHex><suffix>`` module-reference convention recursively). This is
+    the same encoding _sp_alias_for decodes for source-protected tag aliases,
+    but the AOI-parameter records are NOT source-protected, so read 0x65
+    directly (no SP-marker gate) via the full body-mode attr walk (the terminal
+    0x65 record is past what RxGeneric.extended_records exposes). Fail-closed:
+    returns None unless every token resolves.
+    """
+    try:
+        attrs = CompsRecord.read_value_attrs(raw_rec, short_header, full=True,
+                                             body_mode=True)
+        raw = attrs.get(0x65)
+        if not raw or len(raw) < 4:
+            return None
+        s = raw.decode("utf-16-le", errors="replace").split("\x00")[0]
+        if not _AT_TOKEN_RE.search(s):
+            return None
+
+        def _resolve(oid: int, depth: int = 0) -> "Union[str, None]":
+            if depth > 6:
+                return None
+            row = cur.execute(
+                "SELECT comp_name FROM comps WHERE object_id=?",
+                (oid,)).fetchone()
+            if not row or row[0] is None:
+                return None
+            m = re.match(r"^&([0-9a-fA-F]+)(.*)$", row[0])
+            if m:
+                p = _resolve(int(m.group(1), 16), depth + 1)
+                return (p + m.group(2)) if p is not None else None
+            return row[0]
+
+        out = _AT_TOKEN_RE.sub(
+            lambda m: (_resolve(int(m.group(1), 16)) or m.group(0)), s)
+        return out if "@" not in out else None
+    except Exception:
+        return None
+
+
 _HEX_MEMBER_TOKEN_RE = re.compile(r"\.!([0-9A-Fa-f]{8})")
 
 
@@ -347,6 +394,18 @@ def _parse_rec_and_exts(raw_rec: bytes):
     """
     try:
         r = RxGeneric.from_bytes(raw_rec)
-        return r, {er.attribute_id: bytes(er.value) for er in r.extended_records}, False
+        exts = {er.attribute_id: bytes(er.value) for er in r.extended_records}
+        # extended_records stops before the ext-attr TAIL's terminal record,
+        # which the kaitai parser keeps in last_attribute_record. In the compact
+        # AOI-tag format (record_type 260/1284) the 0x01 identity attr IS that
+        # terminal record, so it is absent from exts and the AOI usage classifier
+        # sees an empty blob (every SCP param then misroutes to <LocalTag>).
+        # Recover it when 0x01 is otherwise missing; the normal path (0x01 in the
+        # regular records) is untouched.
+        if 0x01 not in exts:
+            _last = getattr(r, "last_attribute_record", None)
+            if _last is not None and getattr(_last, "attribute_id", None) == 1:
+                exts[0x01] = bytes(_last.value)
+        return r, exts, False
     except Exception:
         return _rxgeneric_plaintext_main(raw_rec), CompsRecord.read_ext_attrs_from_record(raw_rec), True

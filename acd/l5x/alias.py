@@ -627,6 +627,59 @@ class TagAliasResolver:
         except Exception:
             return None
 
+    def _rack_slot_alias_for(self, raw_comp_name: str, io_name: str,
+                             own_dt: "Union[str, None]") -> Union[str, None]:
+        """AliasFor of a rack chassis-image per-point alias, or None.
+
+        A rack point tag ``&<hex>:<slot>:<I|O>`` (io_name ``Rack_N:<slot>:I``) is
+        an alias into the chassis-image base tag ``&<hex>:<I|O>`` (io_name
+        ``Rack_N:I``), whose datatype is a chassis type (AB:1756_ENET_<N>SLOT:
+        <I|O>:0) with a single array member ``Slot`` of the point's own datatype.
+        OEM emits ``AliasFor="Rack_N:<I|O>.<arrayMemberName>[<slot>]"`` (e.g.
+        ``Rack_2:I.Slot[1]``). Derived entirely from the sibling tag + its
+        TagInfo layout; distinct from _io_alias_for (the primitive ``.Data[``
+        case) by the point's datatype being a STRUCTURE (``:`` in own_dt).
+        Fail-closed on any missing structural condition, so it can never
+        reclassify a genuine Base module-IO point.
+        """
+        try:
+            m = re.match(r"^(.+):(\d+):([IO])$", io_name)
+            if not m or not own_dt or ":" not in own_dt:
+                return None
+            module, slot, io_type = m.group(1), int(m.group(2)), m.group(3)
+            sm = re.match(r"^(&[0-9a-fA-F]+):\d+:[IO]$", raw_comp_name)
+            if not sm:
+                return None
+            sib = "%s:%s" % (sm.group(1), io_type)
+            srows = self._cur.execute(
+                "SELECT record FROM comps WHERE comp_name=?", (sib,)).fetchall()
+            if len(srows) != 1:
+                return None
+            br = self._parse_rec_tolerant(bytes(srows[0][0]))
+            if br is None or getattr(br, "main_record", None) is None:
+                return None
+            sib_dt_oid = getattr(br.main_record, "data_type", None)
+            if not sib_dt_oid:
+                return None
+            sdt = self._cur.execute(
+                "SELECT comp_name FROM comps WHERE object_id=?",
+                (sib_dt_oid,)).fetchone()
+            if not sdt or not sdt[0]:
+                return None
+            mem = self._taginfo_layout.get(sdt[0].upper())
+            if not mem:
+                return None
+            arr = [(nm, dims) for (nm, mdt, off, bit, hid, dims) in mem
+                   if dims and (mdt or "").upper() == own_dt.upper()]
+            if len(arr) != 1:
+                return None
+            nm, dims = arr[0]
+            if not (0 <= slot < dims[0]):
+                return None
+            return "%s:%s.%s[%d]" % (module, io_type, nm, slot)
+        except Exception:
+            return None
+
     def _resolve_comp_oid(self, oid: int, depth: int = 0) -> Union[str, None]:
         """Resolve a comps object id to its export name, following the
         ``&<parentHex><suffix>`` module-reference convention recursively."""
