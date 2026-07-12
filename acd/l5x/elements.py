@@ -328,6 +328,20 @@ def _render_axis_virtual(blob: bytes, group_name: str) -> "Union[str, None]":
     return f'<Data Format="Axis">\n<AxisParameters {joined}/>\n</Data>'
 
 
+# TODO(MOTION_GROUP <Data Format="MotionGroup">): the sibling of AXIS_VIRTUAL,
+# ~36 pool diffs, HELD by decision (2026-07-12). 3 of the 7
+# MotionGroupParameters attrs ARE byte-derivable from the tag's attr-0x01 blob
+# (CoarseUpdatePeriod u32; blob-length-keyed: V20 @564, V30 @2212, V32+ @2210;
+# Alternate1/2UpdateMultiplier). The other 4 -- GroupType, PhaseShift,
+# GeneralFaultType, AutoTagUpdate -- are pool-CONSTANT with NO locatable offset
+# (they map to zero bytes indistinguishable from padding), so a full render
+# needs them as literal schema constants, and a partial render is net-worse
+# (1 element_missing -> 3-4 attr_missing per file). Left unimplemented until the
+# pool gains a project that VARIES one of those 4 attrs, exposing its offset --
+# then this becomes a clean, fully-derived -36 mirroring _render_axis_virtual.
+# Full offset map: scratchpad p8probes/a7c3_axis_servo_virtual + renderprobes.
+
+
 def _zero_member_node(mdt: str, mdim: int,
                       data_types_map: Dict[str, "DataType"], depth: int):
     """Zero-valued tag_value node for one member (scalar or 1-D array)."""
