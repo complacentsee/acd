@@ -971,11 +971,15 @@ class LocalTag(L5xElement):
 
     @property
     def _l5x_exclude(self) -> bool:
-        """Exclude hex-address placeholders, empty names, and ACD-internal runtime tags."""
+        """Exclude hex-address placeholders, empty names, and ACD-internal runtime
+        tags -- including the SFC/ST step-temporaries (``__SL<n>``) the Tag
+        predicate already drops; the reference exports no ``__``-prefixed
+        LocalTag anywhere in the OEM pool."""
         return (
             not self.name
             or not (self.name[0].isalpha() or self.name[0] == "_")
             or ":" in self.name
+            or self.name.startswith("__SL")
             or self.name.startswith("__l0")
             or self.name.startswith("__CLONE")
         )
