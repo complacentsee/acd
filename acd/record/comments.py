@@ -270,13 +270,22 @@ class CommentsRecord:
           [6:8]  record_type            [8:10] sub_record_length
           [10:14] parent (== comment_id*0x10000 + cip_type)
         then body = raw[14:] (the Utf16Record):
-          [0:8]  unknown   [8:12] object_id   [12:16] unknown
-          [16:]  UTF-16LE NUL-term OPERAND, then 12 unknown bytes,
-                 then a UTF-8 NUL-term comment TEXT.
+          [0:8]  unknown   [8:12] object_id   [12] pad
+          [13]   KIND discriminator: 0x01 comment, 0x02 Min, 0x03 Max,
+                 0x05 EngineeringUnit (byte-confirmed across V24..V36 pool
+                 files; record_type is an ordinal and cannot discriminate)
+          [16:]  UTF-16LE NUL-term OPERAND, then for text kinds 12 unknown
+                 bytes + a UTF-8 NUL-term TEXT; for Min/Max no text at all --
+                 the value is the record's TRAILING 4-byte little-endian REAL.
 
         A real operand is a qualifier relative to the tag (leading '.' or '[');
         requiring that plus printable text rejects the few non-operand records
         that also reach the raw branch. Returns the comments 9-tuple or None.
+        The kind goes into the member_ref column (previously hard-coded 0 here,
+        and no consumer filters member_ref on operand rows) so TagBuilder can
+        route rows to <Comments>/<EngineeringUnits>/<Maxes>/<Mins>; Min/Max
+        rows store the REAL rendered in the Logix Decorated style (the form the
+        OEM emits inside <Max>/<Min>) in record_string.
         """
         if len(raw) < 14:
             return None
@@ -303,6 +312,28 @@ class CommentsRecord:
             return None
         if any((ord(c) < 0x20 and c != "\t") for c in operand):
             return None
+        kind = body[13]
+        if kind in (0x02, 0x03):
+            # Min/Max: the payload is the trailing little-endian REAL (there is
+            # no text, which is why these records used to decode to '' and be
+            # dropped). Render it in the Decorated style at staging so the
+            # builder emits it verbatim.
+            if len(body) < pos + 4:
+                return None
+            from acd.l5x.tag_value import _fmt_real_decorated
+            value_text = _fmt_real_decorated(
+                struct.unpack("<f", body[-4:])[0])
+            return (
+                seq_number,
+                sub_record_length,
+                object_id,
+                value_text,
+                record_type,
+                parent,
+                operand,
+                0,
+                kind,
+            )
         tpos = pos + 12  # skip the 12-byte unknown_3 region
         end = body.find(b"\x00", tpos)
         if end < 0:
@@ -319,7 +350,7 @@ class CommentsRecord:
             parent,
             operand,
             0,
-            0,
+            kind,
         )
 
     @staticmethod
