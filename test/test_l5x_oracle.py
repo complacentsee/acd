@@ -91,12 +91,11 @@ WITHAOI_EXACT = [
     "Trends",
     "DataLogs",
     "TimeSynchronize",
-    # EthernetPorts is a byte-exact pin (P6.9 C7). Its EthernetPort is an
-    # FDFD-winner controller child (oid 1493048019, fafa_seen=0); controller_ports
-    # reads it body-direct via record_attrs, which equals full_attrs only because
-    # the C5 flip aligned comps.record to full[148:]. Pinning it exact turns a
-    # silent D11@155 regression (or a revert of C5) into a test failure -- the
-    # pool gauntlet cannot, since no in-pool FDFD winner sits under the controller.
+    # EthernetPorts is a byte-exact pin (P6.9 C7). This fixture's EthernetPort1
+    # (oid 1771406859) is a LIVE FAFA-winner controller child read body-direct
+    # via record_attrs; pinning it exact guards that read path. The FDFD@148
+    # decode keeps its own pin in test_fdfd_grammar.py, and the liveness gate's
+    # relic side is pinned by test_empty_redundant_dead_ethernet_port_suppressed.
     "EthernetPorts",
 ]
 # Subtrees entirely missing from our export (probe-only, not implemented):
@@ -258,6 +257,17 @@ def test_empty_redundant_exact_subtrees(emptyredundant):
     co, ce = _controller_pair(emptyredundant)
     for tag in EMPTY_REDUNDANT_EXACT:
         _assert_canon_equal(co.find(tag), ce.find(tag), f"Controller/{tag}")
+
+
+def test_empty_redundant_dead_ethernet_port_suppressed(emptyredundant):
+    """This fixture's EthernetPort1 (oid 1493048019) is an FDFD-only relic
+    (comps_family.fafa_seen=0) -- a deleted component Studio keeps in
+    Comps.Dat but never exports; the OEM L5X has no <EthernetPorts>. The
+    controller_ports liveness gate (CompsRecord.dead_oids in _rcc_child)
+    must treat the relic as absent instead of emitting its stale config."""
+    co, ce = _controller_pair(emptyredundant)
+    assert ce.find("EthernetPorts") is None
+    assert co.find("EthernetPorts") is None
 
 
 def test_withaoi_exact_subtrees(withaoi):

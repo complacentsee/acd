@@ -4,8 +4,10 @@
 # Every attribute value is READ from the backing RxControllerCollection child
 # comp record (SerialPort + ASCII + DF1, EthernetPort1/2, EthernetNetwork)
 # through CompsRecord.record_attrs -- the body-direct, source-protection-aware
-# ext-attr table -- never emitted as a constant. Presence gates are comp
-# existence (0-FP/0-FN over the 116-project reference pool). The one OEM
+# ext-attr table -- never emitted as a constant. Presence gates are LIVE comp
+# existence: an FDFD-only relic (CompsRecord.dead_oids) is a deleted component
+# Studio never exports, so it is treated as absent rather than emitted from
+# its stale record (0-FP/0-FN over the 116-project reference pool). The one OEM
 # attribute with no in-record source (SerialPort Channel, reference-invariant
 # "0") is omitted rather than fabricated. Unrecognised enum codes or
 # short/absent payloads degrade to omitting the element (the pre-existing
@@ -38,8 +40,15 @@ _MASTER_MSG_TRANSMIT = {0: "Between station polls"}
 _EP_BLOCK = 106
 
 
-def _rcc_child(cur: Cursor, controller_oid: int, name: str) -> Optional[int]:
-    """object_id of the named RxControllerCollection child comp, or None."""
+def _rcc_child(cur: Cursor, controller_oid: int, name: str,
+               short_header: bool) -> Optional[int]:
+    """object_id of the named LIVE RxControllerCollection child comp, or None.
+
+    A deleted controller child survives in Comps.Dat as an FDFD-only relic
+    (comps_family.fafa_seen=0); emitting from its stale record would invent
+    config the project no longer has (ACDTestsEmptyRedundant's deleted
+    EthernetPort1, oid 1493048019, is the pinned case), so a dead oid is
+    treated as absent."""
     rcc = cur.execute(
         "SELECT object_id FROM comps WHERE parent_id=? AND "
         "comp_name='RxControllerCollection'", (controller_oid,)).fetchone()
@@ -48,20 +57,21 @@ def _rcc_child(cur: Cursor, controller_oid: int, name: str) -> Optional[int]:
     row = cur.execute(
         "SELECT object_id FROM comps WHERE parent_id=? AND comp_name=?",
         (rcc[0], name)).fetchone()
-    return row[0] if row else None
+    if not row or row[0] in CompsRecord.dead_oids(cur, short_header):
+        return None
+    return row[0]
 
 
 def _attrs(cur: Cursor, controller_oid: int, name: str,
            short_header: bool) -> Optional[Dict[int, bytes]]:
-    oid = _rcc_child(cur, controller_oid, name)
+    oid = _rcc_child(cur, controller_oid, name, short_header)
     if oid is None:
         return None
-    # Body-direct read of comps.record (D11). Valid since the P6.9 C5 flip made
-    # comps.record == full[148:] for BOTH long-header families, so record_attrs
-    # equals full_attrs even for an FDFD-winner controller child (verified on
-    # ACDTestsEmptyRedundant EthernetPort oid 1493048019). No in-pool FDFD winner
-    # sits under RxControllerCollection, so the fixture pins are the regression
-    # gate, not the pool gauntlet.
+    # Body-direct read of comps.record (D11), valid since the P6.9 C5 flip made
+    # comps.record == full[148:] for BOTH long-header families. The FDFD@148
+    # decode keeps its own pin in test_fdfd_grammar.py; the oracle fixtures pin
+    # both liveness directions (WithAOI live port byte-exact, EmptyRedundant
+    # relic suppressed).
     return CompsRecord.record_attrs(cur, oid, short_header)
 
 
@@ -155,7 +165,7 @@ def build_ethernet_ports(cur: Cursor, controller_oid: int, short_header: bool,
         except (TypeError, ValueError):
             ane_form = False
         has_ip2 = _rcc_child(
-            cur, controller_oid, "InternetProtocol2") is not None
+            cur, controller_oid, "InternetProtocol2", short_header) is not None
         ports = []
         for n in (1, 2):
             attrs = _attrs(
