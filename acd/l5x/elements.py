@@ -197,6 +197,108 @@ def _is_valid_operand(op: str) -> bool:
     return bool(op) and ".!" not in op and bool(_OPERAND_RE.match(op))
 
 
+# ---- AXIS_VIRTUAL <Data Format="Axis"> renderer ------------------------- #
+# The value image is attr 0x01 of the tag's cip-0x6a backing (body_mode); it is
+# a fixed-offset struct whose fixed header (offsets 158..1182) is identical
+# across every firmware generation and whose only version-shifting field is the
+# tail InterpolatedPositionConfiguration offset (+ whether AxisUpdateSchedule is
+# appended). The int->label tables are reference-invariant Logix motion-schema
+# constants (same class as radix_enum), NOT per-device values. Validated
+# byte-exact vs OEM on 13/13 pool AXIS_VIRTUAL tags across firmware 20/30/33/35.
+_AXIS_ENUM: Dict[str, Dict[int, str]] = {
+    "RotaryAxis": {0: "Linear", 1: "Rotary"},
+    "HomeMode": {0: "Passive", 1: "Active", 2: "Absolute"},
+    "HomeDirection": {0: "Uni-directional Forward", 1: "Bi-directional Forward",
+                      2: "Uni-directional Reverse", 3: "Bi-directional Reverse"},
+    "HomeSequence": {0: "Immediate", 1: "Switch", 2: "Marker"},
+    "ProgrammedStopMode": {0: "Fast Stop", 1: "Fast Disable"},
+    "AxisUpdateSchedule": {0: "Base"},
+}
+# Fixed header attrs (name, offset, kind[, enum]); kind: f real, d u32-dec,
+# h u32-hex (16#XXXX_XXXX), s u16-len-prefixed UTF-8, e u8 enum.
+_AXIS_VIRTUAL_HEADER = [
+    ("ConversionConstant", 196, "f"),
+    ("OutputCamExecutionTargets", 1055, "d"),
+    ("PositionUnits", 158, "s"),
+    ("AverageVelocityTimebase", 192, "f"),
+    ("RotaryAxis", 200, "e", "RotaryAxis"),
+    ("PositionUnwind", 201, "d"),
+    ("HomeMode", 205, "e", "HomeMode"),
+    ("HomeDirection", 206, "e", "HomeDirection"),
+    ("HomeSequence", 207, "e", "HomeSequence"),
+    ("HomeConfigurationBits", 208, "h"),
+    ("HomePosition", 212, "f"),
+    ("HomeOffset", 216, "f"),
+    ("MaximumSpeed", 228, "f"),
+    ("MaximumAcceleration", 232, "f"),
+    ("MaximumDeceleration", 236, "f"),
+    ("ProgrammedStopMode", 240, "e", "ProgrammedStopMode"),
+    ("MasterInputConfigurationBits", 1129, "d"),
+    ("MasterPositionFilterBandwidth", 1133, "f"),
+    ("MaximumAccelerationJerk", 1174, "f"),
+    ("MaximumDecelerationJerk", 1178, "f"),
+    ("DynamicsConfigurationBits", 1182, "d"),
+]
+# Blob length -> (InterpolatedPositionConfiguration offset, AxisUpdateSchedule
+# present). The blob length is the firmware-generation discriminator, read
+# straight from the record, so this needs no external version input; an
+# unknown length falls through to today's no-<Data> behaviour (0-worse).
+_AXIS_VIRTUAL_TAIL = {
+    3430: (3426, False),
+    3666: (3426, True),
+    5476: (3474, True),
+    5843: (3506, True),
+}
+
+
+def _axis_attr(blob: bytes, off: int, kind: str, enum: str = "") -> str:
+    if kind == "f":
+        return _tag_value._fmt_real_decorated(struct.unpack_from("<f", blob, off)[0])
+    if kind == "d":
+        return str(struct.unpack_from("<I", blob, off)[0])
+    if kind == "h":
+        return _tag_value._format_int_radix(
+            "UDINT", struct.unpack_from("<I", blob, off)[0], 4, "Hex")
+    if kind == "s":
+        ln = struct.unpack_from("<H", blob, off)[0]
+        return blob[off + 2:off + 2 + ln].decode("utf-8", errors="replace")
+    if kind == "e":
+        return _AXIS_ENUM[enum][blob[off]]
+    raise ValueError(kind)
+
+
+def _render_axis_virtual(blob: bytes, group_name: str) -> "Union[str, None]":
+    """The full <Data Format="Axis"><AxisParameters .../></Data> for an
+    AXIS_VIRTUAL tag, or None when the blob length is an unrecognised firmware
+    generation (keep today's no-<Data>, never a wrong render)."""
+    tail = _AXIS_VIRTUAL_TAIL.get(len(blob))
+    if tail is None:
+        return None
+    ipc_off, aus = tail
+    try:
+        parts = [f'MotionGroup="{html.escape(group_name, quote=True)}"']
+        for entry in _AXIS_VIRTUAL_HEADER:
+            val = _axis_attr(blob, entry[1], entry[2],
+                             entry[3] if len(entry) > 3 else "")
+            parts.append(f'{entry[0]}="{html.escape(val, quote=True)}"')
+        ipc = _tag_value._format_int_radix(
+            "UDINT", struct.unpack_from("<I", blob, ipc_off)[0], 4, "Hex")
+        parts.append(f'InterpolatedPositionConfiguration="{ipc}"')
+        if aus:
+            parts.append('AxisUpdateSchedule="'
+                         + _AXIS_ENUM["AxisUpdateSchedule"][0] + '"')
+    except Exception:
+        return None
+    # OEM joins attrs with a single space, breaking to a newline+space after
+    # every 11th attribute.
+    joined = ""
+    for i, p in enumerate(parts):
+        if i:
+            joined += "\n " if i % 11 == 0 else " "
+        joined += p
+    return f'<Data Format="Axis">\n<AxisParameters {joined}/>\n</Data>'
+
+
 def _zero_member_node(mdt: str, mdim: int,
                       data_types_map: Dict[str, "DataType"], depth: int):
     """Zero-valued tag_value node for one member (scalar or 1-D array)."""
@@ -703,6 +805,9 @@ class Tag(L5xElement):
     # Pre-rendered <Data Format="Alarm"> block for an ALARM_DIGITAL tag, resolved
     # by ControllerBuilder from the tag's data-table backing. None -> no <Data>.
     _alarm_data_xml: Union[str, None] = field(default=None)
+    # Pre-rendered <Data Format="Axis"> block for an AXIS_VIRTUAL tag, resolved by
+    # ControllerBuilder once every MOTION_GROUP tag is known. None -> no <Data>.
+    _axis_data_xml: Union[str, None] = field(default=None)
 
     def _inject_tag_attrs(self, base: str) -> str:
         """Insert OpcUaAccess / Class attributes into the opening <Tag ...> of base.
@@ -947,6 +1052,13 @@ class Tag(L5xElement):
         # a Decorated structure); the block is resolved by the controller builder.
         if not data_xml and not self._no_data and self._alarm_data_xml:
             data_xml = self._alarm_data_xml
+
+        # --- AXIS_VIRTUAL tag <Data Format="Axis"> block ---
+        # AXIS_VIRTUAL is in _SKIP_DECORATED; its value image is attr 0x01 (not
+        # 0x66), resolved by the controller builder once MotionGroup names are
+        # known. None -> keep today's no-<Data> (element_missing, never worse).
+        if not data_xml and not self._no_data and self._axis_data_xml:
+            data_xml = self._axis_data_xml
 
         # --- ConsumeInfo child (Consumed tags) ---
         # OEM emits <ConsumeInfo> as the FIRST child of a Consumed tag, before
@@ -4936,6 +5048,49 @@ class ControllerBuilder(L5xElementBuilder):
                             self._cur, self._short_header, _at._data_table_instance)
             except Exception:
                 pass
+
+        # AXIS_VIRTUAL tags carry a <Data Format="Axis"> block whose value image
+        # is attr 0x01 of the cip-0x6a backing (not 0x66); MotionGroup resolves
+        # against every MOTION_GROUP tag, so this runs post-build. Only
+        # AXIS_VIRTUAL is emitted -- the other axis datatypes (SERVO/SERVO_DRIVE/
+        # CIP_DRIVE) carry attributes that cannot be byte-reproduced and stay
+        # element_missing rather than go net-worse.
+        try:
+            _ax_tags = list(tags)
+            for _prog in programs:
+                _ax_tags.extend(_prog.tags)
+            # {MOTION_GROUP backing comment_id -> group tag name}
+            _grp_by_cid: Dict[int, str] = {}
+            for _gt in _ax_tags:
+                if (_gt.data_type or "").upper() != "MOTION_GROUP":
+                    continue
+                _gr = self._cur.execute(
+                    "SELECT record FROM comps WHERE object_id=?",
+                    (_gt._data_table_instance,)).fetchone()
+                if _gr and _gr[0] is not None and len(bytes(_gr[0])) >= 14:
+                    _cid = struct.unpack_from("<H", bytes(_gr[0]), 12)[0]
+                    _grp_by_cid[_cid] = _gt.name
+            for _at in _ax_tags:
+                if ((_at.data_type or "").upper() != "AXIS_VIRTUAL"
+                        or _at.tag_type == "Alias"):
+                    continue
+                _br = self._cur.execute(
+                    "SELECT record FROM comps WHERE object_id=?",
+                    (_at._data_table_instance,)).fetchone()
+                if not _br or _br[0] is None:
+                    continue
+                _blob = CompsRecord.read_value_attrs(
+                    bytes(_br[0]), self._short_header, full=True,
+                    body_mode=True).get(0x01)
+                if not _blob or len(_blob) < 14:
+                    continue
+                _gcid = struct.unpack_from("<H", _blob, 8)[0]
+                _gname = _grp_by_cid.get(_gcid)
+                if _gname is None:
+                    continue
+                _at._axis_data_xml = _render_axis_virtual(_blob, _gname)
+        except Exception:
+            pass
 
     def _pass_motion_sync(self, tags, programs, modules):
         # CIP Motion: a 2094-family integrated-motion drive (ProductType 37) that
