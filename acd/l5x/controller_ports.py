@@ -204,6 +204,54 @@ def build_ethernet_ports(cur: Cursor, controller_oid: int, short_header: bool,
         return ""
 
 
+# InternetProtocol config codes: only the reference-verified code decodes (an
+# unseen code omits the element). Code 1 = a manually configured static
+# address; the unconfigured comps (address block all zero) carry 0 here.
+_IP_CONFIG_TYPE = {1: "Manual"}
+
+# The InternetProtocol address block in the record's 0x1 ext-attr value:
+# five little-endian IPv4 words at IPAddress=142, SubnetMask=146, Gateway=150,
+# PrimaryDNS=154, SecondaryDNS=158, with the config code at offset 0 (verified
+# at those locations across all 56 live InternetProtocol records pool-wide;
+# every record is 303 bytes).
+_IP_BLOCK = 142
+
+
+def _ipv4_le(v: bytes, off: int) -> str:
+    return ".".join(str(b) for b in v[off:off + 4][::-1])
+
+
+def build_internet_protocol(cur: Cursor, controller_oid: int,
+                            short_header: bool,
+                            major_rev: Union[str, None]) -> str:
+    """<InternetProtocol> with the controller's IP configuration, or "" when
+    absent. The reference exports the element only on the AutoNegotiate-form
+    generation (firmware major <= 24, the build_ethernet_ports boundary);
+    newer exports omit it even when the comp carries a configured address."""
+    try:
+        try:
+            if int(major_rev) > 24:
+                return ""
+        except (TypeError, ValueError):
+            return ""
+        attrs = _attrs(cur, controller_oid, "InternetProtocol", short_header)
+        if attrs is None:
+            return ""
+        v = attrs.get(0x1, b"")
+        if len(v) < _IP_BLOCK + 20:
+            return ""
+        return (
+            f'<InternetProtocol ConfigType="{_IP_CONFIG_TYPE[v[0]]}"'
+            f' IPAddress="{_ipv4_le(v, _IP_BLOCK)}"'
+            f' SubnetMask="{_ipv4_le(v, _IP_BLOCK + 4)}"'
+            f' Gateway="{_ipv4_le(v, _IP_BLOCK + 8)}"'
+            f' PrimaryDNS="{_ipv4_le(v, _IP_BLOCK + 12)}"'
+            f' SecondaryDNS="{_ipv4_le(v, _IP_BLOCK + 16)}"/>'
+        )
+    except Exception:
+        return ""
+
+
 def build_ethernet_network(cur: Cursor, controller_oid: int,
                            short_header: bool) -> str:
     """<EthernetNetwork> (the CIP DLR ring supervisor config), or "" when the

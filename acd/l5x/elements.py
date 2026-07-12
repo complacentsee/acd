@@ -47,6 +47,7 @@ from acd.l5x.controller_ports import (
     build_comm_ports,
     build_ethernet_network,
     build_ethernet_ports,
+    build_internet_protocol,
 )
 from acd.l5x.datatypes import (
     DataType,
@@ -1503,10 +1504,12 @@ class Controller(L5xElement):
     # <CST MasterID>, read from the controller's CST config record. Default "0".
     _cst_master_id: str = field(default="0")
     # Pre-rendered controller communication port elements (see
-    # acd.l5x.controller_ports): <CommPorts> sits immediately before <CST>,
-    # <EthernetPorts> + <EthernetNetwork> follow <TimeSynchronize> (the
-    # reference's invariant placement). "" omits each.
+    # acd.l5x.controller_ports): <CommPorts> sits immediately before <CST>;
+    # <InternetProtocol>, <EthernetPorts> and <EthernetNetwork> follow
+    # <TimeSynchronize> in that order (the reference's invariant placement).
+    # "" omits each.
     _comm_ports_xml: str = field(default="")
+    _internet_protocol_xml: str = field(default="")
     _ethernet_ports_xml: str = field(default="")
     _ethernet_network_xml: str = field(default="")
     # The controller-level safety signatures rendered as <SafetyInfo> children, each a
@@ -1581,6 +1584,7 @@ class Controller(L5xElement):
             + ('<DataLogs/>' if self._emit_data_logs else '')
             + (f'<TimeSynchronize Priority1="{self._ts_priority1}" '
                f'Priority2="{self._ts_priority2}" PTPEnable="{self._ts_ptp_enable}"/>')
+            + self._internet_protocol_xml
             + self._ethernet_ports_xml
             + self._ethernet_network_xml
             + '</Controller>'
@@ -5368,6 +5372,8 @@ class ControllerBuilder(L5xElementBuilder):
             self._pass_processor_identity(modules, _comm_path_prefix, _ctlattrs)
         comm_ports_xml = build_comm_ports(
             self._cur, self._object_id, self._short_header)
+        internet_protocol_xml = build_internet_protocol(
+            self._cur, self._object_id, self._short_header, major_rev)
         ethernet_ports_xml = build_ethernet_ports(
             self._cur, self._object_id, self._short_header, major_rev)
         ethernet_network_xml = build_ethernet_network(
@@ -5426,6 +5432,7 @@ class ControllerBuilder(L5xElementBuilder):
             _io_memory_pad_percentage=io_memory_pad_percentage,
             _data_table_pad_percentage=data_table_pad_percentage,
             _comm_ports_xml=comm_ports_xml,
+            _internet_protocol_xml=internet_protocol_xml,
             _ethernet_ports_xml=ethernet_ports_xml,
             _ethernet_network_xml=ethernet_network_xml,
             _ts_ptp_enable=ts_ptp_enable,
