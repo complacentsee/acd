@@ -30,6 +30,7 @@ from acd.l5x.base import (
     external_access_enum,
     own_description,
     radix_enum,
+    resolve_hex_operand,
     safety_signature_row,
     short_own_description,
 )
@@ -631,6 +632,13 @@ class Tag(L5xElement):
     # e.g. ("[3]", "Hydraulic Pump\r\nStart"). Empty by default (long-header
     # path leaves these untouched).
     _operand_comments: List[Tuple[str, str]] = field(default_factory=list)
+    # Operand-keyed EngineeringUnit / Max / Min entries from the same comment
+    # records, routed by the record kind byte (comments.member_ref). OEM emits
+    # them as standalone sibling blocks -- <EngineeringUnits>, <Maxes>, <Mins>,
+    # always in that order -- between Description and Data. Empty by default.
+    _eng_units: List[Tuple[str, str]] = field(default_factory=list)
+    _maxes: List[Tuple[str, str]] = field(default_factory=list)
+    _mins: List[Tuple[str, str]] = field(default_factory=list)
     # Alias target (e.g. "Local:1:I.Data.10"); None for non-alias tags. When set,
     # tag_type is "Alias", data_type is None (omitted), and NO <Data> child is
     # emitted. This is populated only by the V10..V21 short-header TagBuilder
@@ -781,6 +789,34 @@ class Tag(L5xElement):
         parts.append("</Comments>")
         return "".join(parts)
 
+    def _build_operand_block_xml(self, section: str, child: str,
+                                 items: List[Tuple[str, str]],
+                                 cdata: bool) -> str:
+        """One <EngineeringUnits>/<Maxes>/<Mins> block, or "" when empty.
+
+        Mirrors _build_comments_xml (first-occurrence dedup, insertion order).
+        EngineeringUnit text is a CDATA block on its own line (the same shape
+        as <Comment>); Max/Min values are plain inline element text with no
+        CDATA and no newlines -- both shapes OEM-verified pool-wide.
+        """
+        seen = set()
+        parts: List[str] = []
+        for operand, text in items:
+            if not operand or operand in seen:
+                continue
+            seen.add(operand)
+            op_attr = html.escape(operand, quote=True)
+            if cdata:
+                body = self._sanitize_xml_text(text) if text else ""
+                parts.append(
+                    f'<{child} Operand="{op_attr}">\n<![CDATA[{body}]]>\n</{child}>')
+            else:
+                parts.append(
+                    f'<{child} Operand="{op_attr}">{html.escape(text or "")}</{child}>')
+        if not parts:
+            return ""
+        return f"<{section}>" + "".join(parts) + f"</{section}>"
+
     def to_xml(self) -> str:
         if self._io and (self.tag_type == "Alias" or self.alias_for):
             # Per-point module I/O ALIAS tag — OEM emits a self-closing tag:
@@ -826,6 +862,16 @@ class Tag(L5xElement):
 
         # --- Comments child element (operand-keyed member/bit/array comments) ---
         comments_xml = self._build_comments_xml()
+
+        # --- EngineeringUnits / Maxes / Mins blocks (analog-point metadata) ---
+        # OEM order is EngineeringUnits, then Maxes, then Mins (Maxes ALWAYS
+        # precedes Mins pool-wide).
+        eu_xml = self._build_operand_block_xml(
+            "EngineeringUnits", "EngineeringUnit", self._eng_units, cdata=True)
+        maxes_xml = self._build_operand_block_xml(
+            "Maxes", "Max", self._maxes, cdata=False)
+        mins_xml = self._build_operand_block_xml(
+            "Mins", "Min", self._mins, cdata=False)
 
         # --- Description child element ---
         # _comments now carries at most the tag's OWN description (member_ref==0),
@@ -936,15 +982,18 @@ class Tag(L5xElement):
                 )
 
         if (not self._alarm_xml and not consume_xml and not produce_xml
-                and not comments_xml and not desc_xml and not data_xml):
+                and not comments_xml and not desc_xml and not data_xml
+                and not eu_xml and not maxes_xml and not mins_xml):
             return base
 
         # Insert <AlarmConditions> first (Logix emits it before everything else on
         # a tag), then ConsumeInfo/ProduceInfo (Consumed/Produced tags), then
-        # Comments, Description, Data, immediately after the opening tag.
+        # Comments, Description, EngineeringUnits/Maxes/Mins, Data, immediately
+        # after the opening tag.
         idx = base.index(">")
         return (base[:idx + 1] + self._alarm_xml + consume_xml + produce_xml
-                + comments_xml + desc_xml + data_xml + base[idx + 1:])
+                + comments_xml + desc_xml + eu_xml + maxes_xml + mins_xml
+                + data_xml + base[idx + 1:])
 
 
 @dataclass
@@ -1826,6 +1875,9 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
         # with the operand in tag_reference and the text in record_string.
         # Wrapped so any failure degrades to today's no-operand-comment behaviour.
         operand_comments: List[Tuple[str, str]] = []
+        eng_units: List[Tuple[str, str]] = []
+        maxes: List[Tuple[str, str]] = []
+        mins: List[Tuple[str, str]] = []
         if self._short_header and r.cip_type == 0x6B:
             # SHORT (V10..V21): keyed by the bare comment_id; record types 3..11.
             # Restricted to cip 0x6b: cip-0x68 tags share a constant comment_id
@@ -1869,24 +1921,46 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
             # Studio does not surface). COLLISION-SAFE: only emit when the key is
             # owned by exactly one comp (unique_comment_key) -- cip-0x68 tags share
             # a constant comment_id and would smear otherwise. A '.!<hex>' operand
-            # anywhere in the path is a module connection point Logix resolves to a
-            # member name (a separate feature), never surfaced as a tag comment; it
-            # is excluded as a substring ("[30].!0F83..." also occurs).
+            # is a member token, (collection<<16)|member into member_resolve;
+            # resolve_hex_operand rewrites it to the OEM member path and is
+            # fail-closed (any unresolvable token keeps the operand suppressed,
+            # today's behaviour). Rows are routed by the record kind byte
+            # (member_ref): EngineeringUnit/Min/Max rows are NOT tag comments --
+            # OEM renders them as their own blocks. Kaitai-staged rows (rt
+            # 3/4/13/14) carry member_ref 0 and stay on the comment path.
             try:
                 parent_key = (r.comment_id * 0x10000) + r.cip_type
                 self._cur.execute(
-                    "SELECT c.tag_reference, c.record_string FROM comments c "
+                    "SELECT c.tag_reference, c.record_string, c.member_ref "
+                    "FROM comments c "
                     "WHERE c.parent=? "
                     "AND c.tag_reference!='' AND c.tag_reference!='__REVISION_NOTE__' "
                     "AND c.record_string!='' "
                     "AND EXISTS (SELECT 1 FROM unique_comment_key u WHERE u.k=c.parent)",
                     (parent_key,),
                 )
-                for op_ref, op_text in self._cur.fetchall():
-                    if op_text and _is_valid_operand(op_ref):
+                for op_ref, op_text, op_kind in self._cur.fetchall():
+                    if not op_text:
+                        continue
+                    if ".!" in op_ref:
+                        op_ref = resolve_hex_operand(self._cur, op_ref)
+                        if op_ref is None:
+                            continue
+                    if not _is_valid_operand(op_ref):
+                        continue
+                    if op_kind == 0x05:
+                        eng_units.append((op_ref, op_text))
+                    elif op_kind == 0x02:
+                        mins.append((op_ref, op_text))
+                    elif op_kind == 0x03:
+                        maxes.append((op_ref, op_text))
+                    else:
                         operand_comments.append((op_ref, op_text))
             except Exception:
                 operand_comments = []
+                eng_units = []
+                mins = []
+                maxes = []
 
         extended_records: Dict[int, bytes] = {}
         for extended_record in r.extended_records:
@@ -1930,6 +2004,9 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
             r.main_record.data_table_instance,
             comment_results,
             _operand_comments=operand_comments,
+            _eng_units=eng_units,
+            _maxes=maxes,
+            _mins=mins,
             alias_for=alias_for,
             _value_bytes=value_bytes,
             _short_header=self._short_header,
