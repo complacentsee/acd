@@ -1111,12 +1111,20 @@ def _render_string_inner(layout, image: bytes, dt_name: str = "STRING"
             for d in (dims or []):
                 total *= d
             raw = image[off:off + total]
-            length = 0
-            # Use LEN if present/valid; else stop at first NUL.
-            length = next((struct.unpack_from("<i", image, m[2])[0]
-                           for m in layout if m[0].upper() == "LEN"
-                           and m[2] + 4 <= len(image)), 0)
-            if length <= 0 or length > len(raw):
+            # The Decorated DATA member shows the LOGICAL string -- exactly the
+            # first LEN characters. A valid LEN of 0 is an EMPTY string even when
+            # the SINT buffer still holds stale bytes past LEN (which OEM does not
+            # surface); only fall back to a first-NUL scan when the LEN member is
+            # absent or its value is out of range (corrupt). Reading LEN==0 as
+            # "invalid -> NUL-scan" was the bug: it leaked cleared strings' stale
+            # buffer content.
+            _len_off = next((m[2] for m in layout if m[0].upper() == "LEN"
+                             and m[2] + 4 <= len(image)), None)
+            if _len_off is not None:
+                length = struct.unpack_from("<i", image, _len_off)[0]
+                if length < 0 or length > len(raw):
+                    length = len(raw.split(b"\x00", 1)[0])
+            else:
                 length = len(raw.split(b"\x00", 1)[0])
             text = _ascii_string_cdata(raw[:length])
             # OEM wraps non-empty STRING DATA member content in single quotes
