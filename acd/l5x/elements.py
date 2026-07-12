@@ -1185,6 +1185,9 @@ class AOI(L5xElement):
     routines: List[Routine]
     _description: Union[str, None] = field(default=None)
     _revision_note: str = field(default="")
+    # AdditionalHelpText (UDI_EXT_HELP) -- emitted after RevisionNote, before
+    # Parameters (the OEM child order); "" omits the element.
+    _additional_help_text: str = field(default="")
 
     def __post_init__(self):
         super().__post_init__()
@@ -1198,6 +1201,9 @@ class AOI(L5xElement):
             inject += f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
         if self._revision_note:
             inject += f'<RevisionNote>\n<![CDATA[{self._revision_note}]]>\n</RevisionNote>'
+        if self._additional_help_text:
+            inject += (f'<AdditionalHelpText>\n<![CDATA['
+                       f'{self._additional_help_text}]]>\n</AdditionalHelpText>')
         return base[:idx + 1] + inject + base[idx + 1:]
 
 
@@ -3133,9 +3139,10 @@ class AoiBuilder(L5xElementBuilder):
                 except Exception:
                     pass
 
-        # --- Description + RevisionNote ---
+        # --- Description + RevisionNote + AdditionalHelpText ---
         aoi_description: Union[str, None] = None
         revision_note = ""
+        additional_help = ""
         if _r_aoi is not None:
             aoi_comment_parent = (_r_aoi.comment_id * 0x10000) + _r_aoi.cip_type
             if self._short_header:
@@ -3157,6 +3164,20 @@ class AoiBuilder(L5xElementBuilder):
                 rn_row = self._cur.fetchone()
                 if rn_row:
                     revision_note = rn_row[0] or ""
+            except Exception:
+                pass
+            try:
+                # UDI_EXT_HELP rows key on the bare comment_id in the
+                # short-header family and on the long comment key otherwise.
+                self._cur.execute(
+                    "SELECT record_string FROM comments "
+                    "WHERE parent IN (?, ?) AND tag_reference='__EXT_HELP__' "
+                    "LIMIT 1",
+                    (_r_aoi.comment_id, aoi_comment_parent),
+                )
+                ah_row = self._cur.fetchone()
+                if ah_row:
+                    additional_help = ah_row[0] or ""
             except Exception:
                 pass
 
@@ -3188,6 +3209,7 @@ class AoiBuilder(L5xElementBuilder):
             parameters, local_tags, routines,
             aoi_description,
             revision_note,
+            _additional_help_text=additional_help,
         )
 
 

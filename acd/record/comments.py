@@ -366,6 +366,66 @@ class CommentsRecord:
             owner_ref,
         )
 
+    _UDI_EXT_HELP_MARKER = "UDI_EXT_HELP".encode("utf-16-le") + b"\x00\x00"
+
+    @staticmethod
+    def _parse_udi_ext_help(raw: bytes, short_header: bool) -> Optional[tuple]:
+        """Parse an AOI AdditionalHelpText record (UDI_EXT_HELP), or None.
+
+        The record carries the help text after the NUL-terminated
+        ``UDI_EXT_HELP`` type string (plus zero padding), keyed by the AOI's
+        comment id in the header parent field. The text encoding follows the
+        header family exactly like the UDI_HISTORY (RevisionNote) record:
+        UTF-16LE on short-header (V10-V21) files, NUL-terminated UTF-8 on
+        long-header ones. The kaitai path mangles the short-header variant
+        (we emitted nothing before), so the record is decoded from raw bytes,
+        gated on the type-string marker. CRLF is preserved like every other
+        staged text. Stored under the ``__EXT_HELP__`` tag_reference sentinel
+        with object_id 0 so own_description's object_id==1 filter can never
+        surface it as a Description.
+        """
+        i = raw.find(CommentsRecord._UDI_EXT_HELP_MARKER)
+        if i < 0 or len(raw) < 14:
+            return None
+        seq_number = struct.unpack_from("<H", raw, 4)[0]
+        record_type = struct.unpack_from("<H", raw, 6)[0]
+        sub_record_length = struct.unpack_from("<H", raw, 8)[0]
+        parent = struct.unpack_from("<I", raw, 10)[0]
+        pos = i + len(CommentsRecord._UDI_EXT_HELP_MARKER)
+        if short_header:
+            while (pos + 1 < len(raw)
+                    and struct.unpack_from("<H", raw, pos)[0] == 0):
+                pos += 2
+            cus = []
+            while pos + 1 < len(raw):
+                cu = struct.unpack_from("<H", raw, pos)[0]
+                pos += 2
+                if cu == 0:
+                    break
+                cus.append(cu)
+            text = "".join(chr(c) for c in cus)
+        else:
+            while pos < len(raw) and raw[pos] == 0:
+                pos += 1
+            end = raw.find(b"\x00", pos)
+            if end < 0:
+                end = len(raw)
+            text = raw[pos:end].decode("utf-8", errors="replace")
+        if not text:
+            return None
+        return (
+            seq_number,
+            sub_record_length,
+            0,
+            text,
+            record_type,
+            parent,
+            "__EXT_HELP__",
+            0,
+            0,
+            0,
+        )
+
     @staticmethod
     def _parse_sp_operand_body(raw: bytes) -> Optional[tuple]:
         """Parse a SOURCE-PROTECTED long-header operand record, or None.
@@ -491,6 +551,14 @@ class CommentsRecord:
         if dat_record.identifier != 64250:
             return None
         raw_full = bytes(dat_record.record.record_buffer)
+        # AOI AdditionalHelpText (UDI_EXT_HELP) -- both header families; the
+        # marker gate is exact, and neither downstream parser handles these
+        # (the short operand parser bails on UDI_ and the kaitai mangles the
+        # short-header layout).
+        if CommentsRecord._UDI_EXT_HELP_MARKER in raw_full:
+            parsed = CommentsRecord._parse_udi_ext_help(raw_full, short_header)
+            if parsed is not None:
+                return parsed
         # V10..V21 short-header operand comments (member/bit/array element
         # comments) use a different body layout than V24+ long-header records.
         # Decode them here so TagBuilder can emit <Comment Operand="..."> children.
