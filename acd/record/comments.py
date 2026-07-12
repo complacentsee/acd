@@ -122,37 +122,66 @@ class CommentsRecord:
           [8:10]  u16 sub_record_length
           [10:14] u32 parent  (== the owning component's comment_id)
         then the body (raw[14:]):
-          [0:6]   six zero bytes
+          [0:2]   u16 OWNER ORDINAL: zero for a controller-scope (cip-0x6B)
+                  comment (the header parent alone owns it), the owning tag's
+                  scope-local 0x6B ordinal for a program-scope (cip-0x68)
+                  comment -- the short-header analog of the long-header
+                  owner_ref, here in the record header at raw[14:16].
+          [2:6]   four zero bytes
           [6:8]   u16 member key (a per-element discriminator)
           [8:12]  u32 object_id (controller/scope object, constant per project)
           [12]    one pad byte (0x00)
           [13:]   UTF-16LE NUL-terminated OPERAND string ("[3]", ".5", ".DINT[1]")
           [..]    UTF-16LE NUL-terminated comment text (newlines kept as CR/LF)
 
-        Returns the 9-tuple matching the comments table schema, or None.  The
+        The record HEADER carries the scope/owner cip discriminators: raw[8:10]
+        = scope cip (0x68 program / 0x6B controller), raw[12:14] = owner cip
+        (0x6B on a program-scope record, 0 on a controller-scope one).
+
+        Returns the 10-tuple matching the comments table schema, or None.  The
         operand goes into the tag_reference column and the comment text into
         record_string so the existing comments-table join can read both.
         """
-        if len(raw) < 14:
+        if len(raw) < 16:
             return None
         record_length = struct.unpack_from("<I", raw, 0)[0]
         seq_number = struct.unpack_from("<H", raw, 4)[0]
         sub_record_length = struct.unpack_from("<H", raw, 8)[0]
-        parent = struct.unpack_from("<I", raw, 10)[0]
+        scope_cip = struct.unpack_from("<H", raw, 8)[0]
+        owner_cip = struct.unpack_from("<H", raw, 12)[0]
+        owner_ord = struct.unpack_from("<H", raw, 14)[0]
         body = raw[14:]
         if len(body) < 14:
             return None
-        # Structural guard: an operand-comment body always begins with six zero
-        # bytes (the leading member-discriminator region) and a zero pad byte at
-        # body[12]. Non-operand records (own descriptions, internal metadata)
-        # that fall into this branch fail the check and return None so the caller
-        # degrades gracefully. This is what lets the caller attempt the operand
-        # parse for EVERY record_type (the type is an ordinal, not an enum)
-        # without misparsing the few non-operand records that share the branch.
-        if body[0:6] != b"\x00\x00\x00\x00\x00\x00" or body[12] != 0:
+        # Structural guard: a controller-scope operand body begins with six zero
+        # bytes and a zero pad at body[12]; a program-scope operand body carries
+        # its owner ordinal at body[0:2] (== raw[14:16]) with body[2:6] still
+        # zero, and is recognised only under its exact header discriminators
+        # (scope cip 0x68 + owner cip 0x6B). Non-operand records fail both and
+        # return None so the caller degrades gracefully. The type is an ordinal,
+        # not an enum, so this must reject cleanly for every record_type.
+        _controller_form = (body[0:6] == b"\x00\x00\x00\x00\x00\x00")
+        _program_form = (
+            scope_cip == 0x68 and owner_cip == 0x6B and owner_ord != 0
+            and body[2:6] == b"\x00\x00\x00\x00")
+        if (not _controller_form and not _program_form) or body[12] != 0:
             return None
         member_key = struct.unpack_from("<H", body, 6)[0]
         object_id = struct.unpack_from("<I", body, 8)[0]
+        # Attribution keys, aligned to the long-header owner path so a
+        # program-scope tag resolves identically:
+        #   controller-scope: parent = raw[10:14] (the bare scope comment_id),
+        #     owner_ref = 0 (the parent alone owns the row -- today's behaviour).
+        #   program-scope: parent = raw[8:12] = (comment_id << 16) | 0x0068 (the
+        #     shared program-scope key, == TagBuilder's comment_id*0x10000+cip),
+        #     owner_ref = raw[12:16] = (ordinal << 16) | 0x006B (the owning tag's
+        #     own key, == its comp record[14:18]).
+        if _program_form:
+            parent = struct.unpack_from("<I", raw, 8)[0]
+            owner_ref = struct.unpack_from("<I", raw, 12)[0]
+        else:
+            parent = struct.unpack_from("<I", raw, 10)[0]
+            owner_ref = 0
 
         def _utf16z(buf: bytes, pos: int):
             cus = []
@@ -188,7 +217,7 @@ class CommentsRecord:
             operand,        # tag_reference column carries the L5X Operand
             0,              # rung_content
             member_key,     # member_ref column carries the per-element key
-            0,              # owner_ref (long-header concept; not decoded short)
+            owner_ref,      # owner_ref: program-scope owning-tag key (0 = ctrl)
         )
 
     @staticmethod

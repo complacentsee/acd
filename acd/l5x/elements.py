@@ -1964,8 +1964,7 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
                         "AND c.record_string!=''",
                         (parent_key,),
                     )
-                elif (not self._short_header and own_key
-                        and (own_key & 0xFFFF) == 0x6B
+                elif (own_key and (own_key & 0xFFFF) == 0x6B
                         and self._cur.execute(
                             "SELECT 1 FROM unique_owner_key WHERE scope=? AND own=?",
                             (parent_key, own_key)).fetchone()):
