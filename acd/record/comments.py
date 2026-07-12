@@ -510,8 +510,14 @@ class CommentsRecord:
                 pass
         # V24+ long-header operand/member/array comments whose record_type is not
         # one of the four the kaitai decodes (3/4/13/14). 1/2 = own descriptions,
-        # 12 = UDI metadata, 23/25 = controller records -- all handled below; every
-        # other type is an operand record the kaitai drops, so decode it here.
+        # 12 = UDI metadata -- handled below; every other type is attempted as an
+        # operand record here. record_type is an ORDINAL within the parent group,
+        # not a type enum, so even the ordinals genuine controller records use
+        # elsewhere (23/25) are legitimate operand comments on a tag with enough
+        # of them (a 1,113-comment tag reaches ordinals far beyond both); the
+        # structural gates in the parser (leading './[' operand, printable,
+        # non-empty text) reject real controller records, which then fall to the
+        # kaitai path exactly as before.
         # A source-protected record's operand tail is AES-encrypted from the
         # comps marker (the plaintext parse below would yield a mojibake operand
         # that the emission validator rejects), so try the SP-aware parse FIRST
@@ -520,12 +526,12 @@ class CommentsRecord:
         if not short_header and len(raw_full) >= 8:
             try:
                 rt = struct.unpack_from("<H", raw_full, 6)[0]
-                if (rt not in (0x01, 0x02, 0x0C, 0x17, 0x19)
+                if (rt not in (0x01, 0x02, 0x0C)
                         and _SP_MARKER in raw_full):
                     parsed = CommentsRecord._parse_sp_operand_body(raw_full)
                     if parsed is not None:
                         return parsed
-                if rt not in (0x01, 0x02, 0x03, 0x04, 0x0C, 0x0D, 0x0E, 0x17, 0x19):
+                if rt not in (0x01, 0x02, 0x03, 0x04, 0x0C, 0x0D, 0x0E):
                     parsed = CommentsRecord._parse_long_operand_body(raw_full)
                     if parsed is not None:
                         return parsed
