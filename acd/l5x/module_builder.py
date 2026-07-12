@@ -84,6 +84,9 @@ class Module(L5xElement):
     # record when available, else carry the defaults the import accepts.
     _connections: List[dict] = field(default_factory=list)
     _extended_properties: str = field(default="")
+    # ExtendedProperties <private> block (DNET/DNB scanner config path); "" when
+    # the module carries none.
+    _extended_private: str = field(default="")
     # True when the project's OPC UA server is enabled; module IO tag stubs then
     # carry OpcUaAccess="None" (see ExportL5x.project_flags).
     _opc_ua: bool = field(default=False)
@@ -119,6 +122,11 @@ class Module(L5xElement):
     _rack_out_alias_inner: Union[str, None] = field(default=None)
     # True when the module owns a safety connection -> emit SafetyEnabled="true".
     _safety_enabled: bool = field(default=False)
+    # True when the module's identity class_word is a SafetyEnabled-bearing class
+    # (0x618 safety I/O, 0x702 ethernet safety device): OEM writes the attribute
+    # ('true' or 'false') on these and omits it elsewhere. Drives (0x200/0x201)
+    # are deliberately excluded -- OEM omits the attribute on most of them.
+    _safety_enabled_gate: bool = field(default=False)
     # <ConfigData>/<ConfigScript> for a module with a config image but no controller
     # :C tag (mutually exclusive with the ConfigTag above). Each is (hex_data, size)
     # or None. The raw <Data> is masked by the comparator; the size attribute is the
@@ -150,9 +158,15 @@ class Module(L5xElement):
     def to_xml(self) -> str:
         # Hash-named drive peripherals have no Name attribute in Logix-exported L5X.
         name_attr = "" if self.name == "?" else f'Name="{self.name}" '
-        # The reference writes SafetyEnabled="true" on a safety module (one that
-        # owns a safety connection); it omits the attribute on non-safety modules.
-        safety_attr = ' SafetyEnabled="true"' if self._safety_enabled else ''
+        # The reference writes SafetyEnabled on safety I/O (class_word 0x618) and
+        # ethernet safety devices (0x702): "true" when the module owns a safety
+        # connection, "false" otherwise. It omits the attribute on every other
+        # module class (notably 0x200/0x201 drives).
+        if self._safety_enabled_gate:
+            safety_attr = (' SafetyEnabled="true"' if self._safety_enabled
+                           else ' SafetyEnabled="false"')
+        else:
+            safety_attr = ' SafetyEnabled="true"' if self._safety_enabled else ''
         if self._safety_network is not None:
             safety_attr += f' SafetyNetwork="{self._safety_network}"'
         if self._safety_signature is not None:
@@ -420,9 +434,17 @@ class Module(L5xElement):
                 f'</Communications>'
             )
 
-        # <ExtendedProperties> section — only emitted when public data is known.
+        # <ExtendedProperties> section. Public-only keeps its exact prior byte
+        # form (the comparator normalizes inter-tag whitespace); a DNET/DNB
+        # <private> block follows the public block verbatim, with OEM's newline
+        # after the opening tag.
         ext_xml = ""
-        if self._extended_properties:
+        if self._extended_private:
+            pub = (f'<public>{self._extended_properties}</public>'
+                   if self._extended_properties else '')
+            ext_xml = (f'<ExtendedProperties>\n{pub}'
+                       f'{self._extended_private}</ExtendedProperties>')
+        elif self._extended_properties:
             ext_xml = f'<ExtendedProperties><public>{self._extended_properties}</public></ExtendedProperties>'
 
         return f'<Module {attrs}>{desc_xml}{ekey}{ports}{comm_xml}{ext_xml}</Module>'
@@ -752,6 +774,44 @@ class ModuleBuilder(L5xElementBuilder):
             if end_tag_m:
                 return after_pub[:end_tag_m.start()]
             return after_pub.rstrip("\x00 \r\n")
+        return ""
+
+    def _private_props_from_data_collection(self, data_link: int) -> str:
+        """The module's ExtendedProperties ``<private>...</private>`` block, or "".
+
+        DNET/DNB scanner modules store a ``<private><Filename>...</Filename>
+        </private>`` block (the RSNetworx config path) in the SAME hash-named
+        RxDataCollection child as the ``<public>`` block. The whole block is
+        returned verbatim. Read from the UNTRUNCATED comps body (not the
+        _rxdata_by_cid entry, whose long-header raw is clipped to the declared
+        record length and can drop the closing ``</private>`` -- verified on
+        PROJ_M), with the decrypted 0x66 image as the
+        source-protected fallback, mirroring the public extractor.
+        """
+        if not data_link:
+            return ""
+        for child_oid, _raw in self._rxdata_by_cid.get(data_link & 0xFFFF, []):
+            frow = self._cur.execute(
+                "SELECT record FROM comps WHERE object_id=?",
+                (child_oid,)).fetchone()
+            full = bytes(frow[0]) if frow and frow[0] is not None else b""
+            for buf in (full,):
+                s = buf.find(b"<private>")
+                if s >= 0:
+                    e = buf.find(b"</private>", s)
+                    if e >= 0:
+                        return buf[s:e + len(b"</private>")].decode(
+                            "latin-1", errors="replace")
+            # Source-protected: the plaintext body is ciphertext; the block
+            # lives in the decrypted ext-attr 0x66 image.
+            img = CompsRecord.record_attrs(
+                self._cur, child_oid, self._short_header).get(0x66, b"")
+            s = img.find(b"<private>")
+            if s >= 0:
+                e = img.find(b"</private>", s)
+                if e >= 0:
+                    return img[s:e + len(b"</private>")].decode(
+                        "latin-1", errors="replace")
         return ""
 
     def _udcn_from_data_collection(self, data_link: int) -> Union[str, None]:
@@ -1235,6 +1295,7 @@ class ModuleBuilder(L5xElementBuilder):
         # STAGING: CommMethod resolved via the comment_id link (full Communications).
         comm_method = self._comm_method_from_data_link(data_link)
         extended_properties = self._extended_properties_from_data_collection(data_link)
+        extended_private = self._private_props_from_data_collection(data_link)
         # Drive-peripheral modules name their underlying device in
         # UserDefinedCatalogNumber, recovered from the linked device-profile record.
         ud_catalog_number = (self._udcn_from_data_collection(data_link)
@@ -1580,10 +1641,15 @@ class ModuleBuilder(L5xElementBuilder):
         # 305, present (high byte nonzero) only on a safety module.
         drives_adc_enabled = drives_adc_mode = safety_network = None
         safety_signature = safety_signature_timestamp = None
+        safety_enabled_gate = False
         try:
             _fe1 = CompsRecord.record_attrs(
                 self._cur, self._object_id, self._short_header).get(0x001, b"")
             _fmi = ModuleIdentity.from_bytes(_fe1)
+            # class_word 0x618 (safety I/O) and 0x702 (ethernet safety device)
+            # are the classes OEM always writes SafetyEnabled on; verified
+            # byte-exact across the pool (249/249, 0 counterexamples).
+            safety_enabled_gate = _fmi.class_word in (0x0618, 0x0702)
             if _fmi.class_word in (0x0200, 0x0201):
                 _p = _fe1.find(b"\xff\xff\xff\xff")
                 _v = struct.unpack_from("<I", _fe1, _p - 4)[0] if _p >= 4 else 0
@@ -1653,6 +1719,7 @@ class ModuleBuilder(L5xElementBuilder):
             _comm_method=comm_method,
             _connections=connections,
             _extended_properties=extended_properties,
+            _extended_private=extended_private,
             _opc_ua=_opc_ua,
             _config_inner=config_inner,
             _config_size=config_size,
@@ -1665,6 +1732,7 @@ class ModuleBuilder(L5xElementBuilder):
             _rack_in_alias_inner=rack_in_alias_inner,
             _rack_out_alias_inner=rack_out_alias_inner,
             _safety_enabled=safety_enabled,
+            _safety_enabled_gate=safety_enabled_gate,
             _config_data=configdata,
             _config_script=configscript,
             _drives_adc_enabled=drives_adc_enabled,

@@ -5129,6 +5129,20 @@ class ControllerBuilder(L5xElementBuilder):
         # Controller-scoped <Tags> safety signature (separate from the AOI-section one).
         if _ctrl_tags_sig:
             controller._section_attrs["tags"] = _ctrl_tags_sig
+        # <Modules> safety signature (otype 105, empty name): present only on the
+        # 14 OEM-signed projects, byte-exact there; both signature and timestamp
+        # are required so an incomplete row never renders a bare attribute.
+        try:
+            _mod_sig = self._cur.execute(
+                "SELECT signature, timestamp FROM named_safety_signatures "
+                "WHERE otype=105 AND name=''").fetchone()
+        except Exception:
+            _mod_sig = None
+        if _mod_sig and _mod_sig[0] and _mod_sig[1]:
+            controller._section_attrs["modules"] = (
+                f' SafetySignature="{_mod_sig[0]}"'
+                f' SafetySignatureTimestamp="'
+                f'{html.escape(_mod_sig[1], quote=True)}"')
         return controller
 
 
