@@ -3649,19 +3649,23 @@ def _build_short_routine_descriptions(cur) -> Dict[int, str]:
     parent == 0x6D0000 | (comment_id & 0xFFFF) -- the rung-comment record tag --
     keyed by the per-routine member_ref at record[16:20], with a zero
     rung_content (rung comments under the same parent carry the nonzero rung id).
-    The (comment_id & 0xFFFF) parent collides across the routines of one program,
-    so the member_ref discriminator is not globally unique: where two routines
-    map to the same (parent, member_ref) the description cannot be attributed to
-    one of them, so BOTH are dropped (a fabricated description is worse than a
-    missing one). Only routines whose (parent, member_ref) is unique in the file
-    are resolved. Best-effort: any parse failure simply omits that routine.
+    The (comment_id & 0xFFFF) parent collides across the routines of one program
+    AND with UDI/AOI-internal routines (e.g. an AOI's "Logic") sharing the
+    comment_id -- and member_ref alone cannot break the tie (it is a constant
+    pool-wide). The owner's cip_type does: the description row stores it in the
+    sub_record_length column (the same discriminator short_own_description
+    uses), so the map is keyed on (parent, member_ref, cip_type) and the row
+    lookup filters on it. Where two routines still map to the same key the
+    description cannot be attributed to one of them, so BOTH are dropped (a
+    fabricated description is worse than a missing one). Best-effort: any
+    parse failure simply omits that routine.
     """
     cur.execute(
         "SELECT object_id, record FROM comps WHERE parent_id IN "
         "(SELECT object_id FROM comps WHERE comp_name='RxRoutineCollection')"
     )
-    keyed: Dict[int, Tuple[int, int]] = {}
-    counts: Dict[Tuple[int, int], int] = {}
+    keyed: Dict[int, Tuple[int, int, int]] = {}
+    counts: Dict[Tuple[int, int, int], int] = {}
     for oid, rec in cur.fetchall():
         rec = bytes(rec)
         if len(rec) < 20:
@@ -3672,22 +3676,24 @@ def _build_short_routine_descriptions(cur) -> Dict[int, str]:
             # unparseable tails stay excluded from the map (as before).
             _r.extended_records
             cid = _r.comment_id
+            cip = _r.cip_type
         except Exception:
             continue
         parent = 0x6D0000 | (cid & 0xFFFF)
         mref = struct.unpack_from("<I", rec, 16)[0]
-        keyed[oid] = (parent, mref)
-        counts[(parent, mref)] = counts.get((parent, mref), 0) + 1
+        keyed[oid] = (parent, mref, cip)
+        counts[(parent, mref, cip)] = counts.get((parent, mref, cip), 0) + 1
     out: Dict[int, str] = {}
-    for oid, (parent, mref) in keyed.items():
-        if counts[(parent, mref)] != 1:
+    for oid, (parent, mref, cip) in keyed.items():
+        if counts[(parent, mref, cip)] != 1:
             continue
         cur.execute(
             "SELECT record_string FROM comments "
             "WHERE parent=? AND member_ref=? AND record_type=1 "
+            "AND sub_record_length=? "
             "AND (rung_content IS NULL OR rung_content=0) "
             "AND record_string!='' LIMIT 1",
-            (parent, mref),
+            (parent, mref, cip),
         )
         drow = cur.fetchone()
         if drow and drow[0]:

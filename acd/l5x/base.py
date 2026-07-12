@@ -145,11 +145,15 @@ def own_description(cur: Cursor, comment_parent: int) -> Union[str, None]:
     The own-description row lives at parent == comment_id*0x10000 + cip_type
     with member_ref 0 and carries object_id == 1; rows sharing the key with a
     nonzero object_id are scratch/extended-help values whose record_string
-    would leak in as a fabricated Description, so they are excluded.
+    would leak in as a fabricated Description, so they are excluded. An AOI's
+    UDI_HISTORY row (RevisionNote) shares the whole key with object_id 1 too;
+    it is stored under the __REVISION_NOTE__ tag_reference sentinel and is
+    fetched separately, so it must not shadow the real description row here.
     """
     cur.execute(
         "SELECT record_string FROM comments "
-        "WHERE parent=? AND member_ref=0 AND object_id=1 LIMIT 1",
+        "WHERE parent=? AND member_ref=0 AND object_id=1 "
+        "AND tag_reference!='__REVISION_NOTE__' LIMIT 1",
         (comment_parent,),
     )
     row = cur.fetchone()

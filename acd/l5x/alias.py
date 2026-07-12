@@ -53,6 +53,22 @@ class TagAliasResolver:
             m = re.search(r"@([0-9a-fA-F]+)@(\.?[^\x00@]*)", s)
             if not m:
                 return None
+            # A genuine Base tag's data_table_instance points at its own
+            # ``$<hex>$`` RxData value backing (the same discriminator
+            # _long_header_alias_like uses); such a tag is NOT an alias even
+            # when a stale ``@hex@`` blob survives in its record. Reject only
+            # on a positive ``$`` match so a parse failure keeps the blob path.
+            try:
+                r = self._parse_rec_tolerant(raw_rec)
+                dti = r.main_record.data_table_instance if r is not None else None
+                if dti:
+                    drow = self._cur.execute(
+                        "SELECT comp_name FROM comps WHERE object_id=" + str(dti)
+                    ).fetchone()
+                    if drow and drow[0] and drow[0].startswith("$"):
+                        return None
+            except Exception:
+                pass
             self._cur.execute(
                 "SELECT comp_name FROM comps WHERE object_id=" + str(int(m.group(1), 16))
             )
