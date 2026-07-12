@@ -1401,6 +1401,17 @@ class Task(L5xElement):
     # Safety task signature/timestamp (None omits the attributes).
     safety_signature: Union[str, None] = field(default=None)
     safety_signature_timestamp: Union[str, None] = field(default=None)
+    _description: Union[str, None] = field(default=None)
+
+    def to_xml(self) -> str:
+        base = super().to_xml()
+        if not self._description:
+            return base
+        # A task's own Description is its first child, before ScheduledPrograms.
+        desc_xml = (f'<Description>\n<![CDATA[{_xml_sane(self._description)}]]>'
+                    f'\n</Description>')
+        idx = base.index(">")
+        return base[:idx + 1] + desc_xml + base[idx + 1:]
 
 
 @dataclass
@@ -4043,6 +4054,23 @@ class TaskBuilder(L5xElementBuilder):
         if task_type == "EVENT":
             event_info = self._build_event_info(e01, record)
 
+        # A task's own Description is stored under the same own-description key
+        # scheme as tags/routines/programs (long: comment_id*0x10000 + cip_type,
+        # object_id==1; short: bare comment_id filtered by owner cip). Verified
+        # byte-exact vs OEM. Best-effort: any parse failure omits the Description.
+        description: Union[str, None] = None
+        try:
+            _tr = RxGeneric.from_bytes(record)
+            _tr.extended_records
+            if self._short_header:
+                description = short_own_description(
+                    self._cur, _tr.comment_id, _tr.cip_type)
+            else:
+                description = own_description(
+                    self._cur, (_tr.comment_id * 0x10000) + _tr.cip_type)
+        except Exception:
+            description = None
+
         return Task(
             name,
             name,
@@ -4057,6 +4085,7 @@ class TaskBuilder(L5xElementBuilder):
             scheduled_programs,
             safety_signature=task_sig,
             safety_signature_timestamp=task_sig_ts,
+            _description=description,
         )
 
 
