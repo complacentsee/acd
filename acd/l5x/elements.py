@@ -512,7 +512,11 @@ def _render_value_blocks(element: str,
     # (verified byte-exact pool-wide).
     is_string = (dt_base == "STRING") and (
         dimensions is None or string_array_as_string)
-    if not is_string and dimensions is None and taginfo_layout:
+    # A custom-string ARRAY (String50[16], CustomStrUDT[]...) is rendered by
+    # OEM as a single Format="String" block (element[0]) just like a scalar
+    # custom string, so admit the layout-based detection for arrays too when the
+    # caller opts in (string_array_as_string, the short-header raw-hex-first era).
+    if not is_string and (dimensions is None or string_array_as_string) and taginfo_layout:
         try:
             lay = _tag_value._resolve_layout(dt_base, taginfo_layout,
                                              data_types_map)
@@ -2000,12 +2004,17 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
             # is): cip-0x68 tags share a constant comment_id, so the bare-cid
             # lookup there matches another comp's description and fabricates one.
             # Wrapped so any failure degrades to today's no-description behaviour.
+            # An AOI DEFINITION's own-description row shares this bare comment_id
+            # but stores the AOI cip (0x6c) in sub_record_length; filtering on the
+            # tag's own cip (0x6b) excludes it (the same owner-cip discriminator
+            # base.short_own_description uses), so a tag never inherits an AOI's
+            # description.
             try:
                 self._cur.execute(
                     "SELECT record_string FROM comments "
                     "WHERE parent=? AND member_ref=0 AND record_type IN (1,2) "
-                    "AND record_string!='' LIMIT 1",
-                    (r.comment_id,),
+                    "AND sub_record_length=? AND record_string!='' LIMIT 1",
+                    (r.comment_id, r.cip_type),
                 )
                 desc_row = self._cur.fetchone()
                 if desc_row and desc_row[0]:
@@ -2313,6 +2322,17 @@ class ParameterBuilder(L5xElementBuilder):
         else:
             radix_idx = ext01[0x20F] >> 4
             radix = radix_enum(radix_idx) if radix_idx != 0 else None
+
+        # AOI ALIAS parameter: OEM emits TagType="Alias" with no DataType and no
+        # <DefaultData>. The direction byte ext01[0x20E] bit 0x02 marks exactly
+        # these (14/14 OEM-alias params pool-wide carry it; zero Base/Local
+        # params do). Null the DataType so the base to_xml omits @DataType (None
+        # fields are skipped) and _build_default_data suppresses the DefaultData
+        # pair (empty dt_base); the alias-target path is not yet decoded, so the
+        # tag stays TagType="Base" (its @AliasFor/@TagType residuals are
+        # pre-existing and untouched -- this only removes over-emission).
+        if not sp and len(ext01) > 0x20E and (ext01[0x20E] & 0x02):
+            data_type = None
 
         # --- Description ---
         # Source-protected projects also encrypt the comment text, so for an
@@ -2718,15 +2738,27 @@ class RoutineBuilder(L5xElementBuilder):
                     # short-header rung comment's parent column is
                     #   0x6d0000 | (routine comment_id & 0xffff)
                     # (the short comment parser stores parent == comment_id; the
-                    # 0x6d high byte is the rung-comment record tag). Verified on
-                    # V20 (1767 -> exact 1727) and V16 (102, unchanged).
+                    # 0x6d high byte is the rung-comment record tag). But EVERY
+                    # routine in a program shares the one comment_id, so the
+                    # parent scope separates nothing, and rc_hi collides across
+                    # routines -> a comment binds to a rung in the WRONG routine.
+                    # The routine's own key is the high u16 of record[14:18];
+                    # each of its rung comments repeats it in the low u16 of
+                    # member_ref, so match on it to scope to the true owner.
+                    # Verified pool-wide: removes exactly the 15 cross-routine
+                    # over-emissions (RTN_B 11, RTN_A 2, RTN_C 2), 0 regressions.
                     short_parent_key = 0x6D0000 | (r.comment_id & 0xFFFF)
+                    short_mref_key = (
+                        struct.unpack_from("<I", record, 14)[0] >> 16
+                        if len(record) >= 18 else -1
+                    )
                     self._cur.execute(
                         "SELECT rl.rung_oid, c.record_string FROM regn_link rl "
                         "JOIN comments c ON c.rung_content = rl.rc_hi "
                         "WHERE c.record_type=1 AND c.rung_content!=0 "
-                        "  AND rl.group_id=? AND c.parent=?",
-                        (self._object_id, short_parent_key),
+                        "  AND rl.group_id=? AND c.parent=? "
+                        "  AND (c.member_ref & 65535)=?",
+                        (self._object_id, short_parent_key, short_mref_key),
                     )
                 else:
                     parent_key = (r.comment_id * 0x10000) + r.cip_type
@@ -3653,9 +3685,15 @@ class ProgramBuilder(L5xElementBuilder):
             # keeps the decoded plaintext routine.
             if self._faithful and _routine_is_source_protected(bytes(child[3])):
                 continue
-            routines.append(RoutineBuilder(
+            _rt = RoutineBuilder(
                 self._cur, child[1], _short_header=self._short_header,
-                _short_routine_desc=self._short_routine_desc).build())
+                _short_routine_desc=self._short_routine_desc).build()
+            # A relic routine with no body decodes as Type="TypeLess" (routine
+            # type index 0). OEM emits zero TypeLess routines pool-wide, so drop
+            # them rather than fabricate a phantom <Routine>.
+            if _rt.type in ("TypeLess", "Typeless"):
+                continue
+            routines.append(_rt)
 
         # Get the Program Scoped Tags
         self._cur.execute(
@@ -4966,7 +5004,8 @@ class ControllerBuilder(L5xElementBuilder):
                 )
         return processor_type, major_rev, minor_rev, comm_path
 
-    def _pass_project_settings(self, processor_type, _ctlattrs, _ctlblob):
+    def _pass_project_settings(self, processor_type, _ctlattrs, _ctlblob,
+                               major_rev="0"):
         # Controller project settings that Studio only writes for certain
         # controller generations / save versions. Emitting them unconditionally
         # fabricates attributes the reference omits on older saves and on
@@ -4982,18 +5021,29 @@ class ControllerBuilder(L5xElementBuilder):
         is_5x80 = bool(processor_type) and processor_type.startswith(
             ("5069-", "5094-", "1756-L8")
         )
+        # Controller FIRMWARE MajorRev (== OEM <Controller MajorRev>), not the
+        # ACD container save version (self._acd_major): PassThrough/DownloadDocs
+        # appear from v24, but DownloadProjectCustomProperties/ReportMinorOverflow
+        # only from v28 (verified 58/58 absent <=24, 58/58 present >=28), so
+        # gating those on _v24_plus over-emits on the 4 v24 files.
+        _fw = int(major_rev) if str(major_rev).isdigit() else 0
         _v24_plus = is_5x80 or self._acd_major >= 24
+        _v28_plus = is_5x80 or _fw >= 28
         pass_through = "EnabledWithAppend" if _v24_plus else None
         download_docs = "true" if _v24_plus else None
-        download_custom = "true" if _v24_plus else None
-        report_minor_overflow = "false" if _v24_plus else None
+        download_custom = "true" if _v28_plus else None
+        report_minor_overflow = "false" if _v28_plus else None
         # AutoDiags/WebServer hinge on the 5x80 generation, which we read from
         # the catalog number. When the root catalog can't be resolved
         # (processor_type is None) we can't tell the generation, so fall back to
         # the save version: these features never appear below v32, so a modern
         # save with an unknown catalog is treated as 5x80 rather than dropping a
         # value the reference keeps.
+        # AutoDiags first appears at firmware v33 (absent <=32, present-mixed
+        # >=33 vs OEM), so add a firmware floor: 3 v30 5x80 files over-emit it
+        # without it.
         _modern_unknown_cpu = processor_type is None and self._acd_major >= 32
+        _autodiags_gen = (is_5x80 or _modern_unknown_cpu) and _fw >= 33
         # AutoDiagsEnabled is a real per-controller flag: bit 0 of the final byte
         # (offset 135) of the 5x80 controller-properties blob. Validated 16 true /
         # 10 false vs OEM, 0 mismatch. WebServerEnabled lives in the controller's
@@ -5001,7 +5051,7 @@ class ControllerBuilder(L5xElementBuilder):
         # Emit only on a controller that actually carries the embedded-ethernet attrs
         # (0x81 or 0x7e); a 5x80 without them (e.g. 5069-L310ERM) omits the attribute
         # like OEM. Validated 0 over-emit / 0 value-mismatch pool-wide.
-        if is_5x80 or _modern_unknown_cpu:
+        if _autodiags_gen:
             auto_diags = "true" if (len(_ctlblob) > 135 and (_ctlblob[135] & 1)) else "false"
         else:
             auto_diags = None
@@ -5231,7 +5281,8 @@ class ControllerBuilder(L5xElementBuilder):
         ethernet_network_xml = build_ethernet_network(
             self._cur, self._object_id, self._short_header)
         (pass_through, download_docs, download_custom, report_minor_overflow, auto_diags,
-         web_server, _v24_plus) = self._pass_project_settings(processor_type, _ctlattrs, _ctlblob)
+         web_server, _v24_plus) = self._pass_project_settings(
+            processor_type, _ctlattrs, _ctlblob, major_rev)
         aoi_sig, aoi_sig_ts = self._pass_aoi_signature()
         self._pass_message_alarm_data(tags, programs, modules)
         self._pass_motion_sync(tags, programs, modules)

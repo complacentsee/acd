@@ -83,6 +83,12 @@ class L5xElement:
                                 new_child_list.append(element.to_xml())
                             else:
                                 new_child_list.append(f"<{element}/>")
+                        # OEM omits an empty <ScheduledPrograms> entirely (the
+                        # Task self-closes); every other empty list section (e.g.
+                        # <Tags/>) IS emitted, so scope the suppression to
+                        # scheduled_programs only.
+                        if attribute == "scheduled_programs" and not new_child_list:
+                            continue
                         # A list section is normally a bare wrapper, but some
                         # carry their own attributes (e.g. the safety signature on
                         # AddOnInstructionDefinitions); _section_attrs maps the field
