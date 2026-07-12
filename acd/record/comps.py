@@ -69,16 +69,20 @@ def _sp_cbc(ciphertext: bytes, aes: AES, nblocks: int) -> bytes:
     return bytes(out)
 
 
-def _sp_walk(pt: bytes) -> Optional[dict]:
+def _sp_walk(pt: bytes, max_count: int = 255) -> Optional[dict]:
     """Parse a decrypted ext-attr table ``[u32 count][(u32 id,u32 len,bytes)...]``.
 
     Returns the {attribute_id: bytes} dict, or None if the layout is structurally
-    invalid (used to reject a wrong decryption key).
+    invalid (used to reject a wrong decryption key). ``max_count`` is the
+    caller-computed capacity of the FULL table (after the 4-byte count, each
+    attribute is at least an 8-byte id+length header), so the count check stays
+    a wrong-key rejector without capping how many attributes a record may
+    legitimately carry.
     """
     if len(pt) < 4:
         return None
     count = int.from_bytes(pt[0:4], "little")
-    if not (0 < count < 256):
+    if not (0 < count <= max_count):
         return None
     out: dict = {}
     pos = 4
@@ -109,6 +113,13 @@ def _decrypt_value_attrs(ciphertext: bytes, full: bool = False) -> dict:
     nblocks_total = len(ciphertext) // 16
     if nblocks_total == 0:
         return {}
+    # Table capacity: after the 4-byte count each attribute is >= 8 bytes
+    # (u32 id + u32 len), so the count can't exceed this and still fit the
+    # decrypted buffer. A count within it is plausible; beyond it is a wrong-key
+    # signal. Predefined datatype records (AXIS_CIP_DRIVE, MMC, CC, ...)
+    # legitimately carry hundreds of member-descriptor attributes, so a fixed
+    # 256 ceiling would reject them.
+    max_count = max(1, (nblocks_total * 16 - 4) // 8)
     order = list(_SP_KEYS)
     hint = _SP_KEY_HINT[0]
     if hint is not None:
@@ -121,7 +132,7 @@ def _decrypt_value_attrs(ciphertext: bytes, full: bool = False) -> dict:
             continue
         count = int.from_bytes(head[0:4], "little")
         first_id = int.from_bytes(head[4:8], "little")
-        if not (0 < count < 256) or first_id != 0x01:
+        if not (0 < count <= max_count) or first_id != 0x01:
             continue
         _SP_KEY_HINT[0] = config
         if full:
@@ -129,7 +140,7 @@ def _decrypt_value_attrs(ciphertext: bytes, full: bool = False) -> dict:
             # incremental grow-and-rewalk below is O(blocks^2) and a large datatype
             # blob has hundreds of blocks, so it must not be used here.)
             plain = _sp_cbc(ciphertext, aes, nblocks_total)
-            return _sp_walk(plain) or {}
+            return _sp_walk(plain, max_count) or {}
         # Value mode: grow the decrypted prefix only until 0x66 is complete (a big
         # array backing then never pays for full decryption). One expanding pass.
         plain = bytearray(head)

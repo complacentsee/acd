@@ -190,6 +190,30 @@ def test_sp_wrong_key_rejected():
     assert out.get(0x66) != b"\x2a\x00\x00\x00"
 
 
+def test_sp_decrypt_large_table_over_256_attrs():
+    """A predefined-datatype record (AXIS_CIP_DRIVE-class) carries hundreds of
+    member-descriptor attributes; the wrong-key count check must scale with the
+    buffer, not cap at 256, or the whole table fails to decode."""
+    attrs = [(0x01, b"\x3e\x00\x11\x11")]
+    attrs += [(0x6E + i, struct.pack("<I", i)) for i in range(400)]
+    assert len(attrs) > 256
+    ct = _cbc_encrypt(_sp_table(attrs), _SP_KEY)
+    out = C._decrypt_value_attrs(ct, full=True)
+    assert out.get(0x01) == b"\x3e\x00\x11\x11"
+    assert out.get(0x6E + 399) == struct.pack("<I", 399)
+    assert len(out) == len(attrs)
+
+
+def test_sp_impossible_count_rejected():
+    """A count larger than the decrypted buffer could hold (each attr >= 8 bytes)
+    is still a wrong-key signal: the one-block validator rejects it."""
+    # A single 16-byte block holds at most (16-4)//8 = 1 attribute; claim 99.
+    head = struct.pack("<I", 99) + _attr(0x01, b"\x00\x00\x00\x00")[:12]
+    block = head[:16]
+    ct = _cbc_encrypt(block, _SP_KEY)
+    assert C._decrypt_value_attrs(ct, full=True) == {}
+
+
 def test_read_ext_attrs_no_marker_returns_empty():
     """A plaintext record (no marker) yields {} from the SP-only entry point,
     so its caller keeps the plaintext fallback."""
