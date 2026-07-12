@@ -18,9 +18,14 @@ from acd.l5x.alias import TagAliasResolver
 from acd.l5x.base import (
     L5xElement,
     L5xElementBuilder,
+    _parse_rec_and_exts,
+    _parse_rec_tolerant,
+    _rxgeneric_plaintext_main,
     _xml_sane,
     connection_signature_row,
+    external_access_enum,
     own_description,
+    radix_enum,
     safety_signature_row,
     short_own_description,
 )
@@ -1503,47 +1508,6 @@ def _decode_utf16z(buf: bytes) -> str:
         return ""
 
 
-def radix_enum(i: int) -> str:
-    if i == 0:
-        return "NullType"
-    if i == 1:
-        return "General"
-    if i == 2:
-        return "Binary"
-    if i == 3:
-        return "Octal"
-    if i == 4:
-        return "Decimal"
-    if i == 5:
-        return "Hex"
-    if i == 6:
-        return "Exponential"
-    if i == 7:
-        return "Float"
-    if i == 8:
-        return "ASCII"
-    if i == 9:
-        return "Unicode"
-    if i == 10:
-        return "Date/Time"
-    if i == 11:
-        return "Date/Time (ns)"
-    if i == 12:
-        return "UseTypeStyle"
-    return "General"
-
-
-def external_access_enum(i: int) -> str:
-    default = "Read/Write"
-    if i == 0:
-        return default
-    if i == 2:
-        return "Read Only"
-    if i == 3:
-        return "None"
-    return default
-
-
 @dataclass
 class MemberBuilder(L5xElementBuilder):
     record: bytes = field(default_factory=bytes)
@@ -2103,93 +2067,6 @@ class DataTypeBuilder(L5xElementBuilder):
                       _custom_properties=custom_props)
         dt._emit_predefined = self._short_header
         return dt
-
-
-class _PlaintextMain:
-    """Lightweight stand-in for ``RxGeneric.RxTag`` read from fixed offsets.
-
-    Used when ``RxGeneric.from_bytes`` cannot parse a record because its extended-
-    attribute tail is source-protected (AES-encrypted) — the kaitai parser reads
-    the encryption marker as ``count_record`` and runs off the end. The
-    main_record itself stays PLAINTEXT, so the tag's data_type / radix /
-    dimensions / data_table_instance are all recoverable at their fixed offsets.
-    """
-
-    __slots__ = ("data_type", "radix", "external_access", "dimension_1",
-                 "dimension_2", "dimension_3", "data_table_instance",
-                 "cip_data_type")
-
-    def __init__(self, main: bytes):
-        u4 = lambda o: int.from_bytes(main[o:o + 4], "little")
-        u2 = lambda o: int.from_bytes(main[o:o + 2], "little")
-        self.dimension_1 = u4(12)
-        self.dimension_2 = u4(16)
-        self.dimension_3 = u4(20)
-        self.data_type = u4(28)
-        self.radix = u2(32)
-        self.external_access = u2(34)
-        self.data_table_instance = u4(36)
-        self.cip_data_type = u2(52)
-
-
-class _PlaintextRxGeneric:
-    """Minimal RxGeneric view for a source-protected tag record (plaintext main).
-
-    Exposes only the fields TagBuilder.build reads downstream: ``cip_type``,
-    ``comment_id``, ``main_record`` and an empty ``extended_records`` (the real
-    ext-attrs, including the name 0x01, are encrypted; the tag name is taken from
-    comp_name instead, exactly as the no-0x01 branch already does).
-    """
-
-    def __init__(self, raw_rec: bytes):
-        self.cip_type = int.from_bytes(raw_rec[10:12], "little")
-        self.comment_id = int.from_bytes(raw_rec[12:14], "little")
-        self.main_record = _PlaintextMain(raw_rec[14:74])
-        self.extended_records = []
-
-
-def _rxgeneric_plaintext_main(raw_rec: bytes):
-    """Build a tolerant RxGeneric view from a source-protected tag record, or None.
-
-    Returns None when the record is too short to hold the 14-byte prelude plus the
-    60-byte main_record, so the caller keeps today's stub-Tag fallback.
-    """
-    if len(raw_rec) < 74:
-        return None
-    return _PlaintextRxGeneric(raw_rec)
-
-
-def _parse_rec_tolerant(raw_rec: bytes):
-    """Parse a comps record, tolerating a source-protected (encrypted) tail.
-
-    Returns the kaitai RxGeneric when it parses, else a plaintext-main view
-    (cip_type/comment_id/main_record from fixed offsets), else None. Used by the
-    alias detectors so source-protected aliases are still recognised (the
-    kaitai parser throws on their encrypted ext-attr tail).
-    """
-    try:
-        r = RxGeneric.from_bytes(raw_rec)
-        # The ext-attr tail parses lazily; materialise it here so an
-        # encrypted tail still yields the plaintext-main view instead.
-        r.extended_records
-        return r
-    except Exception:
-        return _rxgeneric_plaintext_main(raw_rec)
-
-
-def _parse_rec_and_exts(raw_rec: bytes):
-    """(record view, ext-attr dict, source_protected) for a comps record.
-
-    Kaitai path: (RxGeneric, {attr_id: bytes}, False). A source-protected
-    record's encrypted ext-attr tail defeats the kaitai parser; then the tail
-    is decrypted to recover the attrs and the main_record is read at fixed
-    plaintext offsets: (plaintext view or None, decrypted attrs, True).
-    """
-    try:
-        r = RxGeneric.from_bytes(raw_rec)
-        return r, {er.attribute_id: bytes(er.value) for er in r.extended_records}, False
-    except Exception:
-        return _rxgeneric_plaintext_main(raw_rec), CompsRecord.read_ext_attrs_from_record(raw_rec), True
 
 
 @dataclass
