@@ -354,17 +354,116 @@ class CommentsRecord:
         )
 
     @staticmethod
+    def _parse_sp_operand_body(raw: bytes) -> Optional[tuple]:
+        """Parse a SOURCE-PROTECTED long-header operand record, or None.
+
+        An SP project AES-256-CBC encrypts the record tail from the comps
+        marker (ciphertext at marker+18, IV = 0, PKCS7), which lands
+        mid-operand: the plaintext keeps the whole header -- including the
+        kind byte at body[13] -- plus the first UTF-16 code unit(s) of the
+        operand (typically just the leading '.'), and the decrypted tail is
+        the operand remainder + the standard 12-byte pad + UTF-8 text (or the
+        trailing REAL for Min/Max): exactly the layout
+        _parse_long_operand_body reads on a plaintext record. Key selection
+        mirrors _decrypt_sp_comment_text (cached-config first; accept on
+        valid PKCS7 + the operand gates + strict UTF-8 text).
+        """
+        if len(raw) < 30:
+            return None
+        mi = raw.find(_SP_MARKER, 14)
+        # The marker must sit beyond the fixed operand-body prelude (body[16]
+        # == raw[30] is where the operand starts); an earlier hit is not an
+        # operand-tail encryption.
+        if mi < 30:
+            return None
+        seq_number = struct.unpack_from("<H", raw, 4)[0]
+        record_type = struct.unpack_from("<H", raw, 6)[0]
+        sub_record_length = struct.unpack_from("<H", raw, 8)[0]
+        parent = struct.unpack_from("<I", raw, 10)[0]
+        body = raw[14:]
+        if len(body) < 16:
+            return None
+        object_id = struct.unpack_from("<I", body, 8)[0]
+        kind = body[13]
+        prefix = raw[30:mi]
+        ct = raw[mi + 18:]
+        nblocks = len(ct) // 16
+        if nblocks < 1:
+            return None
+        order = list(_SP_KEYS)
+        hint = _SP_KEY_HINT[0]
+        if hint is not None:
+            order.sort(key=lambda kv: 0 if kv[0] == hint else 1)
+        for config, key in order:
+            pt = _sp_cbc(ct, _sp_aes(config, key), nblocks)
+            if len(pt) < 1:
+                continue
+            pad = pt[-1]
+            if not (1 <= pad <= 16) or pt[-pad:] != bytes([pad]) * pad:
+                continue
+            blob = prefix + pt[:-pad]
+            pos = 0
+            cus = []
+            while pos + 1 < len(blob):
+                cu = struct.unpack_from("<H", blob, pos)[0]
+                pos += 2
+                if cu == 0:
+                    break
+                cus.append(cu)
+            if not cus:
+                continue
+            operand = "".join(chr(c) for c in cus)
+            if operand[0] not in ".[":
+                continue
+            if any((ord(c) < 0x20 and c != "\t") for c in operand):
+                continue
+            if kind in (0x02, 0x03):
+                if len(blob) < pos + 4:
+                    continue
+                from acd.l5x.tag_value import _fmt_real_decorated
+                text = _fmt_real_decorated(
+                    struct.unpack("<f", blob[-4:])[0])
+            else:
+                tpos = pos + 12
+                end = blob.find(b"\x00", tpos)
+                if end < 0:
+                    end = len(blob)
+                try:
+                    text = blob[tpos:end].decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                if not text:
+                    continue
+            _SP_KEY_HINT[0] = config
+            return (
+                seq_number,
+                sub_record_length,
+                object_id,
+                text,
+                record_type,
+                parent,
+                operand,
+                0,
+                kind,
+            )
+        return None
+
+    @staticmethod
     def parse(dat_record: DatRecord, short_header: bool = False) -> Optional[tuple]:
         result = CommentsRecord._parse_core(dat_record, short_header)
         if result is None:
             return None
-        # Source-protected records carry the comment text AES-encrypted after the
-        # comps marker; the parsers above recover the lookup keys (from the
-        # plaintext header) but a garbage text. Swap in the decrypted text when the
-        # marker is present so the recovered keys map to the real Description.
+        # Source-protected DESCRIPTION records carry the text AES-encrypted
+        # after the comps marker; the parsers above recover the lookup keys
+        # (from the plaintext header) but a garbage text. Swap in the decrypted
+        # text when the marker is present so the recovered keys map to the real
+        # Description. Gated to rows WITHOUT an operand (tag_reference == ''):
+        # SP operand rows are decoded whole by _parse_sp_operand_body (their
+        # text does not sit at the description layout's offset 12, so this
+        # swap would corrupt them).
         try:
             raw_full = bytes(dat_record.record.record_buffer)
-            if _SP_MARKER in raw_full:
+            if _SP_MARKER in raw_full and not result[6]:
                 text = _decrypt_sp_comment_text(raw_full)
                 if text is not None:
                     result = result[:3] + (text,) + result[4:]
@@ -413,9 +512,19 @@ class CommentsRecord:
         # one of the four the kaitai decodes (3/4/13/14). 1/2 = own descriptions,
         # 12 = UDI metadata, 23/25 = controller records -- all handled below; every
         # other type is an operand record the kaitai drops, so decode it here.
+        # A source-protected record's operand tail is AES-encrypted from the
+        # comps marker (the plaintext parse below would yield a mojibake operand
+        # that the emission validator rejects), so try the SP-aware parse FIRST
+        # for any marker-bearing operand-family record -- including the kaitai
+        # ordinals 3/4/13/14, whose kaitai parse is equally mojibake under SP.
         if not short_header and len(raw_full) >= 8:
             try:
                 rt = struct.unpack_from("<H", raw_full, 6)[0]
+                if (rt not in (0x01, 0x02, 0x0C, 0x17, 0x19)
+                        and _SP_MARKER in raw_full):
+                    parsed = CommentsRecord._parse_sp_operand_body(raw_full)
+                    if parsed is not None:
+                        return parsed
                 if rt not in (0x01, 0x02, 0x03, 0x04, 0x0C, 0x0D, 0x0E, 0x17, 0x19):
                     parsed = CommentsRecord._parse_long_operand_body(raw_full)
                     if parsed is not None:
