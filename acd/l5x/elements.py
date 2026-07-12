@@ -1918,27 +1918,53 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
             # the member/bit/array comments live under types beyond the kaitai's
             # 3/4/13/14 (decoded by _parse_long_operand_body). Require both fields
             # non-empty (empty record_string marks an internal multi-entry record
-            # Studio does not surface). COLLISION-SAFE: only emit when the key is
-            # owned by exactly one comp (unique_comment_key) -- cip-0x68 tags share
-            # a constant comment_id and would smear otherwise. A '.!<hex>' operand
-            # is a member token, (collection<<16)|member into member_resolve;
-            # resolve_hex_operand rewrites it to the OEM member path and is
-            # fail-closed (any unresolvable token keeps the operand suppressed,
-            # today's behaviour). Rows are routed by the record kind byte
+            # Studio does not surface). COLLISION-SAFE, two modes:
+            #   * unique parent key (unique_comment_key): the key alone owns the
+            #     rows -- today's path, unchanged;
+            #   * SHARED program-scope key (cip-0x68 tags share the program's
+            #     comment_id): each row repeats its owner's scope-local comment
+            #     key (comp record[14:18]) in owner_ref, so rows are attributed
+            #     by the (parent, owner_ref) pair -- gated on this tag's own
+            #     pair being owned by exactly one live comp (unique_owner_key)
+            #     and rows with owner_ref==0 stay suppressed. Cross-validated
+            #     537/537 vs OEM on PROJ_I / PROJ_F / PROJ_L.
+            # A '.!<hex>' operand is a member token, (collection<<16)|member
+            # into member_resolve; resolve_hex_operand rewrites it to the OEM
+            # member path and is fail-closed (any unresolvable token keeps the
+            # operand suppressed). Rows are routed by the record kind byte
             # (member_ref): EngineeringUnit/Min/Max rows are NOT tag comments --
             # OEM renders them as their own blocks. Kaitai-staged rows (rt
             # 3/4/13/14) carry member_ref 0 and stay on the comment path.
             try:
                 parent_key = (r.comment_id * 0x10000) + r.cip_type
-                self._cur.execute(
-                    "SELECT c.tag_reference, c.record_string, c.member_ref "
-                    "FROM comments c "
-                    "WHERE c.parent=? "
-                    "AND c.tag_reference!='' AND c.tag_reference!='__REVISION_NOTE__' "
-                    "AND c.record_string!='' "
-                    "AND EXISTS (SELECT 1 FROM unique_comment_key u WHERE u.k=c.parent)",
-                    (parent_key,),
-                )
+                own_key = (struct.unpack_from("<I", raw_rec, 14)[0]
+                           if len(raw_rec) >= 18 else 0)
+                if self._cur.execute(
+                        "SELECT 1 FROM unique_comment_key WHERE k=?",
+                        (parent_key,)).fetchone():
+                    self._cur.execute(
+                        "SELECT c.tag_reference, c.record_string, c.member_ref "
+                        "FROM comments c "
+                        "WHERE c.parent=? "
+                        "AND c.tag_reference!='' AND c.tag_reference!='__REVISION_NOTE__' "
+                        "AND c.record_string!=''",
+                        (parent_key,),
+                    )
+                elif (not self._short_header and own_key
+                        and (own_key & 0xFFFF) == 0x6B
+                        and self._cur.execute(
+                            "SELECT 1 FROM unique_owner_key WHERE scope=? AND own=?",
+                            (parent_key, own_key)).fetchone()):
+                    self._cur.execute(
+                        "SELECT c.tag_reference, c.record_string, c.member_ref "
+                        "FROM comments c "
+                        "WHERE c.parent=? AND c.owner_ref=? "
+                        "AND c.tag_reference!='' AND c.tag_reference!='__REVISION_NOTE__' "
+                        "AND c.record_string!=''",
+                        (parent_key, own_key),
+                    )
+                else:
+                    self._cur.execute("SELECT 1 WHERE 0")
                 for op_ref, op_text, op_kind in self._cur.fetchall():
                     if not op_text:
                         continue

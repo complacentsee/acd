@@ -69,7 +69,7 @@ class CommentsRecord:
     def __post_init__(self):
         entry = CommentsRecord.parse(self.dat_record)
         if entry is not None:
-            self._cur.execute("INSERT INTO comments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", entry)
+            self._cur.execute("INSERT INTO comments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", entry)
 
     @staticmethod
     def _parse_udi_body(body: bytes) -> Optional[tuple]:
@@ -188,6 +188,7 @@ class CommentsRecord:
             operand,        # tag_reference column carries the L5X Operand
             0,              # rung_content
             member_key,     # member_ref column carries the per-element key
+            0,              # owner_ref (long-header concept; not decoded short)
         )
 
     @staticmethod
@@ -253,6 +254,7 @@ class CommentsRecord:
             "",              # tag_reference (own descriptions have no operand)
             rung_content,
             member_ref,
+            0,               # owner_ref (long-header concept; not decoded short)
         )
 
     @staticmethod
@@ -270,7 +272,15 @@ class CommentsRecord:
           [6:8]  record_type            [8:10] sub_record_length
           [10:14] parent (== comment_id*0x10000 + cip_type)
         then body = raw[14:] (the Utf16Record):
-          [0:8]  unknown   [8:12] object_id   [12] pad
+          [0:4]  OWNER REFERENCE: the owning comp's own comment key (u32 @14
+                 of the comp record: cip u16 -- 0x006B for tags -- and a
+                 scope-local ordinal u16). Nonzero on rows whose header parent
+                 is a SHARED program-scope (cip-0x68) key; 0 when the parent
+                 key alone identifies the tag. Attribution cross-validated
+                 537/537 vs OEM across PROJ_I / PROJ_F / PROJ_L.
+          [4:8]  unknown   [8:12] object_id (the OPERAND's member/element
+                 token id, e.g. 5982+bit-index -- NOT the owning tag)
+          [12]   pad
           [13]   KIND discriminator: 0x01 comment, 0x02 Min, 0x03 Max,
                  0x05 EngineeringUnit (byte-confirmed across V24..V36 pool
                  files; record_type is an ordinal and cannot discriminate)
@@ -296,6 +306,7 @@ class CommentsRecord:
         body = raw[14:]
         if len(body) < 16:
             return None
+        owner_ref = struct.unpack_from("<I", body, 0)[0]
         object_id = struct.unpack_from("<I", body, 8)[0]
         pos = 16
         cus = []
@@ -333,6 +344,7 @@ class CommentsRecord:
                 operand,
                 0,
                 kind,
+                owner_ref,
             )
         tpos = pos + 12  # skip the 12-byte unknown_3 region
         end = body.find(b"\x00", tpos)
@@ -351,6 +363,7 @@ class CommentsRecord:
             operand,
             0,
             kind,
+            owner_ref,
         )
 
     @staticmethod
@@ -383,6 +396,7 @@ class CommentsRecord:
         body = raw[14:]
         if len(body) < 16:
             return None
+        owner_ref = struct.unpack_from("<I", body, 0)[0]
         object_id = struct.unpack_from("<I", body, 8)[0]
         kind = body[13]
         prefix = raw[30:mi]
@@ -445,6 +459,7 @@ class CommentsRecord:
                 operand,
                 0,
                 kind,
+                owner_ref,
             )
         return None
 
@@ -559,6 +574,7 @@ class CommentsRecord:
                     "__REVISION_NOTE__",
                     0,              # rung_content
                     0,              # member_ref
+                    0,              # owner_ref
                 )
             # The grammar's switch default now parses every other record_type as
             # a utf_16_record too (formalizing that they share the operand
@@ -589,6 +605,16 @@ class CommentsRecord:
                 member_ref = struct.unpack_from("<I", bytes(r.body.unknown_1), 0)[0]
             else:
                 member_ref = 0
+            # The owner-reference slot (body[0:4] == raw[14:18]) is the owning
+            # comp's own comment key on operand rows (see
+            # _parse_long_operand_body); read it from the raw bytes so the
+            # kaitai-decoded ordinals (3/4/13/14) can be attributed under a
+            # shared program-scope parent key too. On rt-1/2 description rows
+            # the same slot is the member_ref already extracted above.
+            owner_ref = (
+                struct.unpack_from("<I", raw_full, 14)[0]
+                if not short_header and len(raw_full) >= 18 else 0
+            )
             return (
                 r.header.seq_number,
                 r.header.sub_record_length,
@@ -599,6 +625,7 @@ class CommentsRecord:
                 tag_ref,
                 rung_content,
                 member_ref,
+                owner_ref,
             )
         except Exception:
             return None

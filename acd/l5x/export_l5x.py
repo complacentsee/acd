@@ -6,7 +6,7 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 from sqlite3 import Cursor
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from acd.database.dbextract import DbExtract
 from acd.zip.unzip import Unzip
@@ -183,7 +183,7 @@ class ExportL5x:
         )
         log.debug("Create Comments table in sqllite db")
         self._cur.execute(
-            "CREATE TABLE comments(seq_number int, sub_record_length int, object_id int, record_string text, record_type int, parent int, tag_reference text, rung_content int, member_ref int)"
+            "CREATE TABLE comments(seq_number int, sub_record_length int, object_id int, record_string text, record_type int, parent int, tag_reference text, rung_content int, member_ref int, owner_ref int)"
         )
 
         log.debug("Create Nameless table in sqllite db")
@@ -286,7 +286,20 @@ class ExportL5x:
         # mis-attributed). cip_type is u2 @ record offset 10, comment_id u2 @ 12
         # (RxGeneric prelude); read directly to avoid a full parse per comp.
         self._cur.execute("CREATE TABLE unique_comment_key(k INTEGER PRIMARY KEY)")
+        # Owner-key attribution for the shared program-scope keys: a comp's
+        # prelude carries a SECOND, scope-local comment key at record[14:18]
+        # (cip u16 @14 -- 0x006B for tags -- and a scope-local ordinal u16
+        # @16); operand comment rows repeat it at body[0:4] (owner_ref). A row
+        # under a shared 0x68 parent key is attributable to the unique live
+        # comp matching (scope key, own key). Only pairs owned by exactly ONE
+        # live comp are stored, so a collision (or an FDFD relic twin) fails
+        # closed to today's suppression. Cross-validated 537/537 vs OEM
+        # (PROJ_I 270, PROJ_F 95, PROJ_L 72).
+        self._cur.execute(
+            "CREATE TABLE unique_owner_key("
+            "scope INTEGER, own INTEGER, PRIMARY KEY(scope, own))")
         _key_counts: Dict[int, int] = {}
+        _pair_counts: Dict[Tuple[int, int], int] = {}
         for _oid, _t in comps_by_id.items():
             if _oid in _dead_derived:
                 continue
@@ -296,9 +309,18 @@ class ExportL5x:
                 _cid = int.from_bytes(_rec[12:14], "little")
                 _k = (_cid << 16) | _cip
                 _key_counts[_k] = _key_counts.get(_k, 0) + 1
+                if len(_rec) >= 18:
+                    _own = int.from_bytes(_rec[14:18], "little")
+                    if _own and (_own & 0xFFFF) == 0x6B:
+                        _pair_counts[(_k, _own)] = _pair_counts.get(
+                            (_k, _own), 0) + 1
         self._cur.executemany(
             "INSERT OR IGNORE INTO unique_comment_key VALUES (?)",
             [(k,) for k, n in _key_counts.items() if n == 1],
+        )
+        self._cur.executemany(
+            "INSERT OR IGNORE INTO unique_owner_key VALUES (?,?)",
+            [(k, o) for (k, o), n in _pair_counts.items() if n == 1],
         )
 
         # ``.!<8hex>`` operand-token resolver (long-header). A module/UDT member
@@ -462,7 +484,7 @@ class ExportL5x:
         # converters normalize to bare LF; that is their quirk, not Rockwell's, so
         # the gauntlet comparator normalizes newlines instead of us changing the
         # output.)
-        self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?)", comment_tuples)
+        self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?,?)", comment_tuples)
         self._db.commit()
 
         # Generated-Safety-Signature records (record_type 0x10) are dropped by the
