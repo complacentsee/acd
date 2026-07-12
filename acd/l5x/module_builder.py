@@ -1216,19 +1216,13 @@ class ModuleBuilder(L5xElementBuilder):
         comm_method: Union[str, None] = None
         connections: List[dict] = []
         extended_properties = ""
+        # A falsy data_link is REAL absence (a module with no RxDataCollection
+        # link), not a truncation artefact: the identity chain already reads the
+        # size-eos comps.record body, the same source a re-read would consume,
+        # so the decoders' not-data_link guards are the correct handling. (The
+        # pre-size-eos recovery re-read that lived here never changed the value
+        # for any of the 5,141 module records pool+fixture-wide.)
         data_link = mi.data_link
-        if not data_link:
-            # The caller's truncated e1 copy can zero the data_link (e1[0x24]),
-            # notably for the root controller; the untruncated comps.record body
-            # carries it. Recover it before giving up on the port topology.
-            try:
-                _dl = ModuleIdentity.from_bytes(CompsRecord.record_attrs(
-                    self._cur, self._object_id, self._short_header
-                ).get(0x001, b"")).data_link
-                if _dl is not None:
-                    data_link = _dl
-            except Exception:
-                pass
         # STAGING: CommMethod resolved via the comment_id link (full Communications).
         comm_method = self._comm_method_from_data_link(data_link)
         extended_properties = self._extended_properties_from_data_collection(data_link)
@@ -1541,8 +1535,8 @@ class ModuleBuilder(L5xElementBuilder):
         # Real port topology from the RxDataCollection blob (preferred over the
         # static catalog). e1[0x24] is the comment_id of the module's backing
         # RxDataCollection child (a 1:1 link); None when it has no <in> blob.
-        # The root controller is decoded the same way: its data_link is recovered
-        # from the comps.record body (above) and the full <in> blob from the child's decrypted
+        # The root controller is decoded the same way: its data_link comes from
+        # the body-derived identity and the full <in> blob from the child's decrypted
         # 0x66 image when the plaintext body is truncated. _ports_from_data_collection
         # returns None when there is no blob (e.g. a 5069 root with a degenerate
         # data_link), so such roots still fall back to the static catalog / empty.
