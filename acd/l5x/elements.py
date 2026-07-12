@@ -188,6 +188,17 @@ _SKIP_DECORATED: set = {
 # PID_ENHANCED is NOT skipped: OEM renders it like any predefined struct, a value
 # block (L5K / raw-hex) plus a Decorated <Structure> of its members.
 
+# Value-image size at/above which Studio's raw-hex-first export omits the
+# Decorated <Data> block (emitting only the flat first block). This is a single
+# global Logix export threshold -- NOT keyed by catalog/type -- validated at 0
+# violations across ~27,000 pool tags (< threshold keeps Decorated, >= omits).
+# Overridable via the ACD_DECORATED_MAX_BYTES env var so a future corpus that
+# shifts the ceiling can be accommodated without a code change.
+try:
+    _DECORATED_MAX_BYTES = int(os.environ.get("ACD_DECORATED_MAX_BYTES", "16384"))
+except ValueError:
+    _DECORATED_MAX_BYTES = 16384
+
 # A valid L5X tag-comment Operand is a member/bit/index path relative to the tag:
 # it starts with '.' or '[' and contains only identifier/index characters. Module
 # connection-point comments instead carry a raw binary key that decodes to junk
@@ -597,6 +608,16 @@ def _render_value_blocks(element: str,
         return first + string_block if ok_first else ""
 
     if require_pair:
+        # Studio omits the Decorated block (keeping only the flat first block)
+        # for a very large value image in the raw-hex-first export era: a
+        # per-export size ceiling, not an ACD field. The threshold is a single
+        # global export constant (like the L5K wrap width / version gates), not
+        # a per-catalog value; it is validated 0-violation over ~27k pool tags
+        # and exposed as _DECORATED_MAX_BYTES so it can be tuned without a code
+        # edit (env override) if a later corpus shifts it.
+        if (ok_first and raw_hex_first
+                and len(value_bytes) >= _DECORATED_MAX_BYTES):
+            return first + force_xml
         if ok_first and decorated_inner is not None:
             return (first + force_xml
                     + f'<{element} Format="Decorated">\n{decorated_inner}\n'
