@@ -365,12 +365,12 @@ class CompsRecord:
         and every by-value comps scan drops these so a relic is neither emitted
         nor allowed to overwrite a live component. See P6.9.
 
-        Returns an EMPTY set on short-header projects: the long-header FDFD body
-        realignment does not apply there (short bodies are always size-eos at 94),
-        so short-header liveness is gated separately (P6.9 C6). Cached per cursor;
-        empty if the comps_family side table is absent (older staging schema)."""
-        if short_header:
-            return frozenset()
+        Applies to BOTH header families since C6: FDFD-only is a deleted relic
+        regardless of the body offset (the long-header realignment was the reason
+        the gate was long-header-only through C2-C5; the liveness SEMANTIC holds
+        on short-header too). ``short_header`` is retained for call-site symmetry
+        but no longer changes the answer. Cached per cursor; empty if the
+        comps_family side table is absent (older staging schema)."""
         cache = _DEAD_OIDS_CACHE.get(cur)
         if cache is None:
             try:

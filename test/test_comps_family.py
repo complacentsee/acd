@@ -115,9 +115,13 @@ def test_dead_oids_long_header_suppresses_fdfd_only_admits_live():
     assert CompsRecord.dead_oids(cur, short_header=False) == frozenset({300})
 
 
-def test_dead_oids_short_header_is_empty():
-    cur = _cur_with_family([(300, FDFD, 0), (400, FDFD, 0)])
-    assert CompsRecord.dead_oids(cur, short_header=True) == frozenset()
+def test_dead_oids_short_header_also_suppresses_fdfd_only():
+    # Since C6 liveness applies to both header families (short_header no longer
+    # changes the answer): FDFD-only relics are dead regardless of body offset.
+    cur = _cur_with_family([(300, FDFD, 0), (400, FDFD, 0), (500, FAFA, 1)])
+    assert CompsRecord.dead_oids(cur, short_header=True) == frozenset({300, 400})
+    assert (CompsRecord.dead_oids(cur, short_header=True)
+            == CompsRecord.dead_oids(cur, short_header=False))
 
 
 def test_dead_oids_empty_when_family_table_absent():
