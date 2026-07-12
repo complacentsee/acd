@@ -198,13 +198,29 @@ def _is_valid_operand(op: str) -> bool:
 
 
 # ---- AXIS_VIRTUAL <Data Format="Axis"> renderer ------------------------- #
-# The value image is attr 0x01 of the tag's cip-0x6a backing (body_mode); it is
-# a fixed-offset struct whose fixed header (offsets 158..1182) is identical
-# across every firmware generation and whose only version-shifting field is the
-# tail InterpolatedPositionConfiguration offset (+ whether AxisUpdateSchedule is
-# appended). The int->label tables are reference-invariant Logix motion-schema
-# constants (same class as radix_enum), NOT per-device values. Validated
-# byte-exact vs OEM on 13/13 pool AXIS_VIRTUAL tags across firmware 20/30/33/35.
+# The value image is attr 0x01 of the tag's cip-0x6a backing (body_mode). It is
+# the axis CONFIG serialization, which is a flat fixed-offset struct -- and,
+# unlike a UDT, it is NOT member-tagged in the datatype schema (TagInfo carries
+# only the 384-byte RUNTIME AXIS_VIRTUAL struct: AxisFault/ModuleFault/...; the
+# config parameter layout below is not recoverable from any parseable ACD
+# record). So these offsets are the firmware motion-schema binary layout,
+# reverse-engineered and validated the same way the module-identity/ForceData
+# offsets elsewhere in this file are.
+#
+# WHAT GENERALISES: the whole header (offsets 158..1182) is IDENTICAL across
+# every firmware generation -- every value is decoded from the record at these
+# offsets (nothing keyed by catalog/type; even pool-constant fields like
+# AverageVelocityTimebase are read, not hardcoded). The int->label tables are
+# reference-invariant Logix motion-schema constants (same class as radix_enum).
+# Only ONE field shifts by generation: the record grows in the middle, moving
+# the tail InterpolatedPositionConfiguration (+ whether AxisUpdateSchedule is
+# appended). That shift is keyed on the blob LENGTH -- an intrinsic property of
+# the bytes, so it cannot disagree with the layout it selects (a MajorRev key
+# could, since the two probe passes disagreed on whether firmware rev or the
+# container version drives it). An unrecognised length returns None -> no
+# <Data> (element_missing, today's behaviour), never a wrong render.
+# Validated byte-exact vs OEM on ALL 15 pool AXIS_VIRTUAL tags across firmware
+# 20/30/33/35 and across multiple files per generation (0 files worse).
 _AXIS_ENUM: Dict[str, Dict[int, str]] = {
     "RotaryAxis": {0: "Linear", 1: "Rotary"},
     "HomeMode": {0: "Passive", 1: "Active", 2: "Absolute"},
