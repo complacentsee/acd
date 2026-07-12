@@ -3327,9 +3327,14 @@ class AoiBuilder(L5xElementBuilder):
                 # object_id == 1 filter excludes them.
                 aoi_description = own_description(self._cur, aoi_comment_parent)
             try:
+                # RevisionNote (UDI_HISTORY) keys on the bare comment_id in the
+                # short-header family and on the long comment key otherwise
+                # (same as UDI_EXT_HELP below).
                 self._cur.execute(
-                    "SELECT record_string FROM comments WHERE parent=? AND tag_reference='__REVISION_NOTE__' LIMIT 1",
-                    (aoi_comment_parent,),
+                    "SELECT record_string FROM comments "
+                    "WHERE parent IN (?, ?) AND tag_reference='__REVISION_NOTE__' "
+                    "LIMIT 1",
+                    (_r_aoi.comment_id, aoi_comment_parent),
                 )
                 rn_row = self._cur.fetchone()
                 if rn_row:

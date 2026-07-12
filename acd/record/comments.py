@@ -396,31 +396,30 @@ class CommentsRecord:
         )
 
     _UDI_EXT_HELP_MARKER = "UDI_EXT_HELP".encode("utf-16-le") + b"\x00\x00"
+    _UDI_HISTORY_MARKER = "UDI_HISTORY".encode("utf-16-le") + b"\x00\x00"
 
     @staticmethod
-    def _parse_udi_ext_help(raw: bytes, short_header: bool) -> Optional[tuple]:
-        """Parse an AOI AdditionalHelpText record (UDI_EXT_HELP), or None.
+    def _parse_udi_text(raw: bytes, short_header: bool, marker: bytes,
+                        tag_ref: str, object_id: int) -> Optional[tuple]:
+        """Parse an AOI UDI text record (help text / revision note), or None.
 
-        The record carries the help text after the NUL-terminated
-        ``UDI_EXT_HELP`` type string (plus zero padding), keyed by the AOI's
-        comment id in the header parent field. The text encoding follows the
-        header family exactly like the UDI_HISTORY (RevisionNote) record:
-        UTF-16LE on short-header (V10-V21) files, NUL-terminated UTF-8 on
-        long-header ones. The kaitai path mangles the short-header variant
-        (we emitted nothing before), so the record is decoded from raw bytes,
-        gated on the type-string marker. CRLF is preserved like every other
-        staged text. Stored under the ``__EXT_HELP__`` tag_reference sentinel
-        with object_id 0 so own_description's object_id==1 filter can never
-        surface it as a Description.
+        The record carries the text after the NUL-terminated UDI type-string
+        marker (plus zero padding), keyed by the AOI's comment id in the header
+        parent field. The text encoding follows the header family: UTF-16LE on
+        short-header (V10-V21) files, NUL-terminated UTF-8 on long-header ones.
+        The kaitai path reads only the long-header UTF-8 form, mangling the
+        short-header UTF-16 text, so decode from raw bytes gated on the exact
+        type-string marker. Stored under a tag_reference sentinel so
+        own_description never surfaces it as a Description.
         """
-        i = raw.find(CommentsRecord._UDI_EXT_HELP_MARKER)
+        i = raw.find(marker)
         if i < 0 or len(raw) < 14:
             return None
         seq_number = struct.unpack_from("<H", raw, 4)[0]
         record_type = struct.unpack_from("<H", raw, 6)[0]
         sub_record_length = struct.unpack_from("<H", raw, 8)[0]
         parent = struct.unpack_from("<I", raw, 10)[0]
-        pos = i + len(CommentsRecord._UDI_EXT_HELP_MARKER)
+        pos = i + len(marker)
         if short_header:
             while (pos + 1 < len(raw)
                     and struct.unpack_from("<H", raw, pos)[0] == 0):
@@ -445,11 +444,11 @@ class CommentsRecord:
         return (
             seq_number,
             sub_record_length,
-            0,
+            object_id,
             text,
             record_type,
             parent,
-            "__EXT_HELP__",
+            tag_ref,
             0,
             0,
             0,
@@ -585,7 +584,18 @@ class CommentsRecord:
         # (the short operand parser bails on UDI_ and the kaitai mangles the
         # short-header layout).
         if CommentsRecord._UDI_EXT_HELP_MARKER in raw_full:
-            parsed = CommentsRecord._parse_udi_ext_help(raw_full, short_header)
+            parsed = CommentsRecord._parse_udi_text(
+                raw_full, short_header, CommentsRecord._UDI_EXT_HELP_MARKER,
+                "__EXT_HELP__", 0)
+            if parsed is not None:
+                return parsed
+        # UDI_HISTORY (RevisionNote): the long-header UTF-8 form is handled by
+        # the kaitai path below; short-header stores the text UTF-16LE, which
+        # that path mangles, so decode it here (family-aware) for short-header.
+        if short_header and CommentsRecord._UDI_HISTORY_MARKER in raw_full:
+            parsed = CommentsRecord._parse_udi_text(
+                raw_full, short_header, CommentsRecord._UDI_HISTORY_MARKER,
+                "__REVISION_NOTE__", 1)
             if parsed is not None:
                 return parsed
         # V10..V21 short-header operand comments (member/bit/array element
