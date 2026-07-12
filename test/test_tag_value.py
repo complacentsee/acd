@@ -4,7 +4,7 @@ These are the leaf formatters the two duplicated layout walkers
 (render_decorated / render_l5k) share.  Pinning them here means the P4
 walker-unification work can consolidate the traversal with a guard that the
 actual value/format bytes never move.  Every expectation is an OEM-verified
-Logix form (bit-packed BOOL arrays, Radix literals, the 1.#INF/1.#QNAN and
+Logix form (bit-packed BOOL arrays, Radix literals, the 1.$/1.#QNAN and
 e+NNN float encodings, $-escapes) -- see the campaign history for the diffs
 each one pins (d49ae5a BOOL bit-unpack, 48c8221 L5K BOOL, 559ee27 radix).
 """
@@ -49,8 +49,8 @@ def test_fmt_real_decorated_edges():
     assert T._fmt_real_decorated(-0.0) == "-0.0"
     assert T._fmt_real_decorated(1.5) == "1.5"
     assert T._fmt_real_decorated(-3.25) == "-3.25"
-    assert T._fmt_real_decorated(float("inf")) == "1.#INF"
-    assert T._fmt_real_decorated(float("-inf")) == "-1.#INF"
+    assert T._fmt_real_decorated(float("inf")) == "1.$"
+    assert T._fmt_real_decorated(float("-inf")) == "-1.$"
     assert T._fmt_real_decorated(float("nan")) == "1.#QNAN"
 
 

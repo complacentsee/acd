@@ -285,9 +285,9 @@ def _fmt_real_decorated(v: float) -> str:
     if f != f:                      # NaN -> Logix Decorated form
         return "1.#QNAN"
     if f == float("inf"):
-        return "1.#INF"
+        return "1.$"
     if f == float("-inf"):
-        return "-1.#INF"
+        return "-1.$"
     with localcontext() as ctx:
         ctx.prec = 80
         if f == 0.0:
@@ -324,9 +324,9 @@ def _fmt_lreal_decorated(v: float) -> str:
     if f != f:
         return "1.#QNAN"
     if f == float("inf"):
-        return "1.#INF"
+        return "1.$"
     if f == float("-inf"):
-        return "-1.#INF"
+        return "-1.$"
     with localcontext() as ctx:
         ctx.prec = 80
         if f == 0.0:
