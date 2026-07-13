@@ -113,6 +113,18 @@ def _msg_build_module_routes(modules):
     return nr, route_count, module_ips
 
 
+def _epath_ascii(seg):
+    """Decode a CIP EPATH port-segment link address (a counted ASCII string).
+
+    The address is NUL-terminated/padded within its length byte, so trim at the
+    first NUL. Otherwise a padding terminator leaks a raw ``\\x00`` into the
+    ConnectionPath and then into an XML attribute, which is not well-formed
+    (XML 1.0 cannot represent NUL at all). Same intent as the ``rstrip("\\x00")``
+    on the UTF-16 tag-token decode below.
+    """
+    return seg.decode("ascii", "replace").split("\x00", 1)[0]
+
+
 def _msg_seg_list(b):
     """Split EPATH bytes into [(port_byte, addr, is_ip)] segments (lenient)."""
     out = []
@@ -128,7 +140,7 @@ def _msg_seg_list(b):
             i += 1
             if i + L > n:
                 break
-            out.append((p, b[i:i + L].decode("ascii", "replace"), True))
+            out.append((p, _epath_ascii(b[i:i + L]), True))
             i += L + (L & 1)
         else:
             if i >= n:
@@ -158,7 +170,7 @@ def _msg_decode_tokens(b):
             i += 1
             if i + L > n:
                 return None
-            toks.append(b[i:i + L].decode("ascii", "replace"))
+            toks.append(_epath_ascii(b[i:i + L]))
             i += L + (L & 1)
         else:
             if i >= n:
