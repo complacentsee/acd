@@ -151,6 +151,10 @@ class MemberBuilder(L5xElementBuilder):
     # with the member NAME in tag_reference; short-header members have no per-
     # member comps record, so the name is the only discriminator. 0 -> skip.
     _owner_comment_id: int = field(default=0)
+    # Export-schema major (see ExportL5x.project_flags.sw_major), passed down by
+    # DataTypeBuilder. Below major 18 the reference emits no @ExternalAccess on
+    # Members (rule A); 0 == underivable -> today's emission.
+    _sw_major: int = field(default=0)
 
     def build(self) -> Member:
         if self._short_name is not None:
@@ -200,6 +204,10 @@ class MemberBuilder(L5xElementBuilder):
             external_access = external_access_enum(md.external_access_byte)
         else:
             external_access = external_access_enum(md.legacy_access_word)
+        # Rule A: the reference omits @ExternalAccess on Members below schema
+        # major 18 (0/10302 v17 Members carry it, corpus-wide).
+        if 1 <= self._sw_major < 18:
+            external_access = None
 
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
@@ -306,6 +314,10 @@ class MemberBuilder(L5xElementBuilder):
                 external_access = external_access_enum(md.external_access_byte)
             else:
                 external_access = external_access_enum(md.legacy_access_word)
+            # Rule A: the reference omits @ExternalAccess on Members below schema
+            # major 18 (0/10302 v17 Members carry it, corpus-wide).
+            if 1 <= self._sw_major < 18:
+                external_access = None
 
             self._cur.execute(
                 "SELECT comp_name FROM comps WHERE object_id=" + str(data_type_id)
@@ -399,6 +411,15 @@ class DataTypeBuilder(L5xElementBuilder):
     _short_header: bool = field(default=False)
 
     def build(self) -> DataType:
+        # Export-schema major, passed to each MemberBuilder for the rule-A
+        # @ExternalAccess suppression (see ExportL5x.project_flags.sw_major).
+        try:
+            self._cur.execute("SELECT sw_major FROM project_flags")
+            _row = self._cur.fetchone()
+            _sw_major = (_row[0] if _row else 0) or 0
+        except Exception:
+            _sw_major = 0
+
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE object_id="
             + str(self._object_id)
@@ -542,6 +563,7 @@ class DataTypeBuilder(L5xElementBuilder):
                             last_hidden_backing,
                             _owner_cls=class_type,
                             _members_by_index=members_by_index,
+                            _sw_major=_sw_major,
                         ).build()
                     )
                 except Exception:
@@ -637,6 +659,7 @@ class DataTypeBuilder(L5xElementBuilder):
                             _owner_cls=class_type,
                             _members_by_index=members_by_index_s,
                             _owner_comment_id=r.comment_id,
+                            _sw_major=_sw_major,
                         ).build()
                     )
                 except Exception:

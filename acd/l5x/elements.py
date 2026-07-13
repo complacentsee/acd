@@ -1026,11 +1026,16 @@ class Tag(L5xElement):
                           if _adesc else "")
             inner = _adesc_xml + comments_xml + eu_xml + maxes_xml + mins_xml
             _radix_attr = "" if self._alias_no_radix else ' Radix="Binary"'
+            # ExternalAccess is suppressed (None) below schema major 18 (rule A)
+            # and on module IO tags below major 20 (rule B); omit the attribute
+            # in that case rather than rendering ExternalAccess="None".
+            _ea_attr = (f' ExternalAccess="{self.external_access}"'
+                        if self.external_access is not None else "")
             head = (
                 f'<Tag Name="{html.escape(self.name, quote=True)}"'
                 f' TagType="Alias"{_radix_attr}'
                 f' AliasFor="{html.escape(self.alias_for, quote=True)}"'
-                f' ExternalAccess="{self.external_access}" IO="true"'
+                f'{_ea_attr} IO="true"'
             )
             return self._inject_tag_attrs(
                 head + (f'>{inner}</Tag>' if inner else '/>'))
@@ -1039,10 +1044,12 @@ class Tag(L5xElement):
             #   Name TagType DataType ExternalAccess IO="true"
             # (no Radix/Constant/Dimensions, which OEM never writes on IO tags).
             dt_attr = f' DataType="{html.escape(self.data_type, quote=True)}"' if self.data_type else ""
+            _ea_attr = (f' ExternalAccess="{self.external_access}"'
+                        if self.external_access is not None else "")
             base = self._inject_tag_attrs(
                 f'<Tag Name="{html.escape(self.name, quote=True)}"'
                 f' TagType="{self.tag_type}"{dt_attr}'
-                f' ExternalAccess="{self.external_access}" IO="true"></Tag>'
+                f'{_ea_attr} IO="true"></Tag>'
             )
         else:
             # OEM emits Radix only for atomic-typed tags (and atomic arrays);
@@ -1928,10 +1935,20 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
         # Project-level OpcUaAccess / Class flags (see ExportL5x.project_flags).
         try:
             self._cur.execute(
-                "SELECT opc_ua, is_safety, opc_access FROM project_flags")
-            _pf = self._cur.fetchone() or (0, 0, "None")
+                "SELECT opc_ua, is_safety, opc_access, sw_major "
+                "FROM project_flags")
+            _pf = self._cur.fetchone() or (0, 0, "None", 0)
         except Exception:
-            _pf = (0, 0, "None")
+            _pf = (0, 0, "None", 0)
+        _sw_major = _pf[3] or 0
+        # Export-schema epoch (rule A): the reference emits neither
+        # @ExternalAccess nor @Constant on ANY element below schema major 18
+        # (0/10302 Members, 0/331 Tags across the v17 corpus vs present at v19+).
+        # File-wide and element-kind-independent. sw_major==0 (underivable) keeps
+        # today's emission.
+        if 1 <= _sw_major < 18:
+            external_access = None
+            constant = None
         _opc_ua = ""
         if _pf[0]:
             # Per-tag OPC UA access: the tag parameter blob's (ext-attr 0x1)

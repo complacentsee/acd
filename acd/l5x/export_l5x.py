@@ -395,6 +395,36 @@ class ExportL5x:
                     _gate_major = int(_di.attrib["MajorRevision"])
         except Exception:
             _gate_major = _major
+        # sw_major: integer major of the SoftwareRevision the project will emit
+        # (RSLogix5000Content SoftwareRevision == the Studio application version).
+        # Keys the export-schema epoch gates for @ExternalAccess / @Constant: the
+        # reference omits BOTH below schema major 18, and omits @ExternalAccess on
+        # module IO tags and ConfigTag/InputTag/OutputTag below major 20 (corpus-
+        # verified 0-exception across the OEM reference corpus). Derived from the
+        # SAME chain the project builder uses to emit SoftwareRevision (QuickInfo
+        # SWVersion "v<maj>.<min>" -> DeviceIdentity MajorRevision -> _acd_version
+        # "V<maj>") so gate and emitted header stay coherent. 0 == underivable ->
+        # gates disabled (today's emission preserved).
+        _sw_major = 0
+        try:
+            import xml.etree.ElementTree as _ET2
+            _qi2 = os.path.join(self._temp_dir, "QuickInfo.XML")
+            if os.path.exists(_qi2):
+                _qr = _ET2.parse(_qi2)
+                _swv = _qr.find("SWVersion")
+                if _swv is not None:
+                    _sm = re.search(
+                        r"v(\d+)\.\d+$", (_swv.attrib.get("String") or "").strip())
+                    if _sm:
+                        _sw_major = int(_sm.group(1))
+                if _sw_major == 0:
+                    _di2 = _qr.find("DeviceIdentity")
+                    if _di2 is not None:
+                        _sw_major = int(_di2.attrib["MajorRevision"])
+        except Exception:
+            _sw_major = 0
+        if _sw_major == 0 and _major:
+            _sw_major = _major
         _opc = 0
         _safety = 0
         for _oid, _t in comps_by_id.items():
@@ -450,10 +480,10 @@ class ExportL5x:
                     break
         self._cur.execute(
             "CREATE TABLE project_flags(opc_ua int, is_safety int, "
-            "opc_access text)")
+            "opc_access text, sw_major int)")
         self._cur.execute(
-            "INSERT INTO project_flags VALUES (?, ?, ?)",
-            (_opc, _safety, _opc_access)
+            "INSERT INTO project_flags VALUES (?, ?, ?, ?)",
+            (_opc, _safety, _opc_access, _sw_major)
         )
 
         # Per-oid header-family + record-length side table. fafa_seen is the
