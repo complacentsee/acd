@@ -92,6 +92,10 @@ class Module(L5xElement):
     # OpcUaAccess=<value>. "" when the server is off (attribute omitted). See
     # ExportL5x.project_flags.
     _opc_ua: str = field(default="")
+    # Export-schema major (see ExportL5x.project_flags.sw_major). The reference
+    # omits @ExternalAccess on module ConfigTag/InputTag/OutputTag stubs below
+    # major 20; 0 == underivable -> today's emission. See ModuleBuilder.
+    _sw_major: int = field(default=0)
     # ConfigTag content for this module: the rendered inner XML (binary + Decorated
     # <Data> blocks, captured byte-for-byte from the module's controller :C tag) and
     # the ConfigSize. Both None -> no <ConfigTag> is emitted. Set by ModuleBuilder
@@ -246,15 +250,21 @@ class Module(L5xElement):
             # distinct image) keeps the empty stub. ExternalAccess is always
             # Read/Write; OpcUaAccess="None" is added when the project OPC UA server
             # is on (one rule for every IO tag).
+            # Rule B: the reference omits @ExternalAccess on module IO tag stubs
+            # below export-schema major 20 (0/1145 IO tags carry it at v19 vs
+            # present at v20+). sw_major 0 (underivable) keeps today's emission.
+            _ea = ('' if 1 <= self._sw_major < 20
+                   else ' ExternalAccess="Read/Write"')
+
             def _io_tag(tag: str, inner: Union[str, None]) -> str:
                 opc = f' OpcUaAccess="{self._opc_ua}"' if self._opc_ua else ''
                 if inner:
-                    return f'<{tag} ExternalAccess="Read/Write"{opc}>{inner}</{tag}>'
+                    return f'<{tag}{_ea}{opc}>{inner}</{tag}>'
                 # The reference writes <Comments> on a module InputTag/OutputTag
                 # only when there is at least one operand <Comment> (always beside
                 # <Data>); it never emits a bare empty <Comments/>. With no data and
                 # no per-operand comments, emit a self-closing stub.
-                return f'<{tag} ExternalAccess="Read/Write"{opc}/>'
+                return f'<{tag}{_ea}{opc}/>'
 
             conn_parts: List[str] = []
             for c in self._connections:
@@ -364,14 +374,15 @@ class Module(L5xElement):
             # <ConfigTag> — the module's config assembly image, emitted as the first
             # child of <Communications> (before <Connections>). The content is the
             # module's controller :C tag <Data> blocks (captured verbatim); a module
-            # gets a ConfigTag iff it owns such a tag. ExternalAccess is always
-            # Read/Write; OpcUaAccess="None" mirrors the IO-tag-stub rule.
+            # gets a ConfigTag iff it owns such a tag. ExternalAccess is Read/Write
+            # (subject to the rule-B major-20 gate above); OpcUaAccess="None"
+            # mirrors the IO-tag-stub rule.
             config_xml = ""
             if self._config_inner is not None and self._config_size is not None:
                 opc = f' OpcUaAccess="{self._opc_ua}"' if self._opc_ua else ''
                 config_xml = (
                     f'<ConfigTag ConfigSize="{self._config_size}"'
-                    f' ExternalAccess="Read/Write"{opc}>'
+                    f'{_ea}{opc}>'
                     f'{self._config_inner}</ConfigTag>'
                 )
             elif self._config_data is not None:
@@ -1678,11 +1689,14 @@ class ModuleBuilder(L5xElementBuilder):
         # pattern as TagBuilder. When the project's OPC UA server is on,
         # module IO tag stubs carry OpcUaAccess=<project access value>.
         try:
-            self._cur.execute("SELECT opc_ua, opc_access FROM project_flags")
+            self._cur.execute(
+                "SELECT opc_ua, opc_access, sw_major FROM project_flags")
             _pf = self._cur.fetchone()
             _opc_ua = (_pf[1] or "None") if _pf and _pf[0] else ""
+            _sw_major = (_pf[2] if _pf else 0) or 0
         except Exception:
             _opc_ua = ""
+            _sw_major = 0
 
         # Real port topology from the RxDataCollection blob (preferred over the
         # static catalog). e1[0x24] is the comment_id of the module's backing
@@ -1811,6 +1825,7 @@ class ModuleBuilder(L5xElementBuilder):
             _extended_properties=extended_properties,
             _extended_private=extended_private,
             _opc_ua=_opc_ua,
+            _sw_major=_sw_major,
             _config_inner=config_inner,
             _config_size=config_size,
             _input_inner=input_inner,

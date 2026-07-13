@@ -2004,6 +2004,10 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
         r = self._parse_rec_tolerant(raw_rec)
         if r is None or r.cip_type not in (0x6B, 0x68):
             _nm = io_name or results[0][0]
+            # Rule B on the unparseable-record fallback (no is_io refinement runs
+            # here): an IO-named tag still omits @ExternalAccess below major 20.
+            if is_io and 1 <= _sw_major < 20:
+                external_access = None
             return Tag(
                 _nm, _nm, tag_type, None if alias_for else "",
                 None, external_access, constant, None, 0, [],
@@ -2072,6 +2076,13 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
                 data_type = ""
                 constant = None
                 _alias_no_radix = True
+
+        # Rule B: the reference omits @ExternalAccess on module I/O tags (IO="true")
+        # below export-schema major 20 (0/1145 IO tags carry it at v19 vs present
+        # at v20+), even though non-IO tags at v19 DO carry it (rule A only strips
+        # below v18). Keyed on the final is_io. sw_major 0 -> today's emission.
+        if is_io and 1 <= _sw_major < 20:
+            external_access = None
 
         # Tag-level Description: a tag must only carry its OWN description, which
         # the comments table identifies by member_ref==0 (sub-element/member
