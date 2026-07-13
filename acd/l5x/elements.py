@@ -346,6 +346,16 @@ def _render_axis_virtual(blob: bytes, group_name: str) -> "Union[str, None]":
 # pool gains a project that VARIES one of those 4 attrs, exposing its offset --
 # then this becomes a clean, fully-derived -36 mirroring _render_axis_virtual.
 # Full offset map: scratchpad p8probes/a7c3_axis_servo_virtual + renderprobes.
+#
+# TODO(AXIS_CIP_DRIVE / AXIS_SERVO_DRIVE <Data Format="Axis">): same struct
+# family as AXIS_VIRTUAL (shared, length-keyed blob) but with the full drive
+# config. A differential analysis over two pools decodes ~231/366 fields
+# byte-exact (float text included) and cracks the four non-scalar decoders, yet
+# ~133 fields per length are pool-INVARIANT (no differential handle to locate an
+# offset). Emitting those would be a hardcoded default with regression risk, and
+# the block is all-or-nothing, so it is HELD. Unblocks when more-varied ACDs make
+# those fields vary (or the CIP Motion attribute table is available). Full
+# status + reproduction: docs/motion-axis-data-status.md.
 
 
 def _zero_member_node(mdt: str, mdim: int,
