@@ -32,6 +32,30 @@ _ALIAS_ELEM_BITS: Dict[str, int] = {
 }
 
 
+def _multi_dim_subscript(dims, idx) -> Union[str, None]:
+    """Render a flat element index as the L5X subscript for the listed dims.
+
+    A multi-dimension base stores one flat element index in the alias record;
+    the L5X subscript lists one index per dimension in declaration order with
+    the LAST-listed dimension varying fastest (row-major), e.g. dims [33, 200]
+    and flat index 255 -> "1,55". A 0/1-dimension base keeps the flat index
+    unchanged (the historic rendering). Returns None when the flat index lies
+    outside a multi-dimension base so the caller fails closed (keeps the tag
+    Base) instead of emitting an out-of-range subscript.
+    """
+    if len(dims) <= 1:
+        return str(idx)
+    subs = []
+    rem = idx
+    for d in reversed(dims[1:]):
+        subs.append(rem % d)
+        rem //= d
+    if rem >= dims[0]:
+        return None
+    subs.append(rem)
+    return ",".join(str(s) for s in reversed(subs))
+
+
 class TagAliasResolver:
 
     def _short_header_alias_for(self, raw_rec: bytes) -> Union[str, None]:
@@ -301,6 +325,7 @@ class TagAliasResolver:
             # (the plaintext RxGeneric parser throws on an encrypted tail).
             base_dt = None
             base_is_array = False
+            base_dims = []
             base_own_bit = None
             if row[1] is not None:
                 try:
@@ -315,6 +340,10 @@ class TagAliasResolver:
                         ).fetchone()
                         base_dt = bdr[0] if bdr else None
                     base_is_array = bool(getattr(br.main_record, "dimension_1", 0))
+                    base_dims = [d for d in (
+                        getattr(br.main_record, "dimension_1", 0),
+                        getattr(br.main_record, "dimension_2", 0),
+                        getattr(br.main_record, "dimension_3", 0)) if d]
                     # The base record's OWN u32@0x26 is its start bit within its
                     # backing image -- the same field an alias tag stores its
                     # target bit in. It is 0 for a controller-scope tag with its
@@ -388,10 +417,13 @@ class TagAliasResolver:
                 bit = bitoff % w
                 if alias_is_bool:
                     if base_is_array:
+                        sub = _multi_dim_subscript(base_dims, idx)
+                        if sub is None:
+                            return None
                         # BOOL-element array: whole element [idx], no .bit.
                         if w == 1:
-                            return "%s[%d]" % (base, idx)
-                        return "%s[%d].%d" % (base, idx, bit)
+                            return "%s[%s]" % (base, sub)
+                        return "%s[%s].%d" % (base, sub, bit)
                     # Scalar 1-bit BOOL base: the alias is the whole base (a nonzero
                     # bitoff here is an alias-to-alias artifact, not a real bit index).
                     if w == 1:
@@ -399,7 +431,8 @@ class TagAliasResolver:
                     return ("%s.%d" % (base, bit)) if idx == 0 \
                         else ("%s[%d].%d" % (base, idx, bit))
                 if base_is_array:
-                    return "%s[%d]" % (base, idx)
+                    sub = _multi_dim_subscript(base_dims, idx)
+                    return None if sub is None else "%s[%s]" % (base, sub)
                 return base if idx == 0 else "%s[%d]" % (base, idx)
             if base_is_array:
                 stride = self._taginfo_layout.get("@size@" + bdu)
@@ -408,7 +441,10 @@ class TagAliasResolver:
                 sbits = stride * 8
                 idx = bitoff // sbits
                 inner = bitoff % sbits
-                seg = "%s[%d]" % (base, idx)
+                sub = _multi_dim_subscript(base_dims, idx)
+                if sub is None:
+                    return None
+                seg = "%s[%s]" % (base, sub)
                 if inner == 0 and (alias_dt or "").upper() == bdu:
                     return seg
                 sub = self._alias_walk_members(base_dt, inner, alias_is_bool,
