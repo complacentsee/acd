@@ -21,10 +21,13 @@ LONG_OFF = 148   # CompsRecord._LONG_BODY_OFF
 DTI = 0x1234
 
 
-def _config(fam, svc=0, req=0, cf=0, epath=b"", lpu=False, size=354) -> bytes:
+def _config(fam, svc=0, req=0, cf=0, epath=b"", lpu=False, cache=False,
+            size=354) -> bytes:
     a = bytearray(size)
     if size > 353:
         a[353] = fam
+    if cache:
+        a[1] |= 0x02   # CacheConnections value bit (byte 1 bit 1)
     struct.pack_into("<H", a, 139, req)
     a[143] = cf
     struct.pack_into("<H", a, 144, len(epath))
@@ -53,13 +56,17 @@ def _render(attrs, oid2name=None):
 
 
 def test_cip_generic_full_block():
-    out = _render([(0x1, _config(1, svc=0x4C, req=12, cf=1, lpu=True))])
+    out = _render([(0x1, _config(1, svc=0x4C, req=12, cf=1, lpu=True,
+                                 cache=True))])
     assert out is not None and 'MessageType="CIP Generic"' in out
     assert 'ServiceCode="16#004c"' in out and 'ObjectType="16#006b"' in out
     assert 'TargetObject="7"' in out and 'AttributeNumber="16#0001"' in out
     assert 'RequestedLength="12"' in out and 'ConnectedFlag="1"' in out
     assert 'CacheConnections="TRUE"' in out and 'LargePacketUsage="true"' in out
     assert 'ConnectionPath' not in out   # no epath stored
+    # The CacheConnections VALUE is config byte 1 bit 1, not a constant.
+    out = _render([(0x1, _config(1, svc=0x4C, req=12, cf=1, lpu=True))])
+    assert out is not None and 'CacheConnections="FALSE"' in out
 
 
 def test_cip_data_table_read_with_elements():

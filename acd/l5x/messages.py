@@ -302,6 +302,17 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count, modu
         re_el = _msg_res_tok(attrs.get(0x67), oid2name)
         if (le and ("&" in le or "@" in le)) or (dt and ("&" in dt or "@" in dt)):
             return None
+        # CacheConnections VALUE is config byte 1 bit 1 (presence stays gated
+        # on a connected message, cf==1, per family below).
+        cc_val = "TRUE" if (a1[1] & 0x02) else "FALSE"
+        # LargePacketUsage exists only from export-schema major 20 on; an
+        # older project's reference export omits it (sw_major 0 = unknown ->
+        # keep emitting, matching the long-standing behaviour).
+        try:
+            _row = cur.execute("SELECT sw_major FROM project_flags").fetchone()
+            sw_major = (_row[0] if _row else 0) or 0
+        except Exception:
+            sw_major = 0
         P = [("MessageType", mt)]
 
         def add_cp():
@@ -322,9 +333,10 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count, modu
             if dt:
                 P.append(("DestinationTag", dt))
             if cf == 1:
-                P.append(("CacheConnections", "TRUE"))
-            lpu = "true" if (mc.large_packet_flags & 0x02) else "false"
-            P.append(("LargePacketUsage", lpu))
+                P.append(("CacheConnections", cc_val))
+            if not (1 <= sw_major < 20):
+                lpu = "true" if (mc.large_packet_flags & 0x02) else "false"
+                P.append(("LargePacketUsage", lpu))
         elif mt in ("CIP Data Table Read", "CIP Data Table Write"):
             if re_el is None or le is None:
                 return None
@@ -333,13 +345,16 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count, modu
             add_cp()
             P += [("CommTypeCode", "0"), ("LocalIndex", "0"), ("LocalElement", le)]
             if cf == 1:
-                P.append(("CacheConnections", "TRUE"))
+                P.append(("CacheConnections", cc_val))
         elif mt in ("SLC Typed Read", "SLC Typed Write",
                     "PLC5 Word Range Write", "PLC5 Word Range Read", "PLC5 Typed Read"):
             # RemoteElement is a PLC data address (e.g. N20:0); LocalElement a tag.
-            # These families render no ConnectedFlag. SLC carries CacheConnections
-            # only on a connected (cf==1) message and its value is not derivable
-            # from a single pool sample, so that lone case is skipped (safe).
+            # These families render no ConnectedFlag. A connected (cf==1) SLC
+            # message additionally carries the DH+ channel attrs (@Channel /
+            # @DHPlus*), which are not decoded, so that case is still skipped
+            # whole (under-emit rather than emit a wrong subset). A connected
+            # PLC5 message gets CacheConnections (same byte-1 bit as CIP); its
+            # DH+ channel attrs remain undecoded (documented residual).
             if re_el is None or le is None:
                 return None
             if mt.startswith("SLC") and cf == 1:
@@ -347,6 +362,8 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count, modu
             P += [("RemoteElement", re_el), ("RequestedLength", str(req))]
             add_cp()
             P += [("CommTypeCode", "0"), ("LocalIndex", "0"), ("LocalElement", le)]
+            if mt.startswith("PLC5") and cf == 1:
+                P.append(("CacheConnections", cc_val))
         elif mt == "Module Reconfigure":
             P += [("RequestedLength", str(req))]
             add_cp()
