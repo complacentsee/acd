@@ -4047,6 +4047,12 @@ class ProgramBuilder(L5xElementBuilder):
         # set flag (false positives) on the long program layout.
         ext01 = exts.get(0x01, b"")
         disabled = "true" if (len(ext01) > 0x24 and ext01[0x24] != 0) else "false"
+        if len(prog_record) < 2000:
+            # Short program layout: the enable state is the record byte at
+            # 0x10C (0xFF disabled / 0x00 enabled); ext[0x01] has no flag
+            # there. Byte-validated pool-wide (42 disabled / 839 enabled).
+            disabled = "true" if (len(prog_record) > 0x10C
+                                  and prog_record[0x10C] != 0) else "false"
 
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
@@ -4124,16 +4130,19 @@ class ProgramBuilder(L5xElementBuilder):
         # for all programs in a redundant controller project.
         sync_redundancy = "true" if self._redundancy_enabled else None
 
-        # UseAsFolder: Studio 5000 only began emitting this Program attribute at
-        # V21. For V10..V20 ACDs the attribute is absent from the OEM L5X (the
-        # value, when present, is always "false" for non-folder programs). Gate
-        # emission on the ACD save-version: emit "false" for V21+ (matches OEM),
-        # omit (None) for older projects to avoid attr_extra over-emission.
-        # (The handful of V15-V20 projects re-exported by a newer Studio do
-        # carry it, but that depends on the *export tool* version, which is not
-        # recoverable from the ACD; keying on the ACD version is the only
-        # deterministic signal.)
-        use_as_folder: Union[str, None] = "false" if self._acd_major >= 21 else None
+        # UseAsFolder: the reference emits this attribute for every LONG-layout
+        # program record and omits it for every short-layout one, regardless of
+        # project version -- the record layout, not the save version, is the
+        # deterministic signal. A folder program (no schedulable content of its
+        # own) has record byte 0x119 == 0 AND u32 @0x60 == 0; both are nonzero
+        # on every non-folder program. Validated 100% on ~1,600 long records
+        # across both reference pools (157 folders, 0 confusions).
+        use_as_folder: Union[str, None] = None
+        if len(prog_record) >= 2000:
+            use_as_folder = (
+                "true" if (prog_record[0x119] == 0 and
+                           struct.unpack_from("<I", prog_record, 0x60)[0] == 0)
+                else "false")
 
         # --- Program own Description ---
         # Long header: object_id==1 own-description key. Short header (V10-V21):
