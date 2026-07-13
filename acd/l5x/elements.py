@@ -4296,16 +4296,66 @@ def _task_ref_list(record: bytes) -> Dict[int, bytes]:
 class TaskBuilder(L5xElementBuilder):
     _short_header: bool = False
 
-    def _build_event_info(self, e01: bytes, record: bytes) -> Union[EventInfo, None]:
-        """Build the <EventInfo> for an EVENT task from its ext-attr 0x01 payload.
+    def _build_event_info(self, e01: bytes, record: bytes,
+                          exts: Union[Dict[int, bytes], None] = None
+                          ) -> Union[EventInfo, None]:
+        """Build the <EventInfo> for an EVENT task.
 
-        EventTrigger is the enum at payload offset (type_off+2); EnableTimeout is
-        bit 0 at payload offset len-0x44. EventTag is the motion group (motion
-        trigger) or the module input tag (module-input trigger), resolved from the
-        comps graph; an EVENT-instruction task has no tag.
+        PRIMARY: the task's ext-attr 0x68 is the trigger-tag reference and its
+        TARGET decides the trigger (validated 58/58 vs the reference across
+        both pools, 0 confusions): 0xFFFFFFFF = "EVENT Instruction Only" (no
+        tag); a MOTION_GROUP-datatype tag = "Motion Group Execution"; a module
+        '&hex:slot:I' input element = "Module Input Data State Change"; an
+        AXIS_*-datatype tag = an axis event, whose only pool-observed subtype
+        is "Axis Registration 1" (the subtype field is not yet located -- a
+        different axis subtype would need it). EnableTimeout is bit 0 at
+        payload offset len-0x44 (0 mismatches pool-wide).
+
+        FALLBACK (ext 0x68 absent -- older record layout): the enum at payload
+        offset (type_off+2) + the MOTION_GROUP needle scan / ref-list module
+        lookup, unchanged. Two pool tasks depend on this path.
         """
         L = len(e01)
         if L < 0x64:
+            return None
+        v68 = (exts or {}).get(0x68)
+        if v68 is not None and len(v68) == 4:
+            enable_timeout = "true" if (e01[L - 0x44] & 1) else "false"
+            if v68 == b"\xff\xff\xff\xff":
+                return EventInfo("EventInfo", "EVENT Instruction Only",
+                                 None, enable_timeout)
+            row = self._cur.execute(
+                "SELECT comp_name, record FROM comps WHERE object_id=?",
+                (int.from_bytes(v68, "little"),)).fetchone()
+            if row and row[0]:
+                nm = row[0]
+                m = re.match(r"^&([0-9a-fA-F]+)(:.*:I)$", nm)
+                if m:
+                    mod = self._cur.execute(
+                        "SELECT comp_name FROM comps WHERE object_id=?",
+                        (int(m.group(1), 16),)).fetchone()
+                    tag = (mod[0] + m.group(2)) if mod and mod[0] else nm
+                    return EventInfo("EventInfo",
+                                     "Module Input Data State Change",
+                                     tag, enable_timeout)
+                dt = None
+                try:
+                    tr = _parse_rec_tolerant(bytes(row[1]))
+                    if tr and getattr(tr.main_record, "data_type", None):
+                        dr = self._cur.execute(
+                            "SELECT comp_name FROM comps WHERE object_id=?",
+                            (tr.main_record.data_type,)).fetchone()
+                        dt = dr[0] if dr else None
+                except Exception:
+                    dt = None
+                if dt == "MOTION_GROUP":
+                    return EventInfo("EventInfo", "Motion Group Execution",
+                                     nm, enable_timeout)
+                if dt and dt.startswith("AXIS_"):
+                    return EventInfo("EventInfo", "Axis Registration 1",
+                                     nm, enable_timeout)
+            # A reference kind this decode does not model: omit rather than
+            # emit a wrong trigger.
             return None
         t_off = 0x28C if L < 2000 else 0x109C
         if t_off + 4 > L or struct.unpack_from("<H", e01, t_off)[0] != 1:
@@ -4366,15 +4416,17 @@ class TaskBuilder(L5xElementBuilder):
         # fall back to the legacy single-file absolute record offsets, then to a
         # valid PERIODIC default for short/opaque (V10..V21) bodies.
         e01 = b""
+        _task_exts: Dict[int, bytes] = {}
         try:
             _r = RxGeneric.from_bytes(record)
-            e01 = {er.attribute_id: bytes(er.value)
-                   for er in _r.extended_records}.get(0x01, b"")
+            _task_exts = {er.attribute_id: bytes(er.value)
+                          for er in _r.extended_records}
         except Exception:
             try:
-                e01 = CompsRecord.read_ext_attrs_from_record(record).get(0x01, b"")
+                _task_exts = CompsRecord.read_ext_attrs_from_record(record)
             except Exception:
-                e01 = b""
+                _task_exts = {}
+        e01 = _task_exts.get(0x01, b"")
         if not e01:
             # Short-header / source-protected tasks carry the same payload inline as
             # the ref-list key==1 entry (RxGeneric drops ext 0x01 on them); use it so
@@ -4453,7 +4505,7 @@ class TaskBuilder(L5xElementBuilder):
 
         event_info = None
         if task_type == "EVENT":
-            event_info = self._build_event_info(e01, record)
+            event_info = self._build_event_info(e01, record, _task_exts)
 
         # A task's own Description is stored under the same own-description key
         # scheme as tags/routines/programs (long: comment_id*0x10000 + cip_type,
