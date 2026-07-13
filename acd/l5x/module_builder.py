@@ -87,9 +87,11 @@ class Module(L5xElement):
     # ExtendedProperties <private> block (DNET/DNB scanner config path); "" when
     # the module carries none.
     _extended_private: str = field(default="")
-    # True when the project's OPC UA server is enabled; module IO tag stubs then
-    # carry OpcUaAccess="None" (see ExportL5x.project_flags).
-    _opc_ua: bool = field(default=False)
+    # The project's OPC UA tag-access value ("None"/"Read/Write"/"Read Only")
+    # when its OPC UA server is enabled; module IO tag stubs then carry
+    # OpcUaAccess=<value>. "" when the server is off (attribute omitted). See
+    # ExportL5x.project_flags.
+    _opc_ua: str = field(default="")
     # ConfigTag content for this module: the rendered inner XML (binary + Decorated
     # <Data> blocks, captured byte-for-byte from the module's controller :C tag) and
     # the ConfigSize. Both None -> no <ConfigTag> is emitted. Set by ModuleBuilder
@@ -245,7 +247,7 @@ class Module(L5xElement):
             # Read/Write; OpcUaAccess="None" is added when the project OPC UA server
             # is on (one rule for every IO tag).
             def _io_tag(tag: str, inner: Union[str, None]) -> str:
-                opc = ' OpcUaAccess="None"' if self._opc_ua else ''
+                opc = f' OpcUaAccess="{self._opc_ua}"' if self._opc_ua else ''
                 if inner:
                     return f'<{tag} ExternalAccess="Read/Write"{opc}>{inner}</{tag}>'
                 # The reference writes <Comments> on a module InputTag/OutputTag
@@ -366,7 +368,7 @@ class Module(L5xElement):
             # Read/Write; OpcUaAccess="None" mirrors the IO-tag-stub rule.
             config_xml = ""
             if self._config_inner is not None and self._config_size is not None:
-                opc = ' OpcUaAccess="None"' if self._opc_ua else ''
+                opc = f' OpcUaAccess="{self._opc_ua}"' if self._opc_ua else ''
                 config_xml = (
                     f'<ConfigTag ConfigSize="{self._config_size}"'
                     f' ExternalAccess="Read/Write"{opc}>'
@@ -1596,15 +1598,15 @@ class ModuleBuilder(L5xElementBuilder):
                                 configscript = (_tag_value.render_hex(img), len(img))
                                 break
 
-        # Project-level OPC UA flag (see ExportL5x.project_flags); same pattern as
-        # TagBuilder. When the project's OPC UA server is on, module IO tag stubs
-        # carry OpcUaAccess="None".
+        # Project-level OPC UA access (see ExportL5x.project_flags); same
+        # pattern as TagBuilder. When the project's OPC UA server is on,
+        # module IO tag stubs carry OpcUaAccess=<project access value>.
         try:
-            self._cur.execute("SELECT opc_ua FROM project_flags")
+            self._cur.execute("SELECT opc_ua, opc_access FROM project_flags")
             _pf = self._cur.fetchone()
-            _opc_ua = bool(_pf[0]) if _pf else False
+            _opc_ua = (_pf[1] or "None") if _pf and _pf[0] else ""
         except Exception:
-            _opc_ua = False
+            _opc_ua = ""
 
         # Real port topology from the RxDataCollection blob (preferred over the
         # static catalog). e1[0x24] is the comment_id of the module's backing

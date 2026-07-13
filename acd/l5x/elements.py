@@ -842,9 +842,11 @@ class Tag(L5xElement):
     # Radix/Constant/Dimensions are suppressed (OEM never emits them on IO tags).
     # Defaults False so every non-IO tag (both header families) is unchanged.
     _io: bool = False
-    # OpcUaAccess="None" is emitted on every <Tag> when the project's OPC UA
-    # server is enabled (V36+; see ExportL5x.project_flags). Default False.
-    _opc_ua: bool = False
+    # OpcUaAccess value ("None"/"Read/Write"/"Read Only") emitted on every
+    # <Tag> when the project's OPC UA server is enabled (V36+; see
+    # ExportL5x.project_flags); "" omits the attribute. Per-tag value from the
+    # tag parameter blob's last byte (ExternalAccess enum encoding).
+    _opc_ua: str = ""
     # Class="Standard"/"Safety" for controller-scope Base tags in a safety
     # project; None omits the attribute. Default None.
     _class_attr: Union[str, None] = None
@@ -895,7 +897,7 @@ class Tag(L5xElement):
         if self._class_attr:
             extra += f' Class="{self._class_attr}"'
         if self._opc_ua:
-            extra += ' OpcUaAccess="None"'
+            extra += f' OpcUaAccess="{self._opc_ua}"'
         if not extra:
             return base
         i = base.find(">")
@@ -1924,11 +1926,26 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
 
         # Project-level OpcUaAccess / Class flags (see ExportL5x.project_flags).
         try:
-            self._cur.execute("SELECT opc_ua, is_safety FROM project_flags")
-            _pf = self._cur.fetchone() or (0, 0)
+            self._cur.execute(
+                "SELECT opc_ua, is_safety, opc_access FROM project_flags")
+            _pf = self._cur.fetchone() or (0, 0, "None")
         except Exception:
-            _pf = (0, 0)
-        _opc_ua = bool(_pf[0])
+            _pf = (0, 0, "None")
+        _opc_ua = ""
+        if _pf[0]:
+            # Per-tag OPC UA access: the tag parameter blob's (ext-attr 0x1)
+            # last byte, ExternalAccess enum encoding (0=Read/Write,
+            # 2=Read Only, 3=None). Falls back to the project-level value for
+            # a record whose blob cannot be read (e.g. source-protected).
+            _opc_ua = _pf[2] or "None"
+            try:
+                _r8 = RxGeneric.from_bytes(raw_rec)
+                _a1 = next((bytes(e.value) for e in _r8.extended_records
+                            if e.attribute_id == 0x1), b"")
+                if _a1 and _a1[-1] in (0, 2, 3):
+                    _opc_ua = external_access_enum(_a1[-1])
+            except Exception:
+                pass
 
         def _cls_attr():
             # Class only on controller-scope (cip 0x6b) Base tags of a safety

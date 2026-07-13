@@ -12,6 +12,7 @@ from acd.database.dbextract import DbExtract
 from acd.zip.unzip import Unzip
 from loguru import logger as log
 
+from acd.l5x.base import external_access_enum
 from acd.l5x.elements import (
     Controller,
     ControllerBuilder,
@@ -358,11 +359,22 @@ class ExportL5x:
 
         # Project-level flags consumed by TagBuilder for OpcUaAccess and Class:
         #   opc_ua  : the project's OPC UA server is enabled -> every <Tag>,
-        #             ConfigTag/InputTag/OutputTag carries OpcUaAccess="None".
-        #             Concrete signal: V36+ AND the named controller record
-        #             (cip 0x8e, parent_id 0) has extended-attribute 0x81 present
-        #             (validated 20/20 on V36; gated to V36+ because the same id
-        #             carries a different meaning pre-V36).
+        #             ConfigTag/InputTag/OutputTag carries OpcUaAccess.
+        #             Concrete signal: firmware V36+ AND the named controller
+        #             record (cip 0x8e, parent_id 0) has extended-attribute 0x81
+        #             present (validated 20/20 on V36; gated to V36+ because the
+        #             same id carries a different meaning pre-V36). The version
+        #             gate keys on the CONTROLLER firmware major from QuickInfo
+        #             DeviceIdentity (== the emitted MajorRev), NOT the Studio
+        #             SWVersion in _acd_version: a V36 project last saved by an
+        #             older Studio carries a stale SWVersion.
+        #   opc_access: the project's OPC UA tag-access value ("None" /
+        #             "Read/Write" / "Read Only"), read from a module backing
+        #             tag's parameter-blob tail (the ext-0x1 blob's last byte,
+        #             ExternalAccess enum encoding; uniform across a project's
+        #             tag records -- per-tag reads in TagBuilder override it
+        #             where parseable). Used directly by the module
+        #             ConfigTag/InputTag/OutputTag stubs.
         #   is_safety: the project contains a safety memory partition -> safety
         #             controller; controller-scope Base tags then carry Class.
         #             Concrete signal: any cip-0x6b comp whose region id
@@ -373,6 +385,16 @@ class ExportL5x:
             _major = int(_m.group(1)) if _m else 0
         except Exception:
             _major = 0
+        _gate_major = _major
+        try:
+            import xml.etree.ElementTree as _ET
+            _qi = os.path.join(self._temp_dir, "QuickInfo.XML")
+            if os.path.exists(_qi):
+                _di = _ET.parse(_qi).find("DeviceIdentity")
+                if _di is not None:
+                    _gate_major = int(_di.attrib["MajorRevision"])
+        except Exception:
+            _gate_major = _major
         _opc = 0
         _safety = 0
         for _oid, _t in comps_by_id.items():
@@ -399,7 +421,7 @@ class ExportL5x:
                 _phi = (int.from_bytes(_rec[0x36:0x3A], "little") >> 16) & 0xFFFF
                 if _phi == 0x00FB or (_phi >> 8) == 0x79 or _phi == 0x8100:
                     _safety = 1
-            if _opc == 0 and _major >= 36 and _cip == 0x8E and _t[1] == 0:
+            if _opc == 0 and _gate_major >= 36 and _cip == 0x8E and _t[1] == 0:
                 try:
                     from acd.generated.comps.rx_generic import RxGeneric as _RxG
                     _r = _RxG.from_bytes(_rec)
@@ -407,9 +429,31 @@ class ExportL5x:
                         _opc = 1
                 except Exception:
                     pass
-        self._cur.execute("CREATE TABLE project_flags(opc_ua int, is_safety int)")
+        _opc_access = "None"
+        if _opc:
+            from acd.generated.comps.rx_generic import RxGeneric as _RxG
+            for _oid, _t in comps_by_id.items():
+                if _oid in _dead_derived:
+                    continue
+                _rec = _t[5]
+                if (not (_t[2] or "").startswith("&") or len(_rec) < 14
+                        or int.from_bytes(_rec[10:12], "little") != 0x6B):
+                    continue
+                try:
+                    _r = _RxG.from_bytes(_rec)
+                    _a1 = next((bytes(e.value) for e in _r.extended_records
+                                if e.attribute_id == 0x1), b"")
+                except Exception:
+                    continue
+                if _a1 and _a1[-1] in (0, 2, 3):
+                    _opc_access = external_access_enum(_a1[-1])
+                    break
         self._cur.execute(
-            "INSERT INTO project_flags VALUES (?, ?)", (_opc, _safety)
+            "CREATE TABLE project_flags(opc_ua int, is_safety int, "
+            "opc_access text)")
+        self._cur.execute(
+            "INSERT INTO project_flags VALUES (?, ?, ?)",
+            (_opc, _safety, _opc_access)
         )
 
         # Per-oid header-family + record-length side table. fafa_seen is the
