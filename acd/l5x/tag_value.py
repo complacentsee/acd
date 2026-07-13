@@ -1008,7 +1008,14 @@ def _format_int_radix(dt: str, val: int, width: int, radix: Optional[str]) -> st
         return "8#" + format(u, "o")
     if radix == "ASCII":
         # One char literal per element: OEM writes Value="&apos;$00&apos;".
-        return "&apos;" + _sint_char_escape(val & 0xFF) + "&apos;"
+        # The char sits inside an XML attribute (Value="..."), so the four
+        # attribute-significant characters must be XML-escaped. The L5K
+        # '$'-escapes and the &apos; wrapper are already attribute-safe; only
+        # a printable '&', '<', '>' or '"' byte reaches raw form here.
+        ch = _sint_char_escape(val & 0xFF)
+        ch = (ch.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace('"', "&quot;"))
+        return "&apos;" + ch + "&apos;"
     # Decimal / anything else -> signed decimal
     return str(val)
 
