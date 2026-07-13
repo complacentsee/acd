@@ -5509,43 +5509,64 @@ class ControllerBuilder(L5xElementBuilder):
 @dataclass
 class ProjectBuilder:
     quick_info_filename: PathLike
+    # Controller decoded from Comps.Dat, used to source the project name and
+    # revision when QuickInfo.XML is absent (pre-V10 ACDs never carry it).
+    fallback_controller: "Union[Controller, None]" = None
 
     def build(self) -> RSLogix5000Content:
-        element = ET.parse(self.quick_info_filename)
-        rslogix_content_element = element.find(".")
-        if rslogix_content_element is not None:
-            target_name = rslogix_content_element.attrib["Name"]
+        # QuickInfo.XML supplies the top-level project name / schema / software
+        # revision. Pre-V10 ACDs predate this stream; degrade to the controller
+        # record (which is decoded from Comps.Dat regardless), mirroring the
+        # os.path.exists guard the controller() property already applies.
+        element = None
+        if os.path.exists(self.quick_info_filename):
+            element = ET.parse(self.quick_info_filename)
 
-        schema_version_element = element.find("SchemaVersion")
-        if schema_version_element is not None:
-            schema_version_major = schema_version_element.attrib["Major"]
-            schema_version_minor = schema_version_element.attrib["Minor"]
-            schema_revision = f"{schema_version_major}.{schema_version_minor}"
-        else:
-            schema_revision = "1.0"
-
-        # SWVersion reflects the Studio 5000 application version (e.g. "RSLogix 5000 v35.04"),
-        # which is what RSLogix5000Content SoftwareRevision represents.  DeviceIdentity
-        # MajorRevision/MinorRevision is the controller firmware version — a different value.
+        target_name = None
+        schema_revision = "1.0"
         software_revision = None
-        sw_version_element = element.find("SWVersion")
-        if sw_version_element is not None:
-            sw_version_string = sw_version_element.attrib.get("String", "")
-            # Extract the version number from the trailing "vXX.YY" portion.
-            match = re.search(r"v(\d+\.\d+)$", sw_version_string.strip())
-            if match:
-                software_revision = match.group(1)
+        if element is not None:
+            rslogix_content_element = element.find(".")
+            if rslogix_content_element is not None:
+                target_name = rslogix_content_element.attrib.get("Name")
+
+            schema_version_element = element.find("SchemaVersion")
+            if schema_version_element is not None:
+                schema_version_major = schema_version_element.attrib["Major"]
+                schema_version_minor = schema_version_element.attrib["Minor"]
+                schema_revision = f"{schema_version_major}.{schema_version_minor}"
+
+            # SWVersion reflects the Studio 5000 application version (e.g. "RSLogix 5000 v35.04"),
+            # which is what RSLogix5000Content SoftwareRevision represents.  DeviceIdentity
+            # MajorRevision/MinorRevision is the controller firmware version — a different value.
+            sw_version_element = element.find("SWVersion")
+            if sw_version_element is not None:
+                sw_version_string = sw_version_element.attrib.get("String", "")
+                # Extract the version number from the trailing "vXX.YY" portion.
+                match = re.search(r"v(\d+\.\d+)$", sw_version_string.strip())
+                if match:
+                    software_revision = match.group(1)
+            if software_revision is None:
+                # SWVersion missing or in an unexpected format — fall back to the
+                # DeviceIdentity firmware version.
+                device_identity = element.find("DeviceIdentity")
+                if device_identity is not None:
+                    software_revision = (
+                        f"{device_identity.attrib['MajorRevision']}"
+                        f".{device_identity.attrib['MinorRevision']}"
+                    )
+
+        # QuickInfo absent (or incomplete): source name/revision from the
+        # controller record so the project still carries a correct TargetName.
+        if target_name is None and self.fallback_controller is not None:
+            target_name = self.fallback_controller.name
+        if software_revision is None and self.fallback_controller is not None:
+            software_revision = (
+                f"{self.fallback_controller.major_rev}"
+                f".{self.fallback_controller.minor_rev}"
+            )
         if software_revision is None:
-            # SWVersion missing or in an unexpected format — fall back to the
-            # DeviceIdentity firmware version.
-            device_identity = element.find("DeviceIdentity")
-            if device_identity is not None:
-                software_revision = (
-                    f"{device_identity.attrib['MajorRevision']}"
-                    f".{device_identity.attrib['MinorRevision']}"
-                )
-            else:
-                software_revision = "33.01"
+            software_revision = "33.01"
 
         target_type = "Controller"
         # Full controller-project exports (TargetType="Controller") always carry the

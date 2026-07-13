@@ -770,10 +770,16 @@ class ExportL5x:
     @property
     def project(self):
         if self._project is None:
+            # Build the controller first so ProjectBuilder can source the
+            # project name / revision from it when QuickInfo.XML is absent
+            # (pre-V10 ACDs). self.controller is cached, so this is not a
+            # double build.
+            _ctrl = self.controller
             self._project = ProjectBuilder(
-                Path(os.path.join(self._temp_dir, "QuickInfo.XML"))
+                Path(os.path.join(self._temp_dir, "QuickInfo.XML")),
+                fallback_controller=_ctrl,
             ).build()
-            self._project.controller = self.controller
+            self._project.controller = _ctrl
             self._project._raw_files = self._raw_files
             self._project._file_order = self._file_order
             self._project._footer_unknown = self._footer_unknown
