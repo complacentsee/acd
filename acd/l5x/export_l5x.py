@@ -184,7 +184,7 @@ class ExportL5x:
         )
         log.debug("Create Comments table in sqllite db")
         self._cur.execute(
-            "CREATE TABLE comments(seq_number int, sub_record_length int, object_id int, record_string text, record_type int, parent int, tag_reference text, rung_content int, member_ref int, owner_ref int)"
+            "CREATE TABLE comments(seq_number int, sub_record_length int, object_id int, record_string text, record_type int, parent int, tag_reference text, rung_content int, member_ref int, owner_ref int, revision int)"
         )
 
         log.debug("Create Nameless table in sqllite db")
@@ -595,7 +595,7 @@ class ExportL5x:
         # converters normalize to bare LF; that is their quirk, not Rockwell's, so
         # the gauntlet comparator normalizes newlines instead of us changing the
         # output.)
-        self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?,?)", comment_tuples)
+        self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?,?,?)", comment_tuples)
         self._db.commit()
 
         # Generated-Safety-Signature records (record_type 0x10) are dropped by the

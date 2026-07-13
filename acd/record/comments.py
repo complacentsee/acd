@@ -69,7 +69,7 @@ class CommentsRecord:
     def __post_init__(self):
         entry = CommentsRecord.parse(self.dat_record)
         if entry is not None:
-            self._cur.execute("INSERT INTO comments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", entry)
+            self._cur.execute("INSERT INTO comments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", entry)
 
     @staticmethod
     def _parse_udi_body(body: bytes) -> Optional[tuple]:
@@ -572,7 +572,22 @@ class CommentsRecord:
                     result = result[:3] + (text,) + result[4:]
         except Exception:
             pass
-        return result
+        # Operand-comment revision: Studio keeps prior edits of an operand comment
+        # in Comments.Dat and the reference export emits only the LATEST. The
+        # revision is a u16 at raw offset 28 (body[14:16]) of a long-header operand
+        # record (body[12]==0, body[13] a comment/Min/Max/EngUnit kind). 0 for
+        # short-header and non-operand rows -> the max-revision dedup is a no-op
+        # there. Appended as the 11th comments-table column.
+        revision = 0
+        try:
+            raw_full = bytes(dat_record.record.record_buffer)
+            if (not short_header and len(raw_full) >= 30
+                    and raw_full[26] == 0x00
+                    and raw_full[27] in (0x01, 0x02, 0x03, 0x05)):
+                revision = struct.unpack_from("<H", raw_full, 28)[0]
+        except Exception:
+            revision = 0
+        return result + (revision,)
 
     @staticmethod
     def _parse_core(dat_record: DatRecord, short_header: bool = False) -> Optional[tuple]:

@@ -2322,7 +2322,8 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
                         "SELECT 1 FROM unique_comment_key WHERE k=?",
                         (parent_key,)).fetchone():
                     self._cur.execute(
-                        "SELECT c.tag_reference, c.record_string, c.member_ref "
+                        "SELECT c.tag_reference, c.record_string, c.member_ref, "
+                        "c.revision "
                         "FROM comments c "
                         "WHERE c.parent=? "
                         "AND c.tag_reference!='' AND c.tag_reference!='__REVISION_NOTE__' "
@@ -2334,7 +2335,8 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
                             "SELECT 1 FROM unique_owner_key WHERE scope=? AND own=?",
                             (parent_key, own_key)).fetchone()):
                     self._cur.execute(
-                        "SELECT c.tag_reference, c.record_string, c.member_ref "
+                        "SELECT c.tag_reference, c.record_string, c.member_ref, "
+                        "c.revision "
                         "FROM comments c "
                         "WHERE c.parent=? AND c.owner_ref=? "
                         "AND c.tag_reference!='' AND c.tag_reference!='__REVISION_NOTE__' "
@@ -2343,7 +2345,11 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
                     )
                 else:
                     self._cur.execute("SELECT 1 WHERE 0")
-                for op_ref, op_text, op_kind in self._cur.fetchall():
+                # Studio keeps prior edits of an operand comment; the reference
+                # emits only the LATEST. Keep the max-revision row per
+                # (operand, kind), preserving first-occurrence order.
+                _best: Dict[Tuple[str, int], Tuple[int, str]] = {}
+                for op_ref, op_text, op_kind, op_rev in self._cur.fetchall():
                     if not op_text:
                         continue
                     if ".!" in op_ref:
@@ -2352,6 +2358,11 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
                             continue
                     if not _is_valid_operand(op_ref):
                         continue
+                    _k = (op_ref, op_kind)
+                    _prev = _best.get(_k)
+                    if _prev is None or (op_rev or 0) > _prev[0]:
+                        _best[_k] = (op_rev or 0, op_text)
+                for (op_ref, op_kind), (_op_rev, op_text) in _best.items():
                     if op_kind == 0x05:
                         eng_units.append((op_ref, op_text))
                     elif op_kind == 0x02:
