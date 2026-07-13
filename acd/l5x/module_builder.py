@@ -1178,6 +1178,31 @@ class ModuleBuilder(L5xElementBuilder):
             ud_minor = minor
             shutdown_parent_on_fault = "false"
             product_code = 29 if product_type in (150, 127, 151) else 28
+            # A PT-123 peripheral is ambiguous between the PF75x Rhino
+            # backplane (RHINOBP, 28) and a PF70-class DPI drive (DPI, 30);
+            # its own identity does not discriminate (identical PCs occur
+            # under both). The reference keys on the PARENT drive's identity:
+            # every DPI peripheral's parent is the (1,123,48|50) drive family,
+            # every RhinoBP PT-123 parent is (1,123,1168) -- corpus-unanimous
+            # with zero overlap. Fail-closed to 28 (today's value) when the
+            # parent cannot be resolved.
+            if product_type == 123:
+                try:
+                    _poid = self._modid_to_oid.get(parent_modid)
+                    _prow = (self._cur.execute(
+                        "SELECT record FROM comps WHERE object_id=?",
+                        (_poid,)).fetchone() if _poid else None)
+                    if _prow and _prow[0] is not None:
+                        _pe1, _pcid, _ = _module_identity_e1(
+                            self._cur, _poid, bytes(_prow[0]),
+                            self._short_header)
+                        if _pcid is not None and len(_pe1) >= 0x30:
+                            _pmi = ModuleIdentity.from_bytes(_pe1)
+                            if (_pmi.vendor == 1 and _pmi.product_type == 123
+                                    and _pmi.product_code in (48, 50)):
+                                product_code = 30
+                except Exception:
+                    pass
             product_type = 0
             # The reference exports these drive-peripheral modules with a fixed
             # Major/Minor of 1/1 (the peripheral's own firmware revision in the
