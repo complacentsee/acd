@@ -550,6 +550,57 @@ class Module(L5xElement):
         return f'<Bus Size="{child_count}"/>'
 
 
+# The controller's last-online identity string, ASCII inside the
+# 'TimeSynchronize' record under RxControllerCollection:
+#   '<vendor>;<catalog>[/<series>][ <name>];<serialhex>'
+# e.g. 'Rockwell Automation;1768-L43/C LOGIX5343;6034DD05'. Anchored by a u32
+# length prefix immediately before the match.
+_ROOT_IDENTITY_RE = re.compile(rb"([ -:<-~]{2,64});([ -:<-~]{2,64});([0-9A-Fa-f]{4,16})")
+_ROOT_CATALOG_SHAPE = re.compile(r"^\d{4}-[A-Za-z0-9-]+$")
+
+
+def _root_identity_catalog(cur, short_header: bool) -> "Union[str, None]":
+    """The root controller's CatalogNumber from its last-online identity, or None.
+
+    Used only as a fallback when the static catalog chain yields nothing. The
+    middle identity field is '<catalog>[/<series>][ <name>]'; the reference
+    emits the bare catalog (series and trailing name stripped). Two fail-closed
+    guards (validated 17/17 exact, 0 false positives, incl. both failure modes):
+      * shape: the derived text must look like a catalog number -- newer
+        firmware (35.011+) writes a marketing-name-only identity instead;
+      * staleness: the identity's serial must equal the controller's ProjectSN
+        (ext-attr 0x75) -- a project retargeted to new hardware but never
+        re-onlined still carries the PREVIOUS controller's identity.
+    """
+    rows = cur.execute(
+        "SELECT c.record, p.parent_id FROM comps c "
+        "JOIN comps p ON c.parent_id = p.object_id "
+        "WHERE c.comp_name = 'TimeSynchronize' "
+        "AND p.comp_name = 'RxControllerCollection'"
+    ).fetchall()
+    for rec, ctrl_oid in rows:
+        if rec is None:
+            continue
+        rec = bytes(rec)
+        for m in _ROOT_IDENTITY_RE.finditer(rec):
+            s = m.start()
+            if s < 4 or struct.unpack_from("<I", rec, s - 4)[0] != len(m.group(0)):
+                continue
+            middle = m.group(2).decode("ascii", errors="replace")
+            catalog = middle.split("/")[0].split(" ")[0]
+            if not _ROOT_CATALOG_SHAPE.match(catalog):
+                continue
+            try:
+                serial = int(m.group(3), 16)
+            except ValueError:
+                continue
+            sn = CompsRecord.record_attrs(cur, ctrl_oid, short_header).get(0x75)
+            if sn is None or len(sn) < 4 or struct.unpack_from("<I", sn)[0] != serial:
+                continue
+            return catalog
+    return None
+
+
 def _module_identity_e1(cur, object_id: int, raw_rec: bytes,
                         short_header: bool) -> "Tuple[bytes, Union[int, None], str]":
     """Resolve a module record's identity blob via the shared recovery chain.
@@ -1642,6 +1693,18 @@ class ModuleBuilder(L5xElementBuilder):
         # returns None when there is no blob (e.g. a 5069 root with a degenerate
         # data_link), so such roots still fall back to the static catalog / empty.
         is_root = (parent_name == name)
+        # Root-module (controller) catalog fallback: when the whole lookup
+        # chain above (BY_MAJOR -> base table -> ExtendedProperties CatNum)
+        # yielded nothing, derive the catalog from the controller's
+        # last-online identity string in the ACD (see
+        # _root_identity_catalog). Fires only for the root module and only on
+        # an otherwise-empty catalog, so covered identities are unchanged.
+        if not catalog_number and is_root:
+            try:
+                catalog_number = _root_identity_catalog(
+                    self._cur, self._short_header) or ""
+            except Exception:
+                catalog_number = ""
         # The root and the conventionally-named controller-chassis modules
         # ("Local"/"Local2") must decode to a controller-type backplane port; gate
         # their blob on that so a mis-linked I/O-adapter blob can't masquerade as the
