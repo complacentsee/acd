@@ -901,6 +901,9 @@ class Tag(L5xElement):
     # @DataExchangeId GUID string ("{...}") for a tag that carries one; None omits
     # the attribute. Set by TagBuilder from the comments table (object_id 45).
     _data_exchange_id: Union[str, None] = None
+    # @Usage ("Public"/"Input"/"Output"/"InOut") for a PROGRAM-scope tag; None
+    # omits it. Set by TagBuilder from the tag's ext-attr 0x01 (ext01[0x20E]).
+    _usage: Union[str, None] = None
 
     def _inject_tag_attrs(self, base: str) -> str:
         """Insert OpcUaAccess / Class attributes into the opening <Tag ...> of base.
@@ -915,6 +918,8 @@ class Tag(L5xElement):
             extra += f' OpcUaAccess="{self._opc_ua}"'
         if self._data_exchange_id:
             extra += f' DataExchangeId="{self._data_exchange_id}"'
+        if self._usage:
+            extra += f' Usage="{self._usage}"'
         if not extra:
             return base
         i = base.find(">")
@@ -2420,6 +2425,15 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
                     struct.unpack_from("<I", raw_rec, 14)[0])
         except Exception:
             _dxid = None
+        # @Usage: a per-tag flag on long-header PROGRAM-scope tags (cip 0x68) in
+        # ext-attr 0x01. Controller-scope tags (cip 0x6B) never carry it.
+        _usage = None
+        try:
+            if not self._short_header and r.cip_type == 0x68:
+                _, _uexts, _ = _parse_rec_and_exts(raw_rec)
+                _usage = _program_tag_usage(_uexts.get(0x01, b""))
+        except Exception:
+            _usage = None
         return Tag(
             _nm,
             _nm,
@@ -2444,8 +2458,22 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
             _alias_no_radix=_alias_no_radix,
             _custom_properties=_cp_xml,
             _data_exchange_id=_dxid,
+            _usage=_usage,
             _opc_ua=_opc_ua, _class_attr=_cls_attr(),
         )
+
+
+def _program_tag_usage(ext01: bytes) -> Union[str, None]:
+    """Return the @Usage of a long-header PROGRAM-scope tag from its ext-attr 0x01
+    blob, or None (no @Usage attribute). The flag shares the same byte the AOI
+    parameter decoder reads (ext01[0x20E]): bit 0x10 => Public; otherwise the
+    0x0C direction bits => Input(0x04)/Output(0x08)/InOut(0x0C); 0x00 => omit."""
+    if len(ext01) <= 0x20E:
+        return None
+    b = ext01[0x20E]
+    if b & 0x10:
+        return "Public"
+    return {0x04: "Input", 0x08: "Output", 0x0C: "InOut"}.get(b & 0x0C)
 
 
 def _aoi_tag_usage(ext01: bytes, short_header: bool = False) -> Tuple[Union[str, None], bool, bool]:
