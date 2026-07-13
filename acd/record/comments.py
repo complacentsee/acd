@@ -353,6 +353,12 @@ class CommentsRecord:
         if any((ord(c) < 0x20 and c != "\t") for c in operand):
             return None
         kind = body[13]
+        if kind == 0x04:
+            # A kind-0x04 operand row is a member CROSS-REFERENCE (where-used
+            # I/O flags as text, e.g. "OI"), not a comment; the reference
+            # export never emits these. Same layout, so it must be dropped
+            # here or it would surface as a spurious <Comment>.
+            return None
         if kind in (0x02, 0x03):
             # Min/Max: the payload is the trailing little-endian REAL (there is
             # no text, which is why these records used to decode to '' and be
@@ -487,6 +493,10 @@ class CommentsRecord:
         owner_ref = struct.unpack_from("<I", body, 0)[0]
         object_id = struct.unpack_from("<I", body, 8)[0]
         kind = body[13]
+        if kind == 0x04:
+            # Member cross-reference row, not a comment (see the plaintext
+            # walker); drop before attempting the decrypt.
+            return None
         prefix = raw[30:mi]
         ct = raw[mi + 18:]
         nblocks = len(ct) // 16
@@ -712,6 +722,14 @@ class CommentsRecord:
                 tag_ref = r.body.tag_reference.value
             else:
                 tag_ref = ""
+            # A kind-0x04 (raw[27]) OPERAND row is a member cross-reference,
+            # not a comment -- same body layout as the hand-walked ordinals,
+            # so gate it here too. rt-1/2 description rows use the same slot
+            # for the member_ref low byte and are NOT filtered.
+            if (tag_ref and tag_ref[:1] in (".", "[")
+                    and len(raw_full) >= 28
+                    and raw_full[26] == 0x00 and raw_full[27] == 0x04):
+                return None
             # For AsciiRecord (type 1 or 2), extract bytes [4:8] of unknown_1.
             # This value is non-zero for rung-level comments and zero for internal
             # metadata strings (FBDRoutineDescription, MainProgramLocalTagDescription, etc.).
