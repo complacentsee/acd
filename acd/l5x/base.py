@@ -185,14 +185,54 @@ def render_custom_properties(rows) -> Union[str, None]:
     """Render an ACM/library <CustomProperties> block from custom_properties
     rows [(provider_id, ext, blob), ...]. Providers are ordered by the natural
     Ext key; each blob is emitted VERBATIM (already the exact inner XML, never
-    re-escaped or CDATA-wrapped). None when there are no rows."""
+    re-escaped or CDATA-wrapped). None when there are no rows.
+
+    Exact-duplicate rows are dropped: Comments.Dat stores some provider records
+    twice, so a raw join can return each provider two or more times; the export
+    carries exactly one per (provider_id, ext, blob)."""
     if not rows:
         return None
-    ordered = sorted(rows, key=lambda t: _cp_ext_sortkey(t[1]))
+    _seen = set()
+    _uniq = []
+    for _t in rows:
+        _k = (_t[0], _t[1], _t[2])
+        if _k in _seen:
+            continue
+        _seen.add(_k)
+        _uniq.append(_t)
+    ordered = sorted(_uniq, key=lambda t: _cp_ext_sortkey(t[1]))
     inner = "\n".join(
         f'<Provider ID="{pid}" Ext="{ext}">\n{blob}\n</Provider>'
         for pid, ext, blob in ordered)
     return f'<CustomProperties>\n{inner}\n</CustomProperties>'
+
+
+def custom_properties_by_parent(cur: Cursor, parent: int) -> Union[str, None]:
+    """Scope-level <CustomProperties> (owner_ref == 0) for an owner keyed by its
+    own comment parent (comment_id<<16 | cip_type): controller-scope Tag,
+    Program, Controller root, DataType, AOI definition. None when absent."""
+    rows = cur.execute(
+        "SELECT provider_id, ext, blob FROM custom_properties "
+        "WHERE parent=? AND owner_ref=0 AND rung_content=0", (parent,)).fetchall()
+    return render_custom_properties(rows)
+
+
+def custom_properties_by_scope_owner(cur: Cursor, parent: int,
+                                     owner_ref: int) -> Union[str, None]:
+    """Member-level <CustomProperties> (a program-scope Tag or a Routine's own
+    block) keyed by BOTH the containing program's scope parent
+    (program_comment_id<<16 | 0x68) and the owning comp's own key
+    (record[14:18]). owner_ref alone is only a program-scoped ordinal and is not
+    globally unique -- a bare-owner match cross-attributes another program's
+    block -- so the scope parent is required. Rung-level rows (rung_content != 0)
+    are excluded. None when owner_ref is 0 or absent."""
+    if not owner_ref:
+        return None
+    rows = cur.execute(
+        "SELECT provider_id, ext, blob FROM custom_properties "
+        "WHERE parent=? AND owner_ref=? AND rung_content=0",
+        (parent, owner_ref)).fetchall()
+    return render_custom_properties(rows)
 
 
 _AT_TOKEN_RE = re.compile(r"@([0-9a-fA-F]+)@")

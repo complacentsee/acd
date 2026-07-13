@@ -27,9 +27,12 @@ from acd.l5x.base import (
     _rxgeneric_plaintext_main,
     _xml_sane,
     connection_signature_row,
+    custom_properties_by_parent,
+    custom_properties_by_scope_owner,
     external_access_enum,
     own_description,
     radix_enum,
+    render_custom_properties,
     resolve_aoi_alias_target,
     resolve_hex_operand,
     safety_signature_row,
@@ -887,6 +890,11 @@ class Tag(L5xElement):
     # A rack chassis-image alias (structure target) carries no Radix, unlike the
     # atomic per-point alias which OEM always writes Radix="Binary" on.
     _alias_no_radix: bool = False
+    # Pre-rendered <CustomProperties> ACM/library block; emitted as the FIRST
+    # child of the tag (before AlarmConditions/Comments/Description/Data). "" for
+    # tags with no provider block. Set by TagBuilder from the custom_properties
+    # table.
+    _custom_properties: str = field(default="")
 
     def _inject_tag_attrs(self, base: str) -> str:
         """Insert OpcUaAccess / Class attributes into the opening <Tag ...> of base.
@@ -1205,17 +1213,19 @@ class Tag(L5xElement):
                     f'{_rpi3}/>'
                 )
 
-        if (not self._alarm_xml and not consume_xml and not produce_xml
+        if (not self._custom_properties and not self._alarm_xml
+                and not consume_xml and not produce_xml
                 and not comments_xml and not desc_xml and not data_xml
                 and not eu_xml and not maxes_xml and not mins_xml):
             return base
 
-        # Insert <AlarmConditions> first (Logix emits it before everything else on
-        # a tag), then ConsumeInfo/ProduceInfo (Consumed/Produced tags), then
-        # Comments, Description, EngineeringUnits/Maxes/Mins, Data, immediately
-        # after the opening tag.
+        # Insert <CustomProperties> first (the reference emits the ACM/library
+        # provider block before everything else), then <AlarmConditions>,
+        # ConsumeInfo/ProduceInfo (Consumed/Produced tags), Comments, Description,
+        # EngineeringUnits/Maxes/Mins, Data, immediately after the opening tag.
         idx = base.index(">")
-        return (base[:idx + 1] + self._alarm_xml + consume_xml + produce_xml
+        return (base[:idx + 1] + self._custom_properties + self._alarm_xml
+                + consume_xml + produce_xml
                 + comments_xml + desc_xml + eu_xml + maxes_xml + mins_xml
                 + data_xml + base[idx + 1:])
 
@@ -1357,6 +1367,12 @@ class Routine(L5xElement):
     # ST routine source lines decoded from the nameless subtree; None emits no
     # <STContent> (fail-closed -- see _st_content_lines).
     _st_lines: Union[List[str], None] = field(default=None)
+    # Pre-rendered routine-own <CustomProperties> block ("" if none) and per-rung
+    # blocks keyed by rung Number ({} if none). Both from the custom_properties
+    # table; the routine-own block is the first child of <Routine>, a rung block
+    # the first child of its <Rung>.
+    _custom_properties: str = field(default="")
+    _rung_custom_properties: Dict[int, str] = field(default_factory=dict)
 
     def to_xml(self) -> str:
         rll_content = ""
@@ -1372,6 +1388,7 @@ class Routine(L5xElement):
                     comment_xml = f'<Comment><![CDATA[{comment_text}]]></Comment>'
                 rung_xmls.append(
                     f'<Rung Number="{i}" Type="N">'
+                    f'{self._rung_custom_properties.get(i, "")}'
                     f'{comment_xml}'
                     f'<Text><![CDATA[{text}]]></Text>'
                     f'</Rung>'
@@ -1395,7 +1412,7 @@ class Routine(L5xElement):
                              f'{html.escape(self._safety_signature_timestamp, quote=True)}"')
         return (
             f'<Routine Name="{html.escape(self.name, quote=True)}" Type="{self.type}"{sig_attr}>'
-            f'{desc_xml}{rll_content}</Routine>'
+            f'{self._custom_properties}{desc_xml}{rll_content}</Routine>'
         )
 
 
@@ -1422,6 +1439,9 @@ class AOI(L5xElement):
     # AdditionalHelpText (UDI_EXT_HELP) -- emitted after RevisionNote, before
     # Parameters (the OEM child order); "" omits the element.
     _additional_help_text: str = field(default="")
+    # Pre-rendered <CustomProperties> block ("" if none); the first child of the
+    # AOI definition, before Description.
+    _custom_properties: str = field(default="")
 
     def __post_init__(self):
         super().__post_init__()
@@ -1430,7 +1450,7 @@ class AOI(L5xElement):
     def to_xml(self) -> str:
         base = super().to_xml()
         idx = base.index(">")
-        inject = ""
+        inject = self._custom_properties
         if self._description:
             inject += f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
         if self._revision_note:
@@ -1457,15 +1477,21 @@ class Program(L5xElement):
     safety_signature: Union[str, None] = field(default=None)
     safety_signature_timestamp: Union[str, None] = field(default=None)
     _description: Union[str, None] = field(default=None)
+    # Pre-rendered <CustomProperties> block ("" if none); the first child of the
+    # program, before Description.
+    _custom_properties: str = field(default="")
 
     def to_xml(self) -> str:
         base = super().to_xml()
-        if not self._description:
+        prefix = self._custom_properties
+        if self._description:
+            # The program's own Description follows CustomProperties.
+            prefix += (f'<Description>\n<![CDATA[{_xml_sane(self._description)}]]>\n'
+                       f'</Description>')
+        if not prefix:
             return base
-        # The program's own Description is the first child.
-        desc_xml = f'<Description>\n<![CDATA[{_xml_sane(self._description)}]]>\n</Description>'
         idx = base.index(">")
-        return base[:idx + 1] + desc_xml + base[idx + 1:]
+        return base[:idx + 1] + prefix + base[idx + 1:]
 
 
 @dataclass
@@ -1555,6 +1581,9 @@ class Controller(L5xElement):
     _emit_data_logs: bool = field(default=True)
     # The controller's own <Description> (first child), or None.
     _description: Union[str, None] = field(default=None)
+    # Pre-rendered controller-root <CustomProperties> block ("" if none); emitted
+    # as the first child, before Description.
+    _custom_properties: str = field(default="")
     # A safety-signed project stamps the <AddOnInstructionDefinitions> collection
     # with these two attributes; both None on a standard/unsigned project (omitted).
     _aoi_safety_signature: Union[str, None] = field(default=None)
@@ -1631,12 +1660,13 @@ class Controller(L5xElement):
         idx = base.index(">")
         open_tag = base[: idx + 1]
         inner = base[idx + 1 : -len("</Controller>")]
-        # The controller's own Description is the first child.
+        # CustomProperties is the first child, then the controller's own
+        # Description.
         desc_xml = (
             f'<Description>\n<![CDATA[{_xml_sane(self._description)}]]>\n</Description>'
             if self._description else ""
         )
-        open_tag = open_tag + desc_xml
+        open_tag = open_tag + self._custom_properties + desc_xml
         # RedundancyInfo: Enabled from the binary; the pad percentages are read from
         # the controller-properties blob and emitted only for the controller
         # generations that carry them (the 5x80 family omits both).
@@ -2341,6 +2371,22 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
             else self._read_tag_value(r.main_record.data_table_instance)
         )
         _nm = io_name or name
+        # ACM/library <CustomProperties>: a controller-scope tag (cip 0x6B) owns
+        # its block keyed by its own comment parent (owner_ref 0); a program-scope
+        # tag (cip 0x68) owns it keyed by its program's scope parent
+        # (comment_id<<16 | 0x68 -- a program tag shares its program's comment_id)
+        # plus the tag's own key at record[14:18].
+        _cp_xml = ""
+        try:
+            if r.cip_type == 0x6B:
+                _cp_xml = custom_properties_by_parent(
+                    self._cur, (r.comment_id * 0x10000) + r.cip_type) or ""
+            elif r.cip_type == 0x68 and len(raw_rec) >= 18:
+                _cp_xml = custom_properties_by_scope_owner(
+                    self._cur, (r.comment_id * 0x10000) + 0x68,
+                    struct.unpack_from("<I", raw_rec, 14)[0]) or ""
+        except Exception:
+            _cp_xml = ""
         return Tag(
             _nm,
             _nm,
@@ -2363,6 +2409,7 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
             _no_data=suppress_value,
             _io=is_io,
             _alias_no_radix=_alias_no_radix,
+            _custom_properties=_cp_xml,
             _opc_ua=_opc_ua, _class_attr=_cls_attr(),
         )
 
@@ -2967,6 +3014,50 @@ class RoutineBuilder(L5xElementBuilder):
         except Exception:
             pass
 
+        # --- CustomProperties (ACM/library) ---
+        # A routine owns a block keyed by its own key at record[14:18] (owner_ref,
+        # rung_content 0); each of its rungs owns a block keyed by the same owner
+        # with a nonzero rung_content, mapped to the rung Number through the same
+        # regn_link join used for rung comments (rc_hi/rc_lo7 scoped to this
+        # routine's group_id). Long-header only -- the capture is gated to V24+,
+        # so a short-header routine finds no rows.
+        routine_cp = ""
+        rung_cp: Dict[int, str] = {}
+        try:
+            _mref = (struct.unpack_from("<I", record, 14)[0]
+                     if len(record) >= 18 else 0)
+            # Scope parent = the program's key. A routine shares its program's
+            # comment_id (record[12:14]), so (comment_id<<16 | 0x68) is the parent
+            # every one of the program's ACM blocks stores.
+            _scope = ((struct.unpack_from("<H", record, 12)[0] * 0x10000) + 0x68
+                      if len(record) >= 14 else 0)
+            if _mref and _scope:
+                routine_cp = custom_properties_by_scope_owner(
+                    self._cur, _scope, _mref) or ""
+                if rung_ids and not self._short_header:
+                    _oidnum = {oid: i for i, oid in enumerate(rung_ids)}
+                    _by_rc: Dict[int, list] = {}
+                    for _pid, _ext, _blob, _rc in self._cur.execute(
+                            "SELECT provider_id, ext, blob, rung_content "
+                            "FROM custom_properties "
+                            "WHERE parent=? AND owner_ref=? AND rung_content!=0",
+                            (_scope, _mref)):
+                        _by_rc.setdefault(_rc, []).append((_pid, _ext, _blob))
+                    for _rc, _rows in _by_rc.items():
+                        _rl = self._cur.execute(
+                            "SELECT rung_oid FROM regn_link "
+                            "WHERE rc_hi=? AND rc_lo7=? AND group_id=?",
+                            (_rc >> 16, _rc & 127, self._object_id)).fetchall()
+                        if len(_rl) == 1:
+                            _num = _oidnum.get(_rl[0][0])
+                            if _num is not None:
+                                _blk = render_custom_properties(_rows)
+                                if _blk:
+                                    rung_cp[_num] = _blk
+        except Exception:
+            routine_cp = ""
+            rung_cp = {}
+
         # --- Routine own Description ---
         # A routine's own description is stored in the comments table under the
         # same own-description key scheme used for tags/datatypes. Long-header
@@ -3029,7 +3120,9 @@ class RoutineBuilder(L5xElementBuilder):
         return Routine(name, name, routine_type, rungs, rung_ids, rung_comments,
                        description, _safety_signature=safety_sig,
                        _safety_signature_timestamp=safety_sig_ts,
-                       _st_lines=st_lines)
+                       _st_lines=st_lines,
+                       _custom_properties=routine_cp,
+                       _rung_custom_properties=rung_cp)
 
 
 def _parse_fffeff(data: bytes, offset: int):
@@ -3496,8 +3589,16 @@ class AoiBuilder(L5xElementBuilder):
         aoi_description: Union[str, None] = None
         revision_note = ""
         additional_help = ""
+        aoi_cp = ""
         if _r_aoi is not None:
             aoi_comment_parent = (_r_aoi.comment_id * 0x10000) + _r_aoi.cip_type
+            try:
+                # ACM/library <CustomProperties>: the AOI definition owns its block
+                # keyed by its own comment parent (cip 0x338), owner_ref 0.
+                aoi_cp = custom_properties_by_parent(
+                    self._cur, aoi_comment_parent) or ""
+            except Exception:
+                aoi_cp = ""
             if self._short_header:
                 # sub_record_length filter skips the cip-0x68 tag that may share
                 # this comment_id (the AOI's own cip is 0x338).
@@ -3568,6 +3669,7 @@ class AoiBuilder(L5xElementBuilder):
             aoi_description,
             revision_note,
             _additional_help_text=additional_help,
+            _custom_properties=aoi_cp,
         )
 
 
@@ -3981,11 +4083,22 @@ class ProgramBuilder(L5xElementBuilder):
             if _srow:
                 prog_sig, prog_sig_ts = _srow[0], _srow[1]
 
+        # ACM/library <CustomProperties>: the program owns its block keyed by its
+        # own comment parent (cip 0x68), owner_ref 0.
+        prog_cp = ""
+        if _prog_comment_parent is not None:
+            try:
+                prog_cp = custom_properties_by_parent(
+                    self._cur, _prog_comment_parent) or ""
+            except Exception:
+                prog_cp = ""
+
         prog = Program(name, name, prog_cls, "false", main_routine_name,
                        fault_routine_name, disabled, sync_redundancy, use_as_folder,
                        tags, routines, safety_signature=prog_sig,
                        safety_signature_timestamp=prog_sig_ts,
-                       _description=program_description)
+                       _description=program_description,
+                       _custom_properties=prog_cp)
         # The program-scoped <Tags> collection carries its own safety signature,
         # distinct from the program's. Render it on the <Tags> wrapper. Program has no
         # _section_attrs by default (the base to_xml reads it via getattr), so create it.
@@ -5476,6 +5589,15 @@ class ControllerBuilder(L5xElementBuilder):
             _comment_parent = None
 
         controller_description = self._pass_own_description(results, _comment_parent)
+        # ACM/library <CustomProperties>: the controller root owns its block keyed
+        # by its own comment parent (cip 0x8E), owner_ref 0.
+        controller_cp = ""
+        if _comment_parent is not None:
+            try:
+                controller_cp = custom_properties_by_parent(
+                    self._cur, _comment_parent) or ""
+            except Exception:
+                controller_cp = ""
         (sfc_execution_control, sfc_restart_position, sfc_last_scan, project_sn,
          project_creation_date, last_modified_date, _comm_path_prefix, major_fault_program,
          redundancy_enabled) = self._pass_ext_record_scalars(r, extended_records)
@@ -5550,6 +5672,7 @@ class ControllerBuilder(L5xElementBuilder):
             # same v24+/5x80 signal as the project-download settings above.
             _emit_data_logs=_v24_plus,
             _description=controller_description,
+            _custom_properties=controller_cp,
             _aoi_safety_signature=aoi_sig,
             _aoi_safety_signature_timestamp=aoi_sig_ts,
             time_slice=time_slice,
