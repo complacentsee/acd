@@ -2349,6 +2349,7 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
                 # emits only the LATEST. Keep the max-revision row per
                 # (operand, kind), preserving first-occurrence order.
                 _best: Dict[Tuple[str, int], Tuple[int, str]] = {}
+                _gen_max = 0
                 for op_ref, op_text, op_kind, op_rev in self._cur.fetchall():
                     if not op_text:
                         continue
@@ -2359,6 +2360,8 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
                     if not _is_valid_operand(op_ref):
                         continue
                     _k = (op_ref, op_kind)
+                    if op_kind not in (0x02, 0x03, 0x05):
+                        _gen_max = max(_gen_max, op_rev or 0)
                     _prev = _best.get(_k)
                     if _prev is None or (op_rev or 0) > _prev[0]:
                         _best[_k] = (op_rev or 0, op_text)
@@ -2370,7 +2373,17 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
                     elif op_kind == 0x03:
                         maxes.append((op_ref, op_text))
                     else:
-                        operand_comments.append((op_ref, op_text))
+                        # An edit of a tag's comments rewrites every LIVE row
+                        # at the project's new edit revision; a row left at an
+                        # older revision was deleted in that edit, and the
+                        # reference export lists its operand with EMPTY text.
+                        # Blank (don't drop) a winner older than the tag's
+                        # newest comment revision. Value/EngUnit kinds keep
+                        # their text (separate blocks, no observed blanking);
+                        # revision is 0 across a short-header project, where
+                        # this is a no-op.
+                        operand_comments.append(
+                            (op_ref, op_text if _op_rev >= _gen_max else ""))
             except Exception:
                 operand_comments = []
                 eng_units = []
