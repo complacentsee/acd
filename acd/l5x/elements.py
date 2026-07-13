@@ -232,8 +232,12 @@ def _is_valid_operand(op: str) -> bool:
 # could, since the two probe passes disagreed on whether firmware rev or the
 # container version drives it). An unrecognised length returns None -> no
 # <Data> (element_missing, today's behaviour), never a wrong render.
-# Validated byte-exact vs OEM on ALL 15 pool AXIS_VIRTUAL tags across firmware
-# 20/30/33/35 and across multiple files per generation (0 files worse).
+# Validated byte-exact vs OEM on every AXIS_VIRTUAL tag whose blob length is in
+# the tail table, across two independent test pools and firmware 20/30/33/35/36/37
+# (the 3654/5965 entries add the newer generations; the header offsets are
+# unchanged -- only the length-keyed tail shifts). The short <=1216-byte variant
+# is a different, smaller struct that does not fit the header, so it stays out of
+# the table -> no <Data>, never a wrong render.
 _AXIS_ENUM: Dict[str, Dict[int, str]] = {
     "RotaryAxis": {0: "Linear", 1: "Rotary"},
     "HomeMode": {0: "Passive", 1: "Active", 2: "Absolute"},
@@ -274,9 +278,11 @@ _AXIS_VIRTUAL_HEADER = [
 # unknown length falls through to today's no-<Data> behaviour (0-worse).
 _AXIS_VIRTUAL_TAIL = {
     3430: (3426, False),
+    3654: (3426, True),
     3666: (3426, True),
     5476: (3474, True),
     5843: (3506, True),
+    5965: (3506, True),
 }
 
 
