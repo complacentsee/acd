@@ -1956,7 +1956,10 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
             if self._short_header:
                 is_safe_partition = hi == 0x00FB
             else:
-                is_safe_partition = (hi >> 8) == 0x79
+                # 0x79xx = 5069-family safety partition; 0x8100 = the
+                # 1756-L8xES (GuardLogix) safety partition (same field,
+                # family-specific id).
+                is_safe_partition = (hi >> 8) == 0x79 or hi == 0x8100
             return "Safety" if is_safe_partition else "Standard"
 
         # A source-protected record's encrypted ext-attr tail defeats the

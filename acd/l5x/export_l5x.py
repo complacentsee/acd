@@ -387,12 +387,17 @@ class ExportL5x:
                 # (u4 @ record 0x36). The encoding is version-specific:
                 #   short header (V10-V21): hi16 == 0x00FB
                 #   long  header (V24+):    hi16 high byte == 0x79  (0x79xx;
-                #                           standard partitions are 0x70xx)
+                #                           standard partitions are 0x70xx), or
+                #                           hi16 == 0x8100 (the 1756-L8xES
+                #                           GuardLogix family stores its safety
+                #                           partition there; the 5069 family
+                #                           uses 0x79xx)
                 # Either marker present anywhere in a cip-0x6b comp => safety
                 # project (validated on V20 + V36 safety projects, and emits
-                # nothing on V20/V34/V36 non-safety projects).
+                # nothing on V20/V34/V36 non-safety projects; 0x8100 validated
+                # tag-for-tag against the reference on 1756-L8xES projects).
                 _phi = (int.from_bytes(_rec[0x36:0x3A], "little") >> 16) & 0xFFFF
-                if _phi == 0x00FB or (_phi >> 8) == 0x79:
+                if _phi == 0x00FB or (_phi >> 8) == 0x79 or _phi == 0x8100:
                     _safety = 1
             if _opc == 0 and _major >= 36 and _cip == 0x8E and _t[1] == 0:
                 try:
