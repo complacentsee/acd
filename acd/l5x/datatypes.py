@@ -20,6 +20,7 @@ from acd.l5x.base import (
     external_access_enum,
     own_description,
     radix_enum,
+    render_custom_properties,
     short_own_description,
 )
 from acd.record.comps import CompsRecord
@@ -679,22 +680,18 @@ class DataTypeBuilder(L5xElementBuilder):
         else:
             description = own_description(self._cur, (r.comment_id * 0x10000) + r.cip_type)
 
-        # Library raC_*/STR* UDTs carry a verbatim <CustomProperties> provider block
-        # captured into the custom_properties table, keyed by this datatype's
-        # comment_id (only datatypes whose record cip_type is 108 own one).
+        # A DataType (raC_*/STR* library UDT or an ACM-managed type) carries a
+        # verbatim <CustomProperties> provider block captured into the
+        # custom_properties table, keyed by this datatype's own comment parent
+        # (comment_id<<16 | cip_type) with owner_ref 0.
         custom_props = None
         try:
-            if getattr(r, "cip_type", None) == 108:
+            if getattr(r, "cip_type", None) is not None:
                 cp_rows = self._cur.execute(
-                    "SELECT provider_id, ext, blob FROM custom_properties WHERE cid=?",
-                    (r.comment_id,)).fetchall()
-                if cp_rows:
-                    cp_rows.sort(key=lambda t: int(t[1])
-                                 if str(t[1]).lstrip('-').isdigit() else 0)
-                    inner = "\n".join(
-                        f'<Provider ID="{pid}" Ext="{ext}">\n{blob}\n</Provider>'
-                        for pid, ext, blob in cp_rows)
-                    custom_props = f'<CustomProperties>\n{inner}\n</CustomProperties>'
+                    "SELECT provider_id, ext, blob FROM custom_properties "
+                    "WHERE parent=? AND owner_ref=0 AND rung_content=0",
+                    ((r.comment_id * 0x10000) + r.cip_type,)).fetchall()
+                custom_props = render_custom_properties(cp_rows)
         except Exception:
             custom_props = None
 

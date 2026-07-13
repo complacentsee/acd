@@ -591,11 +591,15 @@ class ExportL5x:
         self._cur.execute(
             "CREATE TABLE named_safety_signatures(otype int, name text, signature text, timestamp text)"
         )
-        # Library DataTypes (Rockwell raC_*/STR* UDTs) carry a verbatim
-        # <CustomProperties> <Provider> block that the comment parser drops; capture
-        # each provider record (otype 108) keyed by the owning DataType's comment_id.
+        # ACM / library <CustomProperties> <Provider> blocks: a verbatim provider
+        # record the ordinary comment parser drops. Captured for every owner kind
+        # (DataType, Tag, Program, Routine, Rung, Controller, AOI) and keyed by the
+        # owning scope's parent = (comment_id<<16)|cip_type plus the owner_ref and
+        # rung_content so each builder attributes them with the keys it already
+        # computes.
         self._cur.execute(
-            "CREATE TABLE custom_properties(cid int, ext text, provider_id text, blob text)"
+            "CREATE TABLE custom_properties(parent int, owner_ref int, "
+            "rung_content int, provider_id text, ext text, blob text)"
         )
         # ALARM_DIGITAL/ANALOG tag <Message> text: a Comments.Dat record marked
         # 0x0331 (u16 @ buf[8]) carries the alarm message, keyed by a u16 join key
@@ -650,17 +654,25 @@ class ExportL5x:
                 continue
             _otype = struct.unpack_from("<H", _buf, 10)[0]
             _cid = struct.unpack_from("<I", _buf, 12)[0]
-            # <CustomProperties> provider record: otype 108, ID terminated by 0x11,
-            # Ext terminated by 0x12, then the verbatim inner XML to the trailing NUL.
-            if _otype == 108 and len(_buf) >= 32 and (b'<Header' in _buf or b'<Data' in _buf):
-                _sep = _buf.find(b'\x11\x00', 26)
+            # <CustomProperties> provider record: the fafa-comment KIND byte
+            # body[13] (raw[27]) == 0x19 with body[12] (raw[26]) == 0x00, then a
+            # UTF-16LE "<ID>\x11<Ext>\x12" header at body[16] (raw[30]) and the
+            # verbatim ASCII inner XML from the first '<' to the trailing NUL.
+            # Keyed by parent = (comment_id<<16)|cip_type (raw[10:14]) plus the
+            # owner_ref (raw[14:18]) and rung_content (raw[18:22]). Long-header
+            # (V24+) only -- every project that carries these blocks is V24+.
+            if (not self._comps_short_header and len(_buf) >= 34
+                    and _buf[26] == 0x00 and _buf[27] == 0x19):
+                _sep = _buf.find(b'\x11\x00', 30)
                 _m12 = _buf.find(b'\x12\x00', _sep + 2) if _sep >= 0 else -1
                 _lt = _buf.find(b'<', _m12) if _m12 >= 0 else -1
                 if _sep >= 0 and _m12 >= 0 and _lt >= 0:
                     _cp.append((
-                        _cid,
-                        _buf[_sep + 2:_m12].decode("utf-16-le", "replace"),
+                        struct.unpack_from("<I", _buf, 10)[0],
+                        struct.unpack_from("<I", _buf, 14)[0],
+                        struct.unpack_from("<I", _buf, 18)[0],
                         _buf[30:_sep].decode("utf-16-le", "replace"),
+                        _buf[_sep + 2:_m12].decode("utf-16-le", "replace"),
                         _buf[_lt:].rstrip(b"\x00").decode("latin-1", "replace"),
                     ))
             _key = (_otype, _cid)
@@ -710,7 +722,7 @@ class ExportL5x:
             "INSERT INTO named_safety_signatures VALUES (?,?,?,?)",
             [(k[0], k[1], v[0], v[1]) for k, v in _named.items() if v[0]])
         self._cur.executemany(
-            "INSERT INTO custom_properties VALUES (?,?,?,?)", _cp)
+            "INSERT INTO custom_properties VALUES (?,?,?,?,?,?)", _cp)
         self._cur.executemany(
             "INSERT INTO alarm_messages VALUES (?,?,?)", _amsg)
         self._db.commit()

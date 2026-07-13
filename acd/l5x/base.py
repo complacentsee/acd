@@ -166,6 +166,35 @@ def own_description(cur: Cursor, comment_parent: int) -> Union[str, None]:
     return row[0] if row and row[0] else None
 
 
+_CP_EXT_RE = re.compile(r"^(.*?)(\d+)$")
+
+
+def _cp_ext_sortkey(ext: str):
+    """Natural sort key for a <Provider> Ext string: split a trailing run of
+    digits so 'Origin_0' < 'Origin_1' and pure-numeric '0' < '1' both order
+    numerically (Comments.Dat storage order is not reliable). Degenerates to
+    the plain numeric order for pure-digit Ext values."""
+    s = str(ext)
+    m = _CP_EXT_RE.match(s)
+    if m:
+        return (m.group(1), int(m.group(2)))
+    return (s, -1)
+
+
+def render_custom_properties(rows) -> Union[str, None]:
+    """Render an ACM/library <CustomProperties> block from custom_properties
+    rows [(provider_id, ext, blob), ...]. Providers are ordered by the natural
+    Ext key; each blob is emitted VERBATIM (already the exact inner XML, never
+    re-escaped or CDATA-wrapped). None when there are no rows."""
+    if not rows:
+        return None
+    ordered = sorted(rows, key=lambda t: _cp_ext_sortkey(t[1]))
+    inner = "\n".join(
+        f'<Provider ID="{pid}" Ext="{ext}">\n{blob}\n</Provider>'
+        for pid, ext, blob in ordered)
+    return f'<CustomProperties>\n{inner}\n</CustomProperties>'
+
+
 _AT_TOKEN_RE = re.compile(r"@([0-9a-fA-F]+)@")
 
 
