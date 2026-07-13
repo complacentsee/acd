@@ -37,6 +37,7 @@ def _consume_conn_tuple(rec: bytes):
 
 
 _CONSUME_CONN_FMT = 9           # connection-format word marking a consumed tag
+_CONSUME_CONN_FMT_SAFETY = 30   # safety (peer-GuardLogix) consumed tag
 
 
 def _build_consume_map(cur, short_header: bool) -> Dict[int, dict]:
@@ -86,7 +87,7 @@ def _build_consume_map(cur, short_header: bool) -> Dict[int, dict]:
             if ft is None:
                 continue
             t2pos, fmt, rpi_us = ft
-            if fmt != 9:
+            if fmt not in (_CONSUME_CONN_FMT, _CONSUME_CONN_FMT_SAFETY):
                 continue
             m = rec.rfind(b"\x90\x01\x00\x00\x04\x00\x00\x00")
             if m < 0 or m + 12 > len(rec):
@@ -111,6 +112,39 @@ def _build_consume_map(cur, short_header: bool) -> Dict[int, dict]:
             if up >= 0 and up + 0x17 <= len(rec):
                 if struct.unpack_from("<I", rec, up + 0x13)[0] == 2:
                     unicast = "true"
+            safety_extra = None
+            if fmt == _CONSUME_CONN_FMT_SAFETY:
+                # Safety consumed connection: the timing extras live in the
+                # parameter blob at the same offsets the module safety
+                # connections read (ConnectionParams fields, validated there
+                # pool-wide). ReactionTimeLimit is the CIP data-age limit
+                # RPI*(TimeoutMultiplier + NetworkDelayMultiplier/100), snapped
+                # up to the 0.128 ms safety time base -- the same expression as
+                # the module input-connection formula it generalises
+                # (TM=2/NDM=200 -> 4*RPI). Fail-closed: an unreadable blob
+                # skips the connection so the tag stays Base (as today).
+                try:
+                    ea = CompsRecord.read_value_attrs(rec, short_header,
+                                                      full=True, body_mode=True)
+                    cp = ConnectionParams.from_bytes(
+                        ea.get(_PRODUCE_EXT_PARAMS, b""))
+                except Exception:
+                    cp = None
+                if (cp is None or not cp.timeout_multiplier
+                        or not cp.network_delay_multiplier
+                        or cp.max_observed_delay_raw is None):
+                    continue
+                rtl = math.ceil((cp.timeout_multiplier
+                                 + cp.network_delay_multiplier / 100.0)
+                                * (rpi_us / 1000.0) / 0.128) * 0.128
+                safety_extra = {
+                    "TimeoutMultiplier": str(cp.timeout_multiplier),
+                    "NetworkDelayMultiplier": str(cp.network_delay_multiplier),
+                    "ReactionTimeLimit": _conn_num(rtl),
+                    "MaxObservedNetworkDelay": _conn_num(
+                        cp.max_observed_delay_raw * 0.128),
+                }
+                unicast = "true" if cp.transport == 2 else "false"
             out[tag_oid] = {
                 "Producer": o2name.get(o2parent.get(pid)) or "",
                 "RemoteTag": remote_tag,
@@ -118,6 +152,8 @@ def _build_consume_map(cur, short_header: bool) -> Dict[int, dict]:
                 "RPI": str(rpi_us // 1000),
                 "Unicast": unicast,
             }
+            if safety_extra:
+                out[tag_oid].update(safety_extra)
     except Exception:
         return out
     # Fallback: recover consumed connections the plaintext body scan could not
@@ -187,6 +223,7 @@ def _build_consume_map(cur, short_header: bool) -> Dict[int, dict]:
 #  * PLC (PLC/SLC-mapped produce): the tag's OWN record carries a single ext-attr
 #    0x67 (the u32 PLCMappingFile) and there is no connection record.
 _PRODUCE_CONN_FMT = 10          # connection-format word marking a produced tag
+_PRODUCE_CONN_FMT_SAFETY = 31   # safety (peer-GuardLogix) produced tag
 _PRODUCE_EXT_PRODUCED = 0x191   # produced-tag object_id (on the connection record)
 _PRODUCE_EXT_CONSUMED = 0x190   # present on consumed / module I/O connections
 _PRODUCE_EXT_PARAMS = 0x01      # connection parameter blob
@@ -255,7 +292,8 @@ def _build_produce_map(cur, short_header: bool) -> Dict[int, dict]:
                 # produced-tag format gate compares the full leading dword.
                 if cp.default_rpi_us is None:
                     continue
-                if cp.fmt_dword != _PRODUCE_CONN_FMT:
+                if cp.fmt_dword not in (_PRODUCE_CONN_FMT,
+                                        _PRODUCE_CONN_FMT_SAFETY):
                     continue
                 tag_oid = struct.unpack_from("<I", a191, 0)[0]
                 if tag_oid in (0, 0xFFFFFFFF):
@@ -265,10 +303,15 @@ def _build_produce_map(cur, short_header: bool) -> Dict[int, dict]:
                     "ProgrammaticallySendEventTrigger":
                         "true" if cp.send_event_trigger else "false",
                     "UnicastPermitted": "true" if cp.unicast_permitted else "false",
-                    "MinimumRPI": _produce_rpi_ms(cp.min_rpi_us),
-                    "MaximumRPI": _produce_rpi_ms(cp.max_rpi_us),
-                    "DefaultRPI": _produce_rpi_ms(cp.default_rpi_us),
                 }
+                if cp.fmt_dword == _PRODUCE_CONN_FMT:
+                    # The RPI triple is a standard-produce attribute set; a
+                    # safety produced tag (fmt 31) omits it (matches OEM).
+                    out[tag_oid].update({
+                        "MinimumRPI": _produce_rpi_ms(cp.min_rpi_us),
+                        "MaximumRPI": _produce_rpi_ms(cp.max_rpi_us),
+                        "DefaultRPI": _produce_rpi_ms(cp.default_rpi_us),
+                    })
             elif cip == 0x6B and plc_sig in rec:
                 if oid in out:
                     continue

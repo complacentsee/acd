@@ -1149,11 +1149,23 @@ class Tag(L5xElement):
         consume_xml = ""
         if self._consume_info:
             ci = self._consume_info
+            # A safety consumed tag (fmt-30 connection) additionally carries
+            # the CIP-safety timing attributes, emitted between RPI and
+            # Unicast (OEM attribute order).
+            _saf = ""
+            if "TimeoutMultiplier" in ci:
+                _saf = (
+                    f' TimeoutMultiplier="{ci["TimeoutMultiplier"]}"'
+                    f' NetworkDelayMultiplier="{ci["NetworkDelayMultiplier"]}"'
+                    f' ReactionTimeLimit="{ci["ReactionTimeLimit"]}"'
+                    f' MaxObservedNetworkDelay="{ci["MaxObservedNetworkDelay"]}"'
+                )
             consume_xml = (
                 f'<ConsumeInfo Producer="{html.escape(str(ci.get("Producer", "")), quote=True)}"'
                 f' RemoteTag="{html.escape(str(ci.get("RemoteTag", "")), quote=True)}"'
                 f' RemoteInstance="{ci.get("RemoteInstance", "0")}"'
                 f' RPI="{ci.get("RPI", "")}"'
+                f'{_saf}'
                 f' Unicast="{ci.get("Unicast", "false")}"/>'
             )
 
@@ -1167,13 +1179,20 @@ class Tag(L5xElement):
             if "PLCMappingFile" in pi:
                 produce_xml = f'<ProduceInfo PLCMappingFile="{pi["PLCMappingFile"]}"/>'
             else:
+                # A safety produced tag (fmt-31 connection) has no RPI triple;
+                # its map entry omits the keys and OEM omits the attributes.
+                _rpi3 = ""
+                if "MinimumRPI" in pi:
+                    _rpi3 = (
+                        f' MinimumRPI="{pi.get("MinimumRPI", "")}"'
+                        f' MaximumRPI="{pi.get("MaximumRPI", "")}"'
+                        f' DefaultRPI="{pi.get("DefaultRPI", "")}"'
+                    )
                 produce_xml = (
                     f'<ProduceInfo ProduceCount="{pi.get("ProduceCount", "1")}"'
                     f' ProgrammaticallySendEventTrigger="{pi.get("ProgrammaticallySendEventTrigger", "false")}"'
                     f' UnicastPermitted="{pi.get("UnicastPermitted", "false")}"'
-                    f' MinimumRPI="{pi.get("MinimumRPI", "")}"'
-                    f' MaximumRPI="{pi.get("MaximumRPI", "")}"'
-                    f' DefaultRPI="{pi.get("DefaultRPI", "")}"/>'
+                    f'{_rpi3}/>'
                 )
 
         if (not self._alarm_xml and not consume_xml and not produce_xml
