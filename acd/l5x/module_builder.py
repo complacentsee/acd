@@ -16,6 +16,7 @@ from acd.generated.comps.rx_generic import RxGeneric
 from acd.l5x.base import (
     L5xElement,
     L5xElementBuilder,
+    own_data_exchange_id,
     own_description,
     safety_signature_row,
     short_own_description,
@@ -92,6 +93,11 @@ class Module(L5xElement):
     # OpcUaAccess=<value>. "" when the server is off (attribute omitted). See
     # ExportL5x.project_flags.
     _opc_ua: str = field(default="")
+    # @DataExchangeId GUID string ("{...}") for a module that carries one; None
+    # omits the attribute. Set by ModuleBuilder from the comments table
+    # (object_id 45), keyed by the module's own comment parent (comment_id<<16 |
+    # 0x69).
+    _data_exchange_id: Union[str, None] = None
     # Export-schema major (see ExportL5x.project_flags.sw_major). The reference
     # omits @ExternalAccess on module ConfigTag/InputTag/OutputTag stubs below
     # major 20; 0 == underivable -> today's emission. See ModuleBuilder.
@@ -195,6 +201,10 @@ class Module(L5xElement):
             )
         shutdown_attr = (f' ShutdownParentOnFault="{self._shutdown_parent_on_fault}"'
                          if self._shutdown_parent_on_fault is not None else "")
+        # @DataExchangeId (Sercos/motion modules) follows MajorFault in the
+        # reference; None omits it.
+        dxid_attr = (f' DataExchangeId="{self._data_exchange_id}"'
+                     if self._data_exchange_id else "")
         # UserDefinedCatalogNumber is the last <Module> attribute in the reference.
         udcn_attr = (f' UserDefinedCatalogNumber="{html.escape(self._ud_catalog_number, quote=True)}"'
                      if self._ud_catalog_number else "")
@@ -209,7 +219,7 @@ class Module(L5xElement):
             f'ParentModule="{self.parent_module}" '
             f'ParentModPortId="{self.parent_mod_port_id}" '
             f'Inhibited="{self.inhibited}" '
-            f'MajorFault="{self.major_fault}"{shutdown_attr}'
+            f'MajorFault="{self.major_fault}"{shutdown_attr}{dxid_attr}'
             f'{safety_attr}{udcn_attr}'
         )
 
@@ -1793,6 +1803,16 @@ class ModuleBuilder(L5xElementBuilder):
         except Exception:
             pass
 
+        # @DataExchangeId: the module's GUID row in the comments table (object_id
+        # 45), keyed by its own comment parent (comment_id<<16 | 0x69). None omits.
+        _dxid = None
+        try:
+            if comment_id is not None:
+                _dxid = own_data_exchange_id(
+                    self._cur, (comment_id * 0x10000) + 0x69)
+        except Exception:
+            _dxid = None
+
         return Module(
             name,           # L5xElement._name (private)
             name,           # Module.name
@@ -1825,6 +1845,7 @@ class ModuleBuilder(L5xElementBuilder):
             _extended_properties=extended_properties,
             _extended_private=extended_private,
             _opc_ua=_opc_ua,
+            _data_exchange_id=_dxid,
             _sw_major=_sw_major,
             _config_inner=config_inner,
             _config_size=config_size,

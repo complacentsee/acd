@@ -30,8 +30,10 @@ from acd.l5x.base import (
     custom_properties_by_parent,
     custom_properties_by_scope_owner,
     external_access_enum,
+    own_data_exchange_id,
     own_description,
     project_lang_oid,
+    scope_owner_data_exchange_id,
     radix_enum,
     render_custom_properties,
     resolve_aoi_alias_target,
@@ -896,6 +898,9 @@ class Tag(L5xElement):
     # tags with no provider block. Set by TagBuilder from the custom_properties
     # table.
     _custom_properties: str = field(default="")
+    # @DataExchangeId GUID string ("{...}") for a tag that carries one; None omits
+    # the attribute. Set by TagBuilder from the comments table (object_id 45).
+    _data_exchange_id: Union[str, None] = None
 
     def _inject_tag_attrs(self, base: str) -> str:
         """Insert OpcUaAccess / Class attributes into the opening <Tag ...> of base.
@@ -908,6 +913,8 @@ class Tag(L5xElement):
             extra += f' Class="{self._class_attr}"'
         if self._opc_ua:
             extra += f' OpcUaAccess="{self._opc_ua}"'
+        if self._data_exchange_id:
+            extra += f' DataExchangeId="{self._data_exchange_id}"'
         if not extra:
             return base
         i = base.find(">")
@@ -1585,6 +1592,8 @@ class Controller(L5xElement):
     # Pre-rendered controller-root <CustomProperties> block ("" if none); emitted
     # as the first child, before Description.
     _custom_properties: str = field(default="")
+    # @DataExchangeId GUID string for the controller root; None omits the attr.
+    _data_exchange_id: Union[str, None] = None
     # A safety-signed project stamps the <AddOnInstructionDefinitions> collection
     # with these two attributes; both None on a standard/unsigned project (omitted).
     _aoi_safety_signature: Union[str, None] = field(default=None)
@@ -1659,7 +1668,11 @@ class Controller(L5xElement):
         # Split at the end of the opening <Controller ...> tag so we can inject
         # structural stubs before the data sections and post-sections after them.
         idx = base.index(">")
-        open_tag = base[: idx + 1]
+        # @DataExchangeId is an attribute of the <Controller> open tag; inject it
+        # before the closing '>' when present.
+        _dxid_attr = (f' DataExchangeId="{self._data_exchange_id}"'
+                      if self._data_exchange_id else "")
+        open_tag = base[:idx] + _dxid_attr + ">"
         inner = base[idx + 1 : -len("</Controller>")]
         # CustomProperties is the first child, then the controller's own
         # Description.
@@ -2394,6 +2407,19 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
                     struct.unpack_from("<I", raw_rec, 14)[0]) or ""
         except Exception:
             _cp_xml = ""
+        # @DataExchangeId: same owner-key join as CustomProperties -- the GUID is a
+        # comments-table row (object_id 45). None (no row) omits the attribute.
+        _dxid = None
+        try:
+            if r.cip_type == 0x6B:
+                _dxid = own_data_exchange_id(
+                    self._cur, (r.comment_id * 0x10000) + r.cip_type)
+            elif r.cip_type == 0x68 and len(raw_rec) >= 18:
+                _dxid = scope_owner_data_exchange_id(
+                    self._cur, (r.comment_id * 0x10000) + 0x68,
+                    struct.unpack_from("<I", raw_rec, 14)[0])
+        except Exception:
+            _dxid = None
         return Tag(
             _nm,
             _nm,
@@ -2417,6 +2443,7 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
             _io=is_io,
             _alias_no_radix=_alias_no_radix,
             _custom_properties=_cp_xml,
+            _data_exchange_id=_dxid,
             _opc_ua=_opc_ua, _class_attr=_cls_attr(),
         )
 
@@ -5610,6 +5637,13 @@ class ControllerBuilder(L5xElementBuilder):
                     self._cur, _comment_parent) or ""
             except Exception:
                 controller_cp = ""
+        # @DataExchangeId for the controller root (comments-table object_id 45).
+        controller_dxid = None
+        if _comment_parent is not None:
+            try:
+                controller_dxid = own_data_exchange_id(self._cur, _comment_parent)
+            except Exception:
+                controller_dxid = None
         (sfc_execution_control, sfc_restart_position, sfc_last_scan, project_sn,
          project_creation_date, last_modified_date, _comm_path_prefix, major_fault_program,
          redundancy_enabled) = self._pass_ext_record_scalars(r, extended_records)
@@ -5685,6 +5719,7 @@ class ControllerBuilder(L5xElementBuilder):
             _emit_data_logs=_v24_plus,
             _description=controller_description,
             _custom_properties=controller_cp,
+            _data_exchange_id=controller_dxid,
             _aoi_safety_signature=aoi_sig,
             _aoi_safety_signature_timestamp=aoi_sig_ts,
             time_slice=time_slice,

@@ -310,6 +310,35 @@ def custom_properties_by_scope_owner(cur: Cursor, parent: int,
     return render_custom_properties(rows)
 
 
+# A DataExchangeId is stored as a plain ASCII GUID string in Comments.Dat under
+# the comment kind 0x2D (object_id 45 in the comments table); the record_string
+# is already the exact "{...}" brace/upper/dash form the reference emits.
+def own_data_exchange_id(cur: Cursor, parent: int) -> Union[str, None]:
+    """The @DataExchangeId GUID for a scope-level owner (controller-scope Tag,
+    Module, Controller root) keyed by its own comment parent
+    (comment_id<<16 | cip_type), owner_ref 0. None when absent."""
+    row = cur.execute(
+        "SELECT record_string FROM comments "
+        "WHERE parent=? AND member_ref=0 AND object_id=45 "
+        "AND record_string GLOB '{*-*-*-*-*}' LIMIT 1", (parent,)).fetchone()
+    return row[0] if row and row[0] else None
+
+
+def scope_owner_data_exchange_id(cur: Cursor, parent: int,
+                                 owner_ref: int) -> Union[str, None]:
+    """The @DataExchangeId GUID for a program-scope Tag, keyed by the program's
+    scope parent (program_comment_id<<16 | 0x68) and the tag's own key
+    (record[14:18]). None when owner_ref is 0 or absent."""
+    if not owner_ref:
+        return None
+    row = cur.execute(
+        "SELECT record_string FROM comments "
+        "WHERE parent=? AND owner_ref=? AND object_id=45 "
+        "AND record_string GLOB '{*-*-*-*-*}' LIMIT 1",
+        (parent, owner_ref)).fetchone()
+    return row[0] if row and row[0] else None
+
+
 _AT_TOKEN_RE = re.compile(r"@([0-9a-fA-F]+)@")
 
 
