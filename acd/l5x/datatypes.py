@@ -18,7 +18,9 @@ from acd.l5x.base import (
     _rxgeneric_plaintext_main,
     _xml_sane,
     external_access_enum,
+    lang_description,
     own_description,
+    project_lang_oid,
     radix_enum,
     render_custom_properties,
     short_own_description,
@@ -40,9 +42,14 @@ class Member(L5xElement):
 
     def to_xml(self) -> str:
         base = super().to_xml()
-        if not self._description:
+        if self._description is None:
             return base
-        desc_xml = f'<Description>\n<![CDATA[{_xml_sane(self._description)}]]>\n</Description>'
+        # A "" description is the foreign-only sentinel: the member has a
+        # description in some non-export language, which the reference exports as
+        # a literal empty <Description/> (minidom self-closes it).
+        desc_xml = (f'<Description>\n<![CDATA[{_xml_sane(self._description)}]]>\n'
+                    f'</Description>' if self._description
+                    else '<Description></Description>')
         idx = base.index(">")
         return base[:idx + 1] + desc_xml + base[idx + 1:]
 
@@ -86,10 +93,12 @@ class DataType(L5xElement):
         if self._emit_predefined and not self.members:
             base = base.replace("<Members></Members>", "").replace("<Members/>", "")
         # CustomProperties is the first child (before Description), then Description.
+        # A "" description is the foreign-only sentinel -> literal <Description/>.
         prefix = self._custom_properties or ""
-        if self._description:
+        if self._description is not None:
             prefix += (f'<Description>\n<![CDATA[{_xml_sane(self._description)}]]>\n'
-                       f'</Description>')
+                       f'</Description>' if self._description
+                       else '<Description></Description>')
         if not prefix:
             return base
         idx = base.index(">")
@@ -278,13 +287,25 @@ class MemberBuilder(L5xElementBuilder):
         if len(raw_comps) >= 18:
             member_ref = struct.unpack_from("<I", raw_comps, 14)[0]
             if member_ref:
-                self._cur.execute(
-                    "SELECT record_string FROM comments WHERE parent=? AND member_ref=? LIMIT 1",
-                    ((r.comment_id * 0x10000) + r.cip_type, member_ref),
-                )
-                desc_row = self._cur.fetchone()
-                if desc_row and desc_row[0]:
-                    description = desc_row[0]
+                _parent = (r.comment_id * 0x10000) + r.cip_type
+                _lang_oid = project_lang_oid(self._cur)
+                if _lang_oid:
+                    # Language-enabled: pick the export-language row, else the
+                    # legacy row, else the empty sentinel for a foreign-only
+                    # member description (the unfiltered LIMIT 1 would otherwise
+                    # emit a wrong-language row where the reference emits an empty
+                    # <Description/>).
+                    description = lang_description(
+                        self._cur, _parent, member_ref, _lang_oid)
+                else:
+                    self._cur.execute(
+                        "SELECT record_string FROM comments "
+                        "WHERE parent=? AND member_ref=? LIMIT 1",
+                        (_parent, member_ref),
+                    )
+                    desc_row = self._cur.fetchone()
+                    if desc_row and desc_row[0]:
+                        description = desc_row[0]
 
         return Member(name, name, data_type, dimension, radix, hidden, target, bit_number, external_access, description)
 

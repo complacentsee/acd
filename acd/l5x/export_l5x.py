@@ -12,7 +12,7 @@ from acd.database.dbextract import DbExtract
 from acd.zip.unzip import Unzip
 from loguru import logger as log
 
-from acd.l5x.base import external_access_enum
+from acd.l5x.base import external_access_enum, language_desc_oid
 from acd.l5x.elements import (
     Controller,
     ControllerBuilder,
@@ -485,6 +485,38 @@ class ExportL5x:
             "INSERT INTO project_flags VALUES (?, ?, ?, ?)",
             (_opc, _safety, _opc_access, _sw_major)
         )
+
+        # Multi-language project documentation (V24+): a language-enabled project
+        # keys each object's Description by a language-specific comment object_id,
+        # not the legacy 1. The stored language lives in the ExtendedDevice comps
+        # record (u16 length @0x188, ASCII locale @0x18A). The reference EXPORT
+        # language is a property of the export environment, not the ACD (it
+        # exports en-US regardless of the stored language), so it is a converter
+        # option (default en-US). project_lang.lang_oid is the export language's
+        # description object_id, or 0 when the project is NOT language-enabled --
+        # every description query then keeps the legacy object_id=1 path,
+        # byte-identical to today. The strict length+locale parse is load-bearing:
+        # a short-header project can carry a stray 'en-US' at +0x18A with a zero
+        # length word and must NOT enable the language path.
+        _lang_oid = 0
+        try:
+            _ed = self._cur.execute(
+                "SELECT record FROM comps WHERE comp_name='ExtendedDevice' "
+                "LIMIT 1").fetchone()
+            if _ed is not None and not self._comps_short_header:
+                _edr = bytes(_ed[0])
+                if len(_edr) >= 0x18A:
+                    _ln = struct.unpack_from("<H", _edr, 0x188)[0]
+                    if 0 < _ln <= 16 and len(_edr) >= 0x18A + _ln:
+                        _loc = _edr[0x18A:0x18A + _ln].decode("ascii", "replace")
+                        if re.fullmatch(r"[a-z]{2,3}-[A-Z]{2}", _loc):
+                            _lang_oid = language_desc_oid(
+                                getattr(self, "_export_language", "en-US")
+                                or "en-US")
+        except Exception:
+            _lang_oid = 0
+        self._cur.execute("CREATE TABLE project_lang(lang_oid int)")
+        self._cur.execute("INSERT INTO project_lang VALUES (?)", (_lang_oid,))
 
         # Per-oid header-family + record-length side table. fafa_seen is the
         # liveness signal (see _walk_comps_records); winner_family is the stream

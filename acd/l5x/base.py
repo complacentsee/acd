@@ -5,11 +5,34 @@
 ``_xml_sane`` strips the C0 control characters XML 1.0 forbids.
 """
 import html
+import locale as _locale
 import re
 import struct
 from dataclasses import dataclass
 from sqlite3 import Cursor
 from typing import List, Union
+
+
+def _desc_oid_for_langid(langid: int) -> int:
+    """Comments.Dat description object_id for a Windows LANGID: the packed
+    ((sublang<<8 | primarylang) << 8) | kind, kind 0x01 = Description."""
+    return ((((langid >> 10) << 8) | (langid & 0x3FF)) << 8) | 1
+
+
+# Every valid Windows-locale description object_id, derived from the stdlib
+# locale table (no hardcoded numeric list). Used to recognise a "foreign-only"
+# description (a row that exists in some language but not the export language),
+# which the reference exports as a literal empty <Description/>.
+_LANG_DESC_OIDS = frozenset(
+    _desc_oid_for_langid(_lid) for _lid in _locale.windows_locale)
+_LANG_BY_LOCALE = {v.replace("_", "-"): k for k, v in _locale.windows_locale.items()}
+
+
+def language_desc_oid(export_language: str) -> int:
+    """Description object_id for an export language name ("en-US"), or 0 if the
+    name is unknown. en-US -> 0x10901, de-DE -> 0x10701."""
+    langid = _LANG_BY_LOCALE.get(export_language)
+    return _desc_oid_for_langid(langid) if langid is not None else 0
 
 from acd.generated.comps.rx_generic import RxGeneric
 from acd.record.comps import CompsRecord
@@ -145,6 +168,49 @@ def connection_signature_row(cur: Cursor, rec: bytes, body_offset: int):
          struct.unpack_from("<I", rec, body_offset + 16)[0])).fetchone()
 
 
+def project_lang_oid(cur: Cursor) -> int:
+    """The export-language description object_id for a language-enabled project,
+    else 0 (a legacy, single-language project). See ExportL5x.project_lang."""
+    try:
+        row = cur.execute("SELECT lang_oid FROM project_lang").fetchone()
+        return (row[0] if row else 0) or 0
+    except Exception:
+        return 0
+
+
+def lang_description(cur: Cursor, parent: int, member_ref: int, lang_oid: int,
+                     exclude_revnote: bool = False) -> Union[str, None]:
+    """Language-aware description for a (parent, member_ref) key in a
+    language-enabled project. Returns, in priority order:
+      - the export-language row's text;
+      - the legacy object_id==1 row's text;
+      - '' (the empty sentinel) when a row exists whose object_id is a VALID
+        Windows-locale description id (a foreign-only description -> the
+        reference emits a literal empty <Description/>);
+      - None (no Description element).
+    The valid-language gate (never a bare object_id&255==1) keeps stray
+    operand/scratch rows whose token ids merely end in 0x01 from triggering the
+    empty sentinel."""
+    where = ("FROM comments WHERE parent=? AND member_ref=? AND rung_content=0"
+             + (" AND tag_reference!='__REVISION_NOTE__'"
+                if exclude_revnote else ""))
+    key = (parent, member_ref)
+    row = cur.execute(
+        "SELECT record_string " + where + " AND object_id=? LIMIT 1",
+        key + (lang_oid,)).fetchone()
+    if row and row[0]:
+        return row[0]
+    row = cur.execute(
+        "SELECT record_string " + where + " AND object_id=1 LIMIT 1",
+        key).fetchone()
+    if row and row[0]:
+        return row[0]
+    for (oid,) in cur.execute("SELECT object_id " + where, key).fetchall():
+        if oid in _LANG_DESC_OIDS:
+            return ""
+    return None
+
+
 def own_description(cur: Cursor, comment_parent: int) -> Union[str, None]:
     """A component's own Description (long-header form), or None.
 
@@ -155,7 +221,16 @@ def own_description(cur: Cursor, comment_parent: int) -> Union[str, None]:
     UDI_HISTORY row (RevisionNote) shares the whole key with object_id 1 too;
     it is stored under the __REVISION_NOTE__ tag_reference sentinel and is
     fetched separately, so it must not shadow the real description row here.
+
+    In a language-enabled project (project_lang set) the own-description row is
+    keyed by the export language's object_id, not 1, so route through the
+    language-aware picker (which also emits the empty <Description/> sentinel for
+    a foreign-only description).
     """
+    lang_oid = project_lang_oid(cur)
+    if lang_oid:
+        return lang_description(cur, comment_parent, 0, lang_oid,
+                                exclude_revnote=True)
     cur.execute(
         "SELECT record_string FROM comments "
         "WHERE parent=? AND member_ref=0 AND object_id=1 "

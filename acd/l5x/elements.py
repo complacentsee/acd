@@ -31,6 +31,7 @@ from acd.l5x.base import (
     custom_properties_by_scope_owner,
     external_access_enum,
     own_description,
+    project_lang_oid,
     radix_enum,
     render_custom_properties,
     resolve_aoi_alias_target,
@@ -2159,19 +2160,25 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
                 # scratch/operand rows that share (parent_key, member_ref) under a
                 # sentinel key instead carry a nonzero object_id (e.g. 33) with an
                 # empty tag_reference, so the tag_reference guard alone lets them
-                # through as a fabricated name-fragment Description. Requiring
-                # object_id == 1 keeps the real own description and drops those.
-                self._cur.execute(
-                    "SELECT record_string, tag_reference FROM comments "
-                    "WHERE parent=? AND member_ref=? "
-                    "AND (rung_content IS NULL OR rung_content=0) "
-                    "AND object_id=1 "
-                    "LIMIT 1",
-                    (parent_key, member_ref),
-                )
-                desc_row = self._cur.fetchone()
-                if desc_row and desc_row[0] and not desc_row[1]:
-                    comment_results = [("", desc_row[0])]
+                # through as a fabricated name-fragment Description. Requiring the
+                # description object_id keeps the real own description and drops
+                # those. In a language-enabled project that id is the export
+                # language's (project_lang), falling back to the legacy 1.
+                _lang_oid = project_lang_oid(self._cur)
+                _desc_oids = (_lang_oid, 1) if _lang_oid else (1,)
+                for _doid in _desc_oids:
+                    self._cur.execute(
+                        "SELECT record_string, tag_reference FROM comments "
+                        "WHERE parent=? AND member_ref=? "
+                        "AND (rung_content IS NULL OR rung_content=0) "
+                        "AND object_id=? "
+                        "LIMIT 1",
+                        (parent_key, member_ref, _doid),
+                    )
+                    desc_row = self._cur.fetchone()
+                    if desc_row and desc_row[0] and not desc_row[1]:
+                        comment_results = [("", desc_row[0])]
+                        break
             except Exception:
                 comment_results = []
         elif self._program_cid and r.cip_type != 0x6B and len(raw_rec) >= 18:
@@ -3081,15 +3088,20 @@ class RoutineBuilder(L5xElementBuilder):
                     struct.unpack_from("<I", record, 14)[0]
                     if len(record) >= 18 else 0
                 )
-                self._cur.execute(
-                    "SELECT record_string, tag_reference FROM comments "
-                    "WHERE parent=? AND member_ref=? AND object_id=1 "
-                    "AND (rung_content IS NULL OR rung_content=0) LIMIT 1",
-                    (parent_key, member_ref),
-                )
-                drow = self._cur.fetchone()
-                if drow and drow[0] and not drow[1]:
-                    description = drow[0]
+                # Language-enabled projects key the own description by the export
+                # language's object_id, falling back to the legacy 1.
+                _lang_oid = project_lang_oid(self._cur)
+                for _doid in ((_lang_oid, 1) if _lang_oid else (1,)):
+                    self._cur.execute(
+                        "SELECT record_string, tag_reference FROM comments "
+                        "WHERE parent=? AND member_ref=? AND object_id=? "
+                        "AND (rung_content IS NULL OR rung_content=0) LIMIT 1",
+                        (parent_key, member_ref, _doid),
+                    )
+                    drow = self._cur.fetchone()
+                    if drow and drow[0] and not drow[1]:
+                        description = drow[0]
+                        break
             except Exception:
                 description = None
 
