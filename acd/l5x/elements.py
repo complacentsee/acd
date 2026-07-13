@@ -4904,6 +4904,11 @@ class ControllerBuilder(L5xElementBuilder):
         results = self._cur.fetchall()
         if len(results) > 1:
             raise Exception("Contains more than one AOI collection")
+        if not results:
+            # A project with no Add-On Instructions has no
+            # RxUDIDefinitionCollection comp -- there are simply no AOIs to
+            # emit. Mirror the empty-guard the task-collection pass uses above.
+            return []
         _aoi_collection_object_id = results[0][1]
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record_type, record FROM comps WHERE parent_id="
