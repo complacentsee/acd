@@ -130,13 +130,14 @@ _ATOMIC_TAG_TYPES: frozenset = frozenset({
 })
 
 # Data types on which Logix NEVER writes a Constant attribute (a tag of these
-# types cannot be a constant): motion axes/groups, MESSAGE, and digital alarms.
-# Verified: 0 OEM tags of these types carry Constant. (Consumed tags also omit
+# types cannot be a constant): motion axes/groups/coordinate systems, MESSAGE,
+# and digital alarms. Verified: 0 OEM tags of these types carry Constant
+# (COORDINATE_SYSTEM 0/13 pool-wide, all revs). (Consumed tags also omit
 # Constant; handled separately via tag_type.)
 _NO_CONSTANT_TYPES: frozenset = frozenset({
     "MESSAGE", "AXIS_CIP_DRIVE", "AXIS_SERVO_DRIVE", "AXIS_SERVO",
     "AXIS_VIRTUAL", "AXIS_GENERIC", "AXIS_CONSUMED", "MOTION_GROUP",
-    "ALARM_DIGITAL", "ALARM_ANALOG",
+    "COORDINATE_SYSTEM", "ALARM_DIGITAL", "ALARM_ANALOG",
 })
 
 # Default zero value string for each primitive in Decorated output.
@@ -2441,12 +2442,16 @@ class ParameterBuilder(L5xElementBuilder):
         visible = "true" if visible_b else "false"
 
         # ExternalAccess (u16 at ext01[0x21E])
-        # Built-in reference-type InOut parameters (MESSAGE and the motion
-        # references MOTION_GROUP / AXIS_CIP_DRIVE) don't carry Constant in the
+        # Built-in reference-type InOut parameters don't carry Constant in the
         # reference L5X; every other InOut parameter (atomic, string, and user
         # UDTs including axis-named ones like tstAxisUDT) still carries it. Match
-        # by exact DataType, never a name substring.
-        _no_constant_inout = ("MESSAGE", "MOTION_GROUP", "AXIS_CIP_DRIVE")
+        # by exact DataType, never a name substring. The never-set set is the
+        # corpus-proven six (0 with Constant vs 7,839/7,839 WITH on all other
+        # InOut datatypes, 0 mixed): the motion references, MESSAGE, and MODULE.
+        _no_constant_inout = (
+            "MESSAGE", "MOTION_GROUP", "AXIS_CIP_DRIVE", "AXIS_SERVO_DRIVE",
+            "AXIS_VIRTUAL", "MODULE",
+        )
         if usage == "InOut":
             external_access = None
             constant: Union[str, None] = None if data_type in _no_constant_inout else "false"
