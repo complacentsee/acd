@@ -208,23 +208,30 @@ class TagAliasResolver:
                     # element [idx] (1-bit element -> no .bit suffix).
                     if mdt.upper() in ("BOOL", "BIT"):
                         return seg
-                    if (alias_is_bool and inner != 0) or (
-                            mdt.upper() in _ALIAS_ELEM_BITS
-                            and _ALIAS_ELEM_BITS.get(mdt.upper(), 0) > 1
-                            and alias_is_bool):
-                        return seg + ".%d" % inner
-                    if not alias_is_bool and inner == 0:
-                        return seg
+                    # STRUCT-element array: prefer the named member path inside
+                    # the element (whole-element stop only when the alias's own
+                    # datatype IS the element type) -- OEM renders e.g.
+                    # DataREAL[7].Value for a REAL alias onto a wrapper-UDT
+                    # element, not the bare element. Falls back to the historic
+                    # whole-element / numeric-bit outputs when the layout walk
+                    # finds nothing.
                     if mdt.upper() not in _ALIAS_ELEM_BITS:
-                        # whole-member stop: alias dt == member dt at element start
                         if inner == 0 and adu and adu == mdt.upper():
                             return seg
                         sub = self._alias_walk_members(mdt, inner, alias_is_bool,
                                                        "", alias_dt)
                         if sub is not None:
                             return seg + "." + sub
+                        if not alias_is_bool and inner == 0:
+                            return seg
+                        if alias_is_bool:
+                            return seg + ".%d" % inner
+                        return None
                     if alias_is_bool:
-                        return seg + ".%d" % inner
+                        return seg if inner == 0 and mbits == 1 \
+                            else seg + ".%d" % inner
+                    if inner == 0:
+                        return seg
                     return None
             else:
                 if mbits is None:
@@ -294,6 +301,7 @@ class TagAliasResolver:
             # (the plaintext RxGeneric parser throws on an encrypted tail).
             base_dt = None
             base_is_array = False
+            base_own_bit = None
             if row[1] is not None:
                 try:
                     br = self._parse_rec_tolerant(bytes(row[1]))
@@ -307,8 +315,26 @@ class TagAliasResolver:
                         ).fetchone()
                         base_dt = bdr[0] if bdr else None
                     base_is_array = bool(getattr(br.main_record, "dimension_1", 0))
+                    # The base record's OWN u32@0x26 is its start bit within its
+                    # backing image -- the same field an alias tag stores its
+                    # target bit in. It is 0 for a controller-scope tag with its
+                    # own backing, and nonzero for a slotted module element
+                    # (start within the :I/:O direction image; subsumes the
+                    # 64+slot*8 formula racks) and for a program-scoped base
+                    # packed into the program image. The alias tag's bitoff is
+                    # absolute in that same image, so the member offset is the
+                    # difference of the two record fields -- fully derived, no
+                    # per-family constants.
+                    if (getattr(br, "cip_type", None) in (0x6B, 0x68)
+                            and len(row[1]) >= 0x2A):
+                        base_own_bit = struct.unpack_from(
+                            "<I", bytes(row[1]), 0x26)[0]
             if base_dt is None:
                 return None
+            if base_own_bit is not None:
+                if bitoff < base_own_bit:
+                    return None
+                bitoff -= base_own_bit
             bdu = base_dt.upper()
             # A base datatype WITH a TagInfo member layout (TIMER/COUNTER/CONTROL and
             # module-image AB:* types) resolves through the member walker to the OEM
@@ -333,7 +359,12 @@ class TagAliasResolver:
                         return None
                     slot = int(ms.group(2))
                     width = _ALIAS_ELEM_BITS[bdu]
-                    bit = bitoff - (64 + slot * 8)
+                    # bitoff is element-relative already when the element's own
+                    # start bit was readable (subtracted above); the 64+slot*8
+                    # fallback covers an unreadable element record only (the
+                    # historic 8-bit-rack formula it subsumes).
+                    bit = bitoff if base_own_bit is not None \
+                        else bitoff - (64 + slot * 8)
                     if not (0 <= bit < width):
                         return None
                     if (not alias_is_bool and (alias_dt or "").upper() == bdu
