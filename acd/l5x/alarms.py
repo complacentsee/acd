@@ -15,6 +15,17 @@ from typing import Dict, List
 from acd.record.comps import CompsRecord
 
 
+# Flag bits this builder actually reproduces in a rendered <AlarmCondition>:
+# flagA bit1 = present-marker, bit2 = AckRequired; flagB bit0 = Used,
+# bit1 = AlarmSetOperIncluded, bit2 = AlarmSetRollupIncluded. Any bit outside
+# these (e.g. flagA bit3 = Latched, the OperReset/ProgEnable definition-alarm
+# bits, and the <HMIGroup> sub-element that co-occurs with them) is content
+# this builder does not emit -- used to fail-closed-gate a reordered
+# duplicate-Name block below.
+_ALARM_FLAGA_RENDERED = 0x02 | 0x04
+_ALARM_FLAGB_RENDERED = 0x01 | 0x02 | 0x04
+
+
 # Boolean <AlarmCondition> attributes the reference always emits "false" (none of
 # the ~1500 pool conditions has any of these set). Severity-bit fields cover only
 # Used/AlarmSet*/AckRequired (see _build_alarm_conditions).
@@ -202,6 +213,7 @@ def _build_alarm_conditions(cur, short_header):
                 "AckRequired": "true" if flagA & 4 else "false",
                 "EvaluationPeriod": "500 millisecond", "Expression": expr,
                 "AssocTag1": assoc, "_cam": cam, "_cac": cac,
+                "_flagA": flagA, "_flagB": flagB,
             }
         except Exception:
             owner_oid, cond, ok = None, None, False
@@ -213,10 +225,23 @@ def _build_alarm_conditions(cur, short_header):
             continue
         if not all(ok for _c, ok in conds):
             continue
-        names = [c["Name"] for c, _ in conds]
-        if len(names) != len(set(names)):  # duplicate names -> ordering matters; skip
-            continue
-        out[owner_oid] = _render_alarm_conditions([c for c, _ in conds])
+        cs = [c for c, _ in conds]
+        names = [c["Name"] for c in cs]
+        if len(names) != len(set(names)):
+            # Duplicate Names -> the comparator matches conditions by position,
+            # so we must reproduce the reference's authored order = lexicographic
+            # on @Input (a total order needs distinct Inputs). Emit only when
+            # every condition renders byte-exact under this builder: any flag bit
+            # outside the rendered masks means unemitted content (Latched, the
+            # OperReset/ProgEnable bits, an <HMIGroup>), so withhold fail-closed.
+            inputs = [c["Input"] for c in cs]
+            if len(inputs) != len(set(inputs)):
+                continue
+            if any((c["_flagA"] & ~_ALARM_FLAGA_RENDERED)
+                   or (c["_flagB"] & ~_ALARM_FLAGB_RENDERED) for c in cs):
+                continue
+            cs = sorted(cs, key=lambda c: c["Input"])
+        out[owner_oid] = _render_alarm_conditions(cs)
     return out
 
 
