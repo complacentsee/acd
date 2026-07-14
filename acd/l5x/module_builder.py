@@ -1766,8 +1766,15 @@ class ModuleBuilder(L5xElementBuilder):
             _fmi = ModuleIdentity.from_bytes(_fe1)
             # class_word 0x618 (safety I/O) and 0x702 (ethernet safety device)
             # are the classes OEM always writes SafetyEnabled on; verified
-            # byte-exact across the pool (249/249, 0 counterexamples).
-            safety_enabled_gate = _fmi.class_word in (0x0618, 0x0702)
+            # byte-exact across the pool (249/249, 0 counterexamples). The drive
+            # class 0x200 also carries SafetyEnabled, but only from schema major
+            # 30 on (an export-schema epoch, like the @ExternalAccess/PassThrough
+            # gates); its value is the same safety-connection flag already
+            # computed. 0-exception across both pools: v20-29 drives never emit
+            # it, v30+ drives always do.
+            safety_enabled_gate = (
+                _fmi.class_word in (0x0618, 0x0702)
+                or (_fmi.class_word == 0x0200 and _sw_major >= 30))
             if _fmi.class_word in (0x0200, 0x0201):
                 _p = _fe1.find(b"\xff\xff\xff\xff")
                 _v = struct.unpack_from("<I", _fe1, _p - 4)[0] if _p >= 4 else 0
