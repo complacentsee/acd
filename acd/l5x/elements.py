@@ -1256,6 +1256,10 @@ class LocalTag(L5xElement):
     radix: Union[str, None]   # None for complex/UDT types (omitted from XML)
     external_access: str
     _description: Union[str, None] = field(default=None)
+    # Operand-keyed member/bit/array comments (AOI scope). Rendered as a
+    # <Comments> block after <Description> and before <DefaultData>. Empty by
+    # default so existing LocalTag() constructions are unaffected.
+    _operand_comments: List[Tuple[str, str]] = field(default_factory=list)
     # AOI-scoped value image (mirrors Tag): populated by the builder so the
     # <DefaultData> block can be emitted. All default to the no-value state so
     # existing LocalTag() constructions are unaffected.
@@ -1290,6 +1294,8 @@ class LocalTag(L5xElement):
             f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
             if self._description else ""
         )
+        # Operand comments render between Description and DefaultData (OEM order).
+        comments_xml = _aoi_comments_xml(self._operand_comments)
         # DefaultData: OEM emits it on EVERY LocalTag (after Description). Degrade
         # to "" on any failure (still an element_missing, never malformed).
         dd_xml = _build_default_data(
@@ -1297,10 +1303,10 @@ class LocalTag(L5xElement):
             self._short_header, self._data_types_map, self._taginfo_layout,
             radix=self.radix, raw_hex_first=self._raw_hex_data,
         )
-        if not desc_xml and not dd_xml:
+        if not desc_xml and not comments_xml and not dd_xml:
             return base
         idx = base.index(">")
-        return base[:idx + 1] + desc_xml + dd_xml + base[idx + 1:]
+        return base[:idx + 1] + desc_xml + comments_xml + dd_xml + base[idx + 1:]
 
 
 @dataclass
@@ -1320,6 +1326,10 @@ class Parameter(L5xElement):
     constant: Union[str, None]  # "false" for non-MESSAGE InOut, None otherwise (omitted)
     dimensions: Union[str, None]  # array size; None for scalars (omitted from XML)
     _description: Union[str, None] = field(default=None)
+    # Operand-keyed member/bit/array comments (AOI scope). Rendered as a
+    # <Comments> block after <Description> and before <DefaultData>. Empty by
+    # default so existing Parameter() constructions are unaffected.
+    _operand_comments: List[Tuple[str, str]] = field(default_factory=list)
     # AOI-scoped value image (mirrors Tag); defaults to the no-value state so
     # existing Parameter() constructions are unaffected.
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
@@ -1353,6 +1363,8 @@ class Parameter(L5xElement):
             f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
             if self._description else ""
         )
+        # Operand comments render between Description and DefaultData (OEM order).
+        comments_xml = _aoi_comments_xml(self._operand_comments)
         # DefaultData (validated gating on the full OEM pool):
         #   - emitted on Input/Output params, NOT on InOut (933/933 had none);
         #   - SUPPRESSED for the system params EnableIn/EnableOut (no DefaultData);
@@ -1364,10 +1376,10 @@ class Parameter(L5xElement):
                 self._short_header, self._data_types_map, self._taginfo_layout,
                 radix=self.radix, raw_hex_first=self._raw_hex_data,
             )
-        if not desc_xml and not dd_xml:
+        if not desc_xml and not comments_xml and not dd_xml:
             return base
         idx = base.index(">")
-        return base[:idx + 1] + desc_xml + dd_xml + base[idx + 1:]
+        return base[:idx + 1] + desc_xml + comments_xml + dd_xml + base[idx + 1:]
 
 
 @dataclass
@@ -2562,6 +2574,95 @@ def _aoi_tag_usage(ext01: bytes, short_header: bool = False) -> Tuple[Union[str,
     return usage, bool(bits & 0x20), bool(bits & 0x40)
 
 
+def _aoi_operand_comments(cur, r, raw_rec: bytes) -> List[Tuple[str, str]]:
+    """Operand-keyed member/bit/array <Comment> rows for an AOI Parameter/
+    LocalTag, using the SAME shared-scope-key + owner_ref join TagBuilder uses
+    for program-scope tags (long header only). An AOI's parameters/local tags
+    all share the AOI DEFINITION's comment_id and carry the AOI-scope cip 0x338
+    in their prelude, so parent == comment_id*0x10000 + cip is the AOI's shared
+    scope key (== unique_comment_key / unique_owner_key.scope) and record[14:18]
+    is the tag's own key repeated in each comment row's owner_ref -- exactly the
+    program-scope machinery, only the scope cip differs (0x338 vs 0x68). Gated on
+    the same unique-owner-key attribution so a collision fails closed to nothing.
+    AOI params/local tags never carry Min/Max/EngUnit blocks anywhere in the OEM
+    pool, so only comment kinds are kept; Min/Max/EngUnit rows are dropped.
+    Returns [] fail-closed on any miss (short-header handled by the caller)."""
+    operand_comments: List[Tuple[str, str]] = []
+    try:
+        parent_key = (r.comment_id * 0x10000) + r.cip_type
+        own_key = (struct.unpack_from("<I", raw_rec, 14)[0]
+                   if len(raw_rec) >= 18 else 0)
+        if cur.execute("SELECT 1 FROM unique_comment_key WHERE k=?",
+                       (parent_key,)).fetchone():
+            cur.execute(
+                "SELECT c.tag_reference, c.record_string, c.member_ref, "
+                "c.revision FROM comments c WHERE c.parent=? "
+                "AND c.tag_reference!='' AND c.tag_reference!='__REVISION_NOTE__' "
+                "AND c.record_string!=''",
+                (parent_key,))
+        elif (own_key and (own_key & 0xFFFF) == 0x6B
+                and cur.execute(
+                    "SELECT 1 FROM unique_owner_key WHERE scope=? AND own=?",
+                    (parent_key, own_key)).fetchone()):
+            cur.execute(
+                "SELECT c.tag_reference, c.record_string, c.member_ref, "
+                "c.revision FROM comments c WHERE c.parent=? AND c.owner_ref=? "
+                "AND c.tag_reference!='' AND c.tag_reference!='__REVISION_NOTE__' "
+                "AND c.record_string!=''",
+                (parent_key, own_key))
+        else:
+            return operand_comments
+        _best: Dict[Tuple[str, int], Tuple[int, str]] = {}
+        _gen_max = 0
+        for op_ref, op_text, op_kind, op_rev in cur.fetchall():
+            if not op_text:
+                continue
+            if ".!" in op_ref:
+                op_ref = resolve_hex_operand(cur, op_ref)
+                if op_ref is None:
+                    continue
+            if not _is_valid_operand(op_ref):
+                continue
+            if op_kind in (0x02, 0x03, 0x05):
+                continue  # Min/Max/EngUnit -- never on an AOI param/local tag
+            _k = (op_ref, op_kind)
+            _gen_max = max(_gen_max, op_rev or 0)
+            _prev = _best.get(_k)
+            if _prev is None or (op_rev or 0) > _prev[0]:
+                _best[_k] = (op_rev or 0, op_text)
+        for (op_ref, _op_kind), (_op_rev, op_text) in _best.items():
+            operand_comments.append(
+                (op_ref, op_text if _op_rev >= _gen_max else ""))
+    except Exception:
+        operand_comments = []
+    return operand_comments
+
+
+def _aoi_comments_xml(operand_comments: List[Tuple[str, str]]) -> str:
+    """<Comments> block for an AOI Parameter/LocalTag, or "".
+
+    Same shape as Tag._build_comments_xml (first-occurrence dedup, CDATA body)."""
+    if not operand_comments:
+        return ""
+    seen = set()
+    items: List[Tuple[str, str]] = []
+    for operand, text in operand_comments:
+        if not operand or operand in seen:
+            continue
+        seen.add(operand)
+        items.append((operand, text))
+    if not items:
+        return ""
+    parts = ["<Comments>"]
+    for operand, text in items:
+        op_attr = html.escape(operand, quote=True)
+        body = Tag._sanitize_xml_text(text) if text else ""
+        parts.append(
+            f'<Comment Operand="{op_attr}">\n<![CDATA[{body}]]>\n</Comment>')
+    parts.append("</Comments>")
+    return "".join(parts)
+
+
 def _aoi_tag_data_type(cur, raw_rec: bytes) -> str:
     """Look up the DataType name for an AOI tag record.
 
@@ -2723,6 +2824,12 @@ class ParameterBuilder(L5xElementBuilder):
                 if desc_row and desc_row[0]:
                     description = desc_row[0]
 
+        # Operand-keyed member/bit/array comments (long header). The short-header
+        # AOI operand records currently mis-decode in the comments parser, so hold
+        # them (no comments, never a wrong render).
+        operand_comments = ([] if self._short_header
+                            else _aoi_operand_comments(self._cur, r, raw_rec))
+
         return Parameter(
             name,
             name,
@@ -2737,6 +2844,7 @@ class ParameterBuilder(L5xElementBuilder):
             constant,
             dimensions,
             description,
+            operand_comments,
         )
 
 
@@ -2831,7 +2939,12 @@ class LocalTagBuilder(L5xElementBuilder):
                 if desc_row and desc_row[0]:
                     description = desc_row[0]
 
-        return LocalTag(name, name, data_type, dimensions, radix, external_access, description)
+        # Operand-keyed member/bit/array comments (long header); short-header held.
+        operand_comments = ([] if self._short_header
+                            else _aoi_operand_comments(self._cur, r, raw_rec))
+
+        return LocalTag(name, name, data_type, dimensions, radix,
+                        external_access, description, operand_comments)
 
 
 _ST_AT_TOKEN_RE = re.compile(r"@([0-9a-fA-F]+)@")
