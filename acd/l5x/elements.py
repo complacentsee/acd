@@ -72,6 +72,7 @@ from acd.l5x.module_builder import (
     _module_identity_e1,
 )
 from acd.l5x import tag_value as _tag_value
+from acd.l5x.axis_cip import render_axis_cip_drive as _render_axis_cip_drive
 from acd.record.blobs import ControllerProps
 from acd.record.comps import CompsRecord, _SP_MARKER, decrypt_sp_nameless
 
@@ -5442,6 +5443,9 @@ class ControllerBuilder(L5xElementBuilder):
                     for port_id in range(1, 20)
                     if (m.name, port_id) in child_counts
                 }
+        # Stash the modid->name map for the post-build axis pass (CIP-drive
+        # MotionModule resolution reads it).
+        self._modid_to_name = modid_to_name
         return modules
 
     def _pass_processor_identity(self, modules, _comm_path_prefix, _ctlattrs):
@@ -5625,8 +5629,10 @@ class ControllerBuilder(L5xElementBuilder):
                 if _gr and _gr[0] is not None and len(bytes(_gr[0])) >= 14:
                     _cid = struct.unpack_from("<H", bytes(_gr[0]), 12)[0]
                     _grp_by_cid[_cid] = _gt.name
+            _modid_name = getattr(self, "_modid_to_name", {}) or {}
             for _at in _ax_tags:
-                if ((_at.data_type or "").upper() != "AXIS_VIRTUAL"
+                _adt = (_at.data_type or "").upper()
+                if (_adt not in ("AXIS_VIRTUAL", "AXIS_CIP_DRIVE")
                         or _at.tag_type == "Alias"):
                     continue
                 _br = self._cur.execute(
@@ -5643,7 +5649,11 @@ class ControllerBuilder(L5xElementBuilder):
                 _gname = _grp_by_cid.get(_gcid)
                 if _gname is None:
                     continue
-                _at._axis_data_xml = _render_axis_virtual(_blob, _gname)
+                if _adt == "AXIS_VIRTUAL":
+                    _at._axis_data_xml = _render_axis_virtual(_blob, _gname)
+                else:
+                    _at._axis_data_xml = _render_axis_cip_drive(
+                        _blob, _gname, _modid_name)
         except Exception:
             pass
 
