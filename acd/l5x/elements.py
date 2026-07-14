@@ -5639,7 +5639,7 @@ class ControllerBuilder(L5xElementBuilder):
         # module is built. Best-effort: any tag (controller- or program-scope)
         # that does not decode with full confidence keeps its prior no-<Data>.
         try:
-            _msg_nr, _msg_rc, _msg_ips = _msg_build_module_routes(modules)
+            _msg_nr, _msg_rc = _msg_build_module_routes(modules)
             _msg_oid2name = {o: n for o, n in self._cur.execute(
                 "SELECT object_id, comp_name FROM comps")}
             _msg_tags = list(tags)
@@ -5649,7 +5649,7 @@ class ControllerBuilder(L5xElementBuilder):
                 if (_mt.data_type or "").upper() == "MESSAGE" and _mt.tag_type != "Alias":
                     _mt._message_data_xml = _render_message_data(
                         self._cur, self._short_header, _mt._data_table_instance,
-                        _msg_oid2name, _msg_nr, _msg_rc, _msg_ips)
+                        _msg_oid2name, _msg_nr, _msg_rc)
         except Exception:
             pass
 

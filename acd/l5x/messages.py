@@ -69,7 +69,7 @@ def _msg_route_segment(m) -> bytes:
 
 
 def _msg_build_module_routes(modules):
-    """Return (name->route bytes, {route: count}, set(module IPs)).
+    """Return (name->route bytes, {route: count}).
 
     A module's route is the concatenation of its ParentModule-chain segments
     (the root's route is empty). A bare backplane slot-0 route is dropped from
@@ -109,8 +109,7 @@ def _msg_build_module_routes(modules):
     route_count: Dict[bytes, int] = {}
     for r in nr.values():
         route_count[r] = route_count.get(r, 0) + 1
-    module_ips = {m._ip_address for m in modules if m._ip_address}
-    return nr, route_count, module_ips
+    return nr, route_count
 
 
 def _epath_ascii(seg):
@@ -123,31 +122,6 @@ def _epath_ascii(seg):
     on the UTF-16 tag-token decode below.
     """
     return seg.decode("ascii", "replace").split("\x00", 1)[0]
-
-
-def _msg_seg_list(b):
-    """Split EPATH bytes into [(port_byte, addr, is_ip)] segments (lenient)."""
-    out = []
-    i = 0
-    n = len(b)
-    while i < n:
-        p = b[i]
-        i += 1
-        if p & 0x10:
-            if i >= n:
-                break
-            L = b[i]
-            i += 1
-            if i + L > n:
-                break
-            out.append((p, _epath_ascii(b[i:i + L]), True))
-            i += L + (L & 1)
-        else:
-            if i >= n:
-                break
-            out.append((p, b[i], False))
-            i += 1
-    return out
 
 
 def _msg_decode_tokens(b):
@@ -180,15 +154,14 @@ def _msg_decode_tokens(b):
     return toks
 
 
-def _msg_resolve_cp(epath, nr, route_count, module_ips):
+def _msg_resolve_cp(epath, nr, route_count):
     """Resolve a message EPATH to (connection_path_str | None, unsafe bool).
 
     Longest module-route prefix -> that module's name, then the remaining
-    segments decode to "port, addr" tokens. ``unsafe`` is True when the result
-    may differ from what Logix writes (an ambiguous route shared by several
-    modules, a path that traverses a modeled module by IP, or a mid-path
-    slot/node hop into a remote module that Logix would name) -- the caller then
-    emits nothing rather than risk a wrong ConnectionPath.
+    segments decode to "port, addr" tokens. ``unsafe`` is True only when the
+    result may differ from what Logix writes -- an ambiguous route prefix shared
+    by several modules -- and the caller then emits nothing rather than risk a
+    wrong ConnectionPath.
     """
     best = None
     bl = -1
@@ -207,14 +180,12 @@ def _msg_resolve_cp(epath, nr, route_count, module_ips):
     toks = _msg_decode_tokens(rem)
     if toks is None:
         return None, True
-    unsafe = False
-    if best is not None and route_count.get(best_route, 0) > 1:
-        unsafe = True
-    segs = _msg_seg_list(rem)
-    if any(is_ip and addr in module_ips for _p, addr, is_ip in segs):
-        unsafe = True
-    if best is not None and any(not is_ip for _p, _a, is_ip in segs[:-1]):
-        unsafe = True
+    # ``best`` is the LONGEST module-route prefix, so no deeper module route can
+    # be a prefix of the remaining segments -- every remaining hop is un-nameable
+    # and Logix shows its raw port/addr tokens, matching what we render here. The
+    # only genuine ambiguity is a route prefix shared by several modules (we
+    # cannot tell which one Logix names); that alone stays unsafe.
+    unsafe = best is not None and route_count.get(best_route, 0) > 1
     cp = ", ".join(([best] if best is not None else []) + toks)
     return cp, unsafe
 
@@ -249,7 +220,7 @@ def _msg_res_tok(raw, oid2name):
     return "".join(out)
 
 
-def _render_message_data(cur, short_header, dti, oid2name, nr, route_count, module_ips):
+def _render_message_data(cur, short_header, dti, oid2name, nr, route_count):
     """Return the ``<Data Format="Message">`` block for a MESSAGE tag, or None.
 
     None is returned for every configuration not decoded with full confidence
@@ -262,15 +233,20 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count, modu
             return None
         attrs = CompsRecord.record_attrs(cur, dti, short_header)
         a1 = attrs.get(0x1)
-        if not a1 or len(a1) != 354:
+        if not a1 or len(a1) not in (354, 428):
             return None
-        # The exact-354 gate above guarantees every MessageConfig field is
-        # present (the grammar's size guards exist for robustness only).
+        # The 354/428 gate guarantees every MessageConfig field is present at
+        # its offset; the 428 image is the same struct with a trailing
+        # extension, so the CIP families decode identically (the grammar's size
+        # guards exist for robustness only).
         mc = MessageConfig.from_bytes(a1)
         fam = mc.family
         # MessageType family is the struct-trailer byte 353; the sub-type is the
         # service byte 330 (the low byte of the CIP setup struct's ServiceCode).
         svc = mc.service_byte
+        # CommTypeCode (byte 315) gates the DH+ connected variants below; the
+        # EMITTED CommTypeCode stays "0" (every rendered family carries ctc==0).
+        ctc = a1[315]
         if fam == 1:
             mt = "CIP Generic"
         elif fam == 2:
@@ -279,7 +255,7 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count, modu
             mt = {162: "SLC Typed Read", 170: "SLC Typed Write"}.get(svc)
         elif fam == 6:
             mt = {0: "PLC5 Word Range Write", 1: "PLC5 Word Range Read",
-                  104: "PLC5 Typed Read"}.get(svc)
+                  103: "PLC5 Typed Write", 104: "PLC5 Typed Read"}.get(svc)
         elif fam == 7:
             mt = "Module Reconfigure"
         elif fam == 0:
@@ -294,7 +270,7 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count, modu
         has_cp = bool(epath)
         cp = None
         if has_cp:
-            cp, unsafe = _msg_resolve_cp(epath, nr, route_count, module_ips)
+            cp, unsafe = _msg_resolve_cp(epath, nr, route_count)
             if cp is None or unsafe:
                 return None
         le = _msg_res_tok(attrs.get(0x65), oid2name)
@@ -347,22 +323,23 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count, modu
             if cf == 1:
                 P.append(("CacheConnections", cc_val))
         elif mt in ("SLC Typed Read", "SLC Typed Write",
-                    "PLC5 Word Range Write", "PLC5 Word Range Read", "PLC5 Typed Read"):
+                    "PLC5 Word Range Write", "PLC5 Word Range Read",
+                    "PLC5 Typed Read", "PLC5 Typed Write"):
             # RemoteElement is a PLC data address (e.g. N20:0); LocalElement a tag.
-            # These families render no ConnectedFlag. A connected (cf==1) SLC
-            # message additionally carries the DH+ channel attrs (@Channel /
-            # @DHPlus*), which are not decoded, so that case is still skipped
-            # whole (under-emit rather than emit a wrong subset). A connected
-            # PLC5 message gets CacheConnections (same byte-1 bit as CIP); its
-            # DH+ channel attrs remain undecoded (documented residual).
+            # These families render no ConnectedFlag. A connected DH+ message
+            # (CommTypeCode 1) additionally carries the @Channel / @DHPlus*
+            # attrs, which are not decoded, so that case is skipped whole
+            # (under-emit rather than emit a wrong subset) for both SLC and
+            # PLC5. A connected EtherNet message (cf==1, ctc==0) gets
+            # CacheConnections (same byte-1 bit as CIP).
             if re_el is None or le is None:
                 return None
-            if mt.startswith("SLC") and cf == 1:
+            if cf == 1 and ctc == 1:
                 return None
             P += [("RemoteElement", re_el), ("RequestedLength", str(req))]
             add_cp()
             P += [("CommTypeCode", "0"), ("LocalIndex", "0"), ("LocalElement", le)]
-            if mt.startswith("PLC5") and cf == 1:
+            if cf == 1:
                 P.append(("CacheConnections", cc_val))
         elif mt == "Module Reconfigure":
             P += [("RequestedLength", str(req))]

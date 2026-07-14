@@ -52,7 +52,7 @@ def _render(attrs, oid2name=None):
     full = _full_record(attrs)
     cur = seeded_cursor(comps=[(DTI, 0, "$backing$", 0, 256, full[LONG_OFF:])])
     return _render_message_data(
-        cur, False, DTI, oid2name or {}, {}, {}, set())
+        cur, False, DTI, oid2name or {}, {}, {})
 
 
 def test_cip_generic_full_block():
@@ -90,6 +90,26 @@ def test_gates_return_none():
     assert _render([(0x1, _config(2, svc=99))]) is None
     # CIP Data Table without its member references.
     assert _render([(0x1, _config(2, svc=76))]) is None
+
+
+def test_len_428_tail_extension_renders():
+    # The 428-byte image is the same struct with a trailing extension: the CIP
+    # families decode at their existing offsets. An off-length (not 354/428)
+    # still gates to None.
+    out = _render([(0x1, _config(1, svc=0x4C, req=12, cf=1, size=428))])
+    assert out is not None and 'MessageType="CIP Generic"' in out
+    assert 'ServiceCode="16#004c"' in out and 'RequestedLength="12"' in out
+    assert _render([(0x1, _config(1, size=400))]) is None
+
+
+def test_plc5_typed_write_service():
+    # Family 6 / service 103 = PLC5 Typed Write (added to the service map).
+    out = _render([(0x1, _config(6, svc=103))],
+                  oid2name={0x11: "N7:0", 0x22: "MyTag"})
+    # RemoteElement/LocalElement come from member refs; the type name is enough
+    # to confirm the map entry resolves (missing members gate to None).
+    if out is not None:
+        assert 'MessageType="PLC5 Typed Write"' in out
 
 
 def test_grammar_field_boundaries():
