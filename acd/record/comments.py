@@ -353,11 +353,13 @@ class CommentsRecord:
         if any((ord(c) < 0x20 and c != "\t") for c in operand):
             return None
         kind = body[13]
-        if kind == 0x04:
+        if kind in (0x04, 0x21):
             # A kind-0x04 operand row is a member CROSS-REFERENCE (where-used
-            # I/O flags as text, e.g. "OI"), not a comment; the reference
-            # export never emits these. Same layout, so it must be dropped
-            # here or it would surface as a spurious <Comment>.
+            # I/O flags as text, e.g. "OI"); kind-0x21 is an AlarmCondition
+            # trigger tag-name binding whose mid-string text would surface as a
+            # truncated <Comment>. Neither is a comment and the reference export
+            # emits neither -- same operand-row layout, so drop both here or
+            # they leak in as spurious <Comment> rows.
             return None
         if kind in (0x02, 0x03):
             # Min/Max: the payload is the trailing little-endian REAL (there is
@@ -493,9 +495,9 @@ class CommentsRecord:
         owner_ref = struct.unpack_from("<I", body, 0)[0]
         object_id = struct.unpack_from("<I", body, 8)[0]
         kind = body[13]
-        if kind == 0x04:
-            # Member cross-reference row, not a comment (see the plaintext
-            # walker); drop before attempting the decrypt.
+        if kind in (0x04, 0x21):
+            # Non-comment operand-row kinds (member cross-reference 0x04, alarm-
+            # trigger binding 0x21); drop before attempting the decrypt.
             return None
         prefix = raw[30:mi]
         ct = raw[mi + 18:]
@@ -722,13 +724,15 @@ class CommentsRecord:
                 tag_ref = r.body.tag_reference.value
             else:
                 tag_ref = ""
-            # A kind-0x04 (raw[27]) OPERAND row is a member cross-reference,
-            # not a comment -- same body layout as the hand-walked ordinals,
-            # so gate it here too. rt-1/2 description rows use the same slot
-            # for the member_ref low byte and are NOT filtered.
+            # An OPERAND row (raw[27]) whose kind is a member cross-reference
+            # (0x04, where-used flags) or an AlarmCondition trigger binding
+            # (0x21) is not a comment -- same body layout as the hand-walked
+            # ordinals, so gate both here too. rt-1/2 description rows use the
+            # same slot for the member_ref low byte and are NOT filtered.
             if (tag_ref and tag_ref[:1] in (".", "[")
                     and len(raw_full) >= 28
-                    and raw_full[26] == 0x00 and raw_full[27] == 0x04):
+                    and raw_full[26] == 0x00
+                    and raw_full[27] in (0x04, 0x21)):
                 return None
             # For AsciiRecord (type 1 or 2), extract bytes [4:8] of unknown_1.
             # This value is non-zero for rung-level comments and zero for internal
