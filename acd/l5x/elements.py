@@ -209,10 +209,11 @@ except ValueError:
     _DECORATED_MAX_BYTES = 16384
 
 # A valid L5X tag-comment Operand is a member/bit/index path relative to the tag:
-# it starts with '.' or '[' and contains only identifier/index characters. Module
+# it starts with '.' or '[' and contains only identifier/index characters (the
+# comma separates a multi-dimension array index, e.g. "[4,1]"). Module
 # connection-point comments instead carry a raw binary key that decodes to junk
 # (e.g. CJK from a UTF-16 misread); those must not leak in as tag operand comments.
-_OPERAND_RE = re.compile(r"^[.\[][A-Za-z0-9_.\[\]]*$")
+_OPERAND_RE = re.compile(r"^[.\[][A-Za-z0-9_.,\[\]]*$")
 
 
 def _is_valid_operand(op: str) -> bool:
