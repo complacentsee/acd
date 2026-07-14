@@ -87,7 +87,7 @@ def _gate(b, g):
 def _render_attr(a, b, E, group_name, modid_to_name):
     """Render one attribute value string, or None if unreconstructable."""
     if a == "MotionGroup":
-        return group_name
+        return group_name or None
     p = E["attrs"].get(a)
     if p is None:
         return None

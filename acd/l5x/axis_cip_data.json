@@ -15224,6 +15224,216 @@
   }
  },
  "motion_group": {
-  "lengths": {}
+  "lengths": {
+   "1268": {
+    "attrs": {
+     "Alternate1UpdateMultiplier": {
+      "off": 1245,
+      "render": "int",
+      "w": 1
+     },
+     "Alternate2UpdateMultiplier": {
+      "off": 1246,
+      "render": "int",
+      "w": 1
+     },
+     "AutoTagUpdate": {
+      "note": "differential at 621; block-geometry at other lengths",
+      "off": 1240,
+      "render": "enum",
+      "vocab": {
+       "0": "Disabled",
+       "1": "Enabled"
+      },
+      "w": 1
+     },
+     "CoarseUpdatePeriod": {
+      "note": "u32 microseconds, identity; duplicated at A+4",
+      "off": 1188,
+      "render": "int",
+      "w": 4
+     },
+     "GeneralFaultType": {
+      "blocker": true,
+      "note": "pool-constant; encodes as 0 or unstored; unlocatable",
+      "render": "const",
+      "value": "Non Major Fault"
+     },
+     "GroupType": {
+      "blocker": true,
+      "note": "pool-constant; code 02 at 1268 blob end only; no locatable storage at 621/2304 (all-zero)",
+      "render": "const",
+      "value": "Warning Enabled"
+     },
+     "PhaseShift": {
+      "note": "GEOMETRY-PINNED (no in-pool variation); always 0",
+      "off": 1196,
+      "render": "int",
+      "w": 4
+     }
+    },
+    "emit": [
+     "GroupType",
+     "CoarseUpdatePeriod",
+     "PhaseShift",
+     "GeneralFaultType",
+     "AutoTagUpdate",
+     "Alternate1UpdateMultiplier",
+     "Alternate2UpdateMultiplier"
+    ]
+   },
+   "2304": {
+    "attrs": {
+     "Alternate1UpdateMultiplier": {
+      "off": 2281,
+      "render": "int",
+      "w": 1
+     },
+     "Alternate2UpdateMultiplier": {
+      "off": 2282,
+      "render": "int",
+      "w": 1
+     },
+     "AutoTagUpdate": {
+      "note": "differential at 621; block-geometry at other lengths",
+      "off": 2276,
+      "render": "enum",
+      "vocab": {
+       "0": "Disabled",
+       "1": "Enabled"
+      },
+      "w": 1
+     },
+     "CoarseUpdatePeriod": {
+      "note": "u32 microseconds, identity; duplicated at A+4",
+      "off": 2212,
+      "render": "int",
+      "w": 4
+     },
+     "GeneralFaultType": {
+      "blocker": true,
+      "note": "pool-constant; encodes as 0 or unstored; unlocatable",
+      "render": "const",
+      "value": "Non Major Fault"
+     },
+     "GroupType": {
+      "blocker": true,
+      "note": "pool-constant; code 02 at 1268 blob end only; no locatable storage at 621/2304 (all-zero)",
+      "render": "const",
+      "value": "Warning Enabled"
+     },
+     "PhaseShift": {
+      "note": "GEOMETRY-PINNED (no in-pool variation); always 0",
+      "off": 2220,
+      "render": "int",
+      "w": 4
+     }
+    },
+    "emit": [
+     "GroupType",
+     "CoarseUpdatePeriod",
+     "PhaseShift",
+     "GeneralFaultType",
+     "AutoTagUpdate",
+     "Alternate1UpdateMultiplier",
+     "Alternate2UpdateMultiplier"
+    ]
+   },
+   "2306": {
+    "attrs": {
+     "Alternate1UpdateMultiplier": {
+      "off": 2279,
+      "render": "int",
+      "w": 1
+     },
+     "Alternate2UpdateMultiplier": {
+      "off": 2280,
+      "render": "int",
+      "w": 1
+     },
+     "AutoTagUpdate": {
+      "note": "differential at 621; block-geometry at other lengths",
+      "off": 2274,
+      "render": "enum",
+      "vocab": {
+       "0": "Disabled",
+       "1": "Enabled"
+      },
+      "w": 1
+     },
+     "CoarseUpdatePeriod": {
+      "note": "u32 microseconds, identity; duplicated at A+4",
+      "off": 2210,
+      "render": "int",
+      "w": 4
+     },
+     "GeneralFaultType": {
+      "blocker": true,
+      "note": "pool-constant; encodes as 0 or unstored; unlocatable",
+      "render": "const",
+      "value": "Non Major Fault"
+     },
+     "PhaseShift": {
+      "note": "GEOMETRY-PINNED (no in-pool variation); always 0",
+      "off": 2218,
+      "render": "int",
+      "w": 4
+     }
+    },
+    "emit": [
+     "CoarseUpdatePeriod",
+     "PhaseShift",
+     "GeneralFaultType",
+     "AutoTagUpdate",
+     "Alternate1UpdateMultiplier",
+     "Alternate2UpdateMultiplier"
+    ]
+   },
+   "621": {
+    "attrs": {
+     "AutoTagUpdate": {
+      "note": "differential at 621; block-geometry at other lengths",
+      "off": 616,
+      "render": "enum",
+      "vocab": {
+       "0": "Disabled",
+       "1": "Enabled"
+      },
+      "w": 1
+     },
+     "CoarseUpdatePeriod": {
+      "note": "u32 microseconds, identity; duplicated at A+4",
+      "off": 564,
+      "render": "int",
+      "w": 4
+     },
+     "GeneralFaultType": {
+      "blocker": true,
+      "note": "pool-constant; encodes as 0 or unstored; unlocatable",
+      "render": "const",
+      "value": "Non Major Fault"
+     },
+     "GroupType": {
+      "blocker": true,
+      "note": "pool-constant; code 02 at 1268 blob end only; no locatable storage at 621/2304 (all-zero)",
+      "render": "const",
+      "value": "Warning Enabled"
+     },
+     "PhaseShift": {
+      "note": "GEOMETRY-PINNED (no in-pool variation); always 0",
+      "off": 572,
+      "render": "int",
+      "w": 4
+     }
+    },
+    "emit": [
+     "GroupType",
+     "CoarseUpdatePeriod",
+     "PhaseShift",
+     "GeneralFaultType",
+     "AutoTagUpdate"
+    ]
+   }
+  }
  }
 }
