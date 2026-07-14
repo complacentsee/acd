@@ -14,6 +14,7 @@ regress below current output.
 """
 from __future__ import annotations
 
+import datetime as _datetime
 import struct
 from decimal import Decimal, localcontext, ROUND_HALF_UP
 from typing import Dict, List, Optional, Tuple
@@ -291,8 +292,9 @@ def _fmt_real_decorated(v: float) -> str:
     with localcontext() as ctx:
         ctx.prec = 80
         if f == 0.0:
-            neg0 = bool(struct.pack("<d", f)[7] & 0x80)
-            return "-0.0" if neg0 else "0.0"
+            # A stored negative zero prints as plain 0.0: the reference never
+            # emits "-0.0" anywhere in either pool's exports.
+            return "0.0"
         a = abs(f)
         exp = math.floor(math.log10(a))
         # log10 can land just on the wrong side of a power of ten for values that
@@ -330,8 +332,9 @@ def _fmt_lreal_decorated(v: float) -> str:
     with localcontext() as ctx:
         ctx.prec = 80
         if f == 0.0:
-            neg0 = bool(struct.pack("<d", f)[7] & 0x80)
-            return "-0.0" if neg0 else "0.0"
+            # A stored negative zero prints as plain 0.0: the reference never
+            # emits "-0.0" anywhere in either pool's exports.
+            return "0.0"
         a = abs(f)
         exp = math.floor(math.log10(a))
         if Decimal(a) >= Decimal(10) ** (exp + 1):
@@ -1016,6 +1019,18 @@ def _format_int_radix(dt: str, val: int, width: int, radix: Optional[str]) -> st
         ch = (ch.replace("&", "&amp;").replace("<", "&lt;")
                 .replace(">", "&gt;").replace('"', "&quot;"))
         return "&apos;" + ch + "&apos;"
+    if radix == "Date/Time":
+        # LINT wall-clock: signed microseconds since 1970-01-01 UTC ->
+        # DT#Y-MM-DD-HH:MM:SS.mmm_uuuZ. Out-of-range values keep the plain
+        # decimal form (today's output) rather than raise.
+        try:
+            t = _datetime.datetime(1970, 1, 1) + _datetime.timedelta(
+                microseconds=val)
+            return ("DT#%d-%02d-%02d-%02d:%02d:%02d.%03d_%03dZ"
+                    % (t.year, t.month, t.day, t.hour, t.minute, t.second,
+                       t.microsecond // 1000, t.microsecond % 1000))
+        except (OverflowError, OSError):
+            return str(val)
     # Decimal / anything else -> signed decimal
     return str(val)
 

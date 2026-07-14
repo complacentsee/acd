@@ -46,7 +46,9 @@ def test_bool_array_decorated_needs_ceil_div_8_bytes():
 
 def test_fmt_real_decorated_edges():
     assert T._fmt_real_decorated(0.0) == "0.0"
-    assert T._fmt_real_decorated(-0.0) == "-0.0"
+    # A stored negative zero prints as plain 0.0 (the reference never emits
+    # "-0.0" anywhere in either pool's exports).
+    assert T._fmt_real_decorated(-0.0) == "0.0"
     assert T._fmt_real_decorated(1.5) == "1.5"
     assert T._fmt_real_decorated(-3.25) == "-3.25"
     assert T._fmt_real_decorated(float("inf")) == "1.$"

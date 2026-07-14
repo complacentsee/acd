@@ -585,10 +585,12 @@ def _render_value_blocks(element: str,
                       if len(value_bytes) >= 4 else 0)
         except Exception:
             length = 0
-        if length < 0 or length + 4 > len(value_bytes):
-            # Fall back to a NUL-terminated scan for a malformed LEN.
-            raw = value_bytes[4:] if len(value_bytes) > 4 else b""
-            text = _tag_value._ascii_string_cdata(raw.split(b"\x00", 1)[0])
+        if length + 4 > len(value_bytes):
+            # Malformed/garbage LEN: the reference clamps to the DATA
+            # capacity and emits those bytes verbatim (the garbage bytes are
+            # in the stored image), so mirror min(LEN, capacity).
+            text = _tag_value._ascii_string_cdata(
+                value_bytes[4:] if len(value_bytes) > 4 else b"")
         else:
             text = _tag_value._ascii_string_cdata(value_bytes[4:4 + length])
         string_block = (
