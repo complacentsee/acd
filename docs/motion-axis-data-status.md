@@ -1,5 +1,28 @@
 # Motion axis `<Data Format="Axis">` decode — status and remaining gap
 
+## UPDATE 2026-07-14: AXIS_CIP_DRIVE length-5965 is LANDED (byte-exact, 0-worse)
+
+The floor below (AXIS_CIP_DRIVE held on pool-invariant fields) was lifted for the
+length-5965 generation via a motion tracer round-trip + reverse-engineering:
+- **Offsets/values**: a tracer project wrote unique sentinel values into every
+  previously-invariant axis field; importing/re-exporting through Studio v36
+  turned each into a searchable needle, pinning the offsets. Units
+  (MotorUnit/Feedback1Unit) are DERIVED from motor rotary/linear type (documented
+  read, not a hardcode); two feedback/test fields are corpus-constant.
+- **Emit-set** (which attrs a given axis emits — the real remaining problem): it is
+  a CAPABILITY BITMAP stored in the blob (bits at ~offsets 3/8/9/150/458/485 gate
+  feature groups), plus content-presence for the variable cyclic-read list, keyed
+  on AxisConfiguration. Reproduces the exact emit-set for 192/192 pool axes.
+- **Renderer**: `acd/l5x/axis_cip.py` + `acd/l5x/axis_cip_data.json`, wired in the
+  post-build axis pass alongside `_render_axis_virtual`. Fail-closed (any
+  unrecognised length/config/enum/module → no `<Data>`, 0-worse). Both pools
+  improved with zero files worse.
+
+FOLLOW-UPS (not yet done): other CIP lengths (5843/5476/3666/3654 — header offsets
+transfer, need per-length tail + emit-set validation); AXIS_SERVO_DRIVE 5965 (same
+struct, should ride the CIP schema); MOTION_GROUP <Data>. See
+plans/motion-cip-drive-implementation.md.
+
 ## Summary
 
 | Axis datatype | `<Data>` emitted? | Notes |
