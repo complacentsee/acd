@@ -48,14 +48,22 @@ tolerated (fail-closed withholding instead). Landed per target:
 | MOTION_GROUP 621/1268/2304/2306 | 78/78 | `<Data Format="MotionGroup">` |
 
 Remaining held (fail-closed, still element_missing):
-- **AXIS_SERVO_DRIVE 3430 grouped-drive axes (92)**: values and order fully
-  reconstruct; the only residual is the emit gate for the amplifier attribute
-  group ({AmplifierCatalogNumber, MotorFeedbackType, PowerSupplyID}), which is
-  provably NOT in the config image (exhaustive in-blob search empty; emission
-  is module-record state). Closing it needs a converter-side join from the
-  axis modid to the drive-module record's state.
+- **AXIS_SERVO_DRIVE 3430 grouped-drive axes (92): PROVEN environment-coupled
+  floor** (investigated 2026-07-14). Values and order fully reconstruct; only
+  the emit gate for the amplifier attribute group ({AmplifierCatalogNumber,
+  MotorFeedbackType, PowerSupplyID}) is missing, and it is not derivable from
+  the ACD: exhaustive searches found no separator in the axis config image,
+  the axis tag record, the drive-module record/identity/subtree, or the module
+  identity key (catalog, major, minor) — the same key appears on both sides.
+  Emission is perfectly uniform per FILE (zero mixed projects), two saves of
+  the SAME project split emit/no-emit with byte-identical module identities,
+  and the reference exports were all produced by one conversion environment,
+  so the deciding comparison must involve export-workstation motion-database
+  state (the projects' only correlating region is a high-entropy DB-sync
+  stamp). Same floor class as the EncodedData hide/show and InternetProtocol
+  config-epoch findings. The axes stay withheld (0-worse).
 - Tiny buckets with too few instances to fit a profile: CIP 4282/3430/5755,
-  SERVO_DRIVE 3424, AXIS_SERVO 3430.
+  SERVO_DRIVE 3424, AXIS_SERVO 3430 (13 instances total).
 
 Corpus-constant fields: a handful of attributes hold a single value across
 every instance of both pools at a given generation and have no locatable
