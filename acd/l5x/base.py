@@ -75,6 +75,7 @@ _LIST_SECTION_NAMES = {
     "aois": "AddOnInstructionDefinitions",
     "tasks": "Tasks",
     "scheduled_programs": "ScheduledPrograms",
+    "child_programs": "ChildPrograms",
 }
 
 

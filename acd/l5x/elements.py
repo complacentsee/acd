@@ -1490,6 +1490,9 @@ class Program(L5xElement):
     use_as_folder: Union[str, None]  # None -> omit attr (V10..V20 projects)
     tags: List[Tag]        # Tags section before Routines (matches L5X export order)
     routines: List[Routine]
+    # <ChildPrograms> name index after Routines (None omits the section; the
+    # child programs themselves are emitted as flat sibling <Program>s).
+    child_programs: Union[List["ChildProgram"], None] = field(default=None)
     # Safety program signature/timestamp (None omits the attributes).
     safety_signature: Union[str, None] = field(default=None)
     safety_signature_timestamp: Union[str, None] = field(default=None)
@@ -1509,6 +1512,15 @@ class Program(L5xElement):
             return base
         idx = base.index(">")
         return base[:idx + 1] + prefix + base[idx + 1:]
+
+
+@dataclass
+class ChildProgram(L5xElement):
+    name: str
+
+    def __post_init__(self):
+        super().__post_init__()
+        self._export_name = "ChildProgram"
 
 
 @dataclass
@@ -5214,6 +5226,44 @@ class ControllerBuilder(L5xElementBuilder):
             programs.append(
                 ProgramBuilder(self._cur, _program_object_id, data_types_map, redundancy_enabled, _short_header=self._short_header, _taginfo_layout=self._taginfo_layout, _acd_major=self._acd_major, _alarm_map=alarm_map, _short_routine_desc=short_routine_desc, _faithful=self._faithful).build()
             )
+
+        # <ChildPrograms> name index: a child program's record head u32
+        # (record[0:4]) is the object id of its PARENT program's nested
+        # RxProgramCollection (top-level programs carry the controller-level
+        # collection oid there). Purely additive: a head that resolves to
+        # neither collection attaches nothing (today's output).
+        try:
+            _prog_oids = [r[1] for r in results]
+            _nested_owner: Dict[int, int] = {}   # nested collection oid -> program oid
+            for _poid in _prog_oids:
+                _nrow = self._cur.execute(
+                    "SELECT object_id FROM comps WHERE parent_id=? "
+                    "AND comp_name='RxProgramCollection'", (_poid,)).fetchone()
+                if _nrow:
+                    _nested_owner[_nrow[0]] = _poid
+            _by_oid = dict(zip(_prog_oids, programs))
+            _pending: Dict[int, list] = {}   # parent oid -> [(order key, name)]
+            for _poid, _prog in zip(_prog_oids, programs):
+                _rrow = self._cur.execute(
+                    "SELECT record FROM comps WHERE object_id=?",
+                    (_poid,)).fetchone()
+                if not _rrow or _rrow[0] is None or len(bytes(_rrow[0])) < 8:
+                    continue
+                _rec = bytes(_rrow[0])
+                _head = struct.unpack_from("<I", _rec, 0)[0]
+                _owner_oid = _nested_owner.get(_head)
+                if _owner_oid is None or _owner_oid not in _by_oid:
+                    continue
+                # Sibling order key: the u16 at record offset 6 ascends in the
+                # reference's ChildPrograms order (validated on every affected
+                # file of both pools).
+                _pending.setdefault(_owner_oid, []).append(
+                    (struct.unpack_from("<H", _rec, 6)[0], _prog.name))
+            for _owner_oid, _kids in _pending.items():
+                _by_oid[_owner_oid].child_programs = [
+                    ChildProgram(_n, _n) for _, _n in sorted(_kids)]
+        except Exception:
+            pass
 
         # Build comment_id → program name map for task scheduled-program resolution.
         # comment_id is a u16 at BLOB offset 0x0C in each program's RxGeneric record.
