@@ -1,9 +1,11 @@
-"""Render the ``<Data Format="Axis">`` block for an AXIS_CIP_DRIVE tag.
+"""Render the ``<Data Format="Axis">`` block for a drive-axis tag.
 
 The axis config image (attr 0x01 of the cip-0x6a backing, body_mode) is a flat
-fixed-offset struct keyed by its byte length. This renders the length-5965
-generation, reverse-engineered and validated byte-exact against the OEM export
-on every 5965 CIP axis of two independent test pools (see
+fixed-offset struct keyed by its byte length and SHARED across axis datatypes
+(the datatype only decides which attributes the L5X emits). This renders the
+length-5965 generation for AXIS_CIP_DRIVE and AXIS_SERVO_DRIVE,
+reverse-engineered and validated byte-exact against the OEM export on every
+5965 axis of two independent test pools (see
 acd/docs/motion-axis-data-status.md and the tracer round-trip).
 
 Three data-driven parts, all in ``axis_cip_data.json``:
@@ -12,12 +14,15 @@ Three data-driven parts, all in ``axis_cip_data.json``:
     rotary/linear type; two feedback/test fields are corpus-constant);
   * the EMIT-SET: which attributes a given axis emits, read from the config's
     capability bitmap in the blob (bits that gate feature groups) plus
-    content-presence for the variable-length list, keyed on AxisConfiguration;
+    content-presence gates (u16 fields populated only when the feature's data
+    exists), keyed per datatype on a profile attribute (AxisConfiguration for
+    CIP drives, ServoLoopConfiguration for servo drives);
   * the global emit ORDER.
 
-Fail-closed: any unrecognised length, AxisConfiguration, enum code, unresolved
-MotionModule, or ambiguous derivation returns None, so the tag keeps its prior
-no-<Data> output (element_missing) rather than emit a wrong (net-worse) block.
+Fail-closed: any unrecognised length, datatype, profile value, enum code,
+unresolved MotionModule, or ambiguous derivation returns None, so the tag
+keeps its prior no-<Data> output (element_missing) rather than emit a wrong
+(net-worse) block.
 """
 import html
 import json
@@ -138,8 +143,9 @@ def _emit_set(b, D, cfg_model):
     return out
 
 
-def render_axis_cip_drive(blob, group_name, modid_to_name):
-    """Full ``<Data Format="Axis">`` block for a CIP-drive axis, or None.
+def render_axis_cip_drive(blob, group_name, modid_to_name,
+                          data_type="AXIS_CIP_DRIVE"):
+    """Full ``<Data Format="Axis">`` block for a drive axis, or None.
 
     None on any unrecognised/unreconstructable condition, so the caller keeps
     the tag's prior no-<Data> output (0-worse).
@@ -149,10 +155,14 @@ def render_axis_cip_drive(blob, group_name, modid_to_name):
         b = bytes(blob)
         if len(b) != D["len"]:
             return None
-        acfg = D["enum_vocab"].get("AxisConfiguration", {}).get(
-            struct.unpack_from(_INT[D["attrs"]["AxisConfiguration"]["w"]], b,
-                               D["attrs"]["AxisConfiguration"]["off"])[0])
-        cfg_model = D["emitset"].get(acfg)
+        dt_model = D["emitset"].get(data_type)
+        key_attr = D["emitset_key"].get(data_type)
+        if dt_model is None or key_attr is None:
+            return None
+        profile = D["enum_vocab"].get(key_attr, {}).get(
+            struct.unpack_from(_INT[D["attrs"][key_attr]["w"]], b,
+                               D["attrs"][key_attr]["off"])[0])
+        cfg_model = dt_model.get(profile)
         if cfg_model is None:
             return None
         emit = _emit_set(b, D, cfg_model)

@@ -5608,12 +5608,13 @@ class ControllerBuilder(L5xElementBuilder):
             except Exception:
                 pass
 
-        # AXIS_VIRTUAL tags carry a <Data Format="Axis"> block whose value image
-        # is attr 0x01 of the cip-0x6a backing (not 0x66); MotionGroup resolves
-        # against every MOTION_GROUP tag, so this runs post-build. Only
-        # AXIS_VIRTUAL is emitted -- the other axis datatypes (SERVO/SERVO_DRIVE/
-        # CIP_DRIVE) carry attributes that cannot be byte-reproduced and stay
-        # element_missing rather than go net-worse.
+        # Axis tags carry a <Data Format="Axis"> block whose value image is
+        # attr 0x01 of the cip-0x6a backing (not 0x66); MotionGroup resolves
+        # against every MOTION_GROUP tag, so this runs post-build. AXIS_VIRTUAL
+        # renders at every fitting blob length; AXIS_CIP_DRIVE/AXIS_SERVO_DRIVE
+        # render through the length-keyed schema in axis_cip.py (fail-closed:
+        # unrecognised lengths/profiles keep element_missing rather than go
+        # net-worse).
         try:
             _ax_tags = list(tags)
             for _prog in programs:
@@ -5632,7 +5633,8 @@ class ControllerBuilder(L5xElementBuilder):
             _modid_name = getattr(self, "_modid_to_name", {}) or {}
             for _at in _ax_tags:
                 _adt = (_at.data_type or "").upper()
-                if (_adt not in ("AXIS_VIRTUAL", "AXIS_CIP_DRIVE")
+                if (_adt not in ("AXIS_VIRTUAL", "AXIS_CIP_DRIVE",
+                                 "AXIS_SERVO_DRIVE")
                         or _at.tag_type == "Alias"):
                     continue
                 _br = self._cur.execute(
@@ -5653,7 +5655,7 @@ class ControllerBuilder(L5xElementBuilder):
                     _at._axis_data_xml = _render_axis_virtual(_blob, _gname)
                 else:
                     _at._axis_data_xml = _render_axis_cip_drive(
-                        _blob, _gname, _modid_name)
+                        _blob, _gname, _modid_name, _adt)
         except Exception:
             pass
 

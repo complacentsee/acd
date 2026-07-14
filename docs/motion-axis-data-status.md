@@ -18,9 +18,17 @@ length-5965 generation via a motion tracer round-trip + reverse-engineering:
   unrecognised length/config/enum/module → no `<Data>`, 0-worse). Both pools
   improved with zero files worse.
 
+UPDATE: AXIS_SERVO_DRIVE length-5965 now also LANDED on the same schema (the
+blob is the same struct; the datatype only changes the emit profile). Servo
+adds enum codes never seen on CIP axes (conflict-checked vocab extensions), a
+content-presence gate (a u16 field populated only when the amplifier data
+exists) for the amplifier attribute group, and per-datatype emit-profile
+keying (AxisConfiguration for CIP, ServoLoopConfiguration for servo).
+Validated byte-exact on every servo-5965 axis; CIP-5965 output unchanged.
+
 FOLLOW-UPS (not yet done): other CIP lengths (5843/5476/3666/3654 — header offsets
-transfer, need per-length tail + emit-set validation); AXIS_SERVO_DRIVE 5965 (same
-struct, should ride the CIP schema); MOTION_GROUP <Data>. See
+transfer, need per-length tail + emit-set validation); AXIS_SERVO_DRIVE 3430
+(different, smaller struct); MOTION_GROUP <Data>. See
 plans/motion-cip-drive-implementation.md.
 
 ## Summary
@@ -29,7 +37,7 @@ plans/motion-cip-drive-implementation.md.
 | --- | --- | --- |
 | `AXIS_VIRTUAL` | **Yes**, all fitting blob lengths | `_render_axis_virtual`; every field read from the blob, nothing hardcoded |
 | `AXIS_CIP_DRIVE` | No — documented floor | ~63% of fields decode; blocked by pool-invariant fields (below) |
-| `AXIS_SERVO_DRIVE` | No — documented floor | same struct/family as CIP_DRIVE |
+| `AXIS_SERVO_DRIVE` | **Yes at length 5965** | same struct as CIP_DRIVE, servo emit profile; other lengths held |
 | `MOTION_GROUP` | No — documented floor | `MotionGroupParameters`; same class of pool-invariant blocker |
 
 `AXIS_VIRTUAL` is fully handled. The drive axes and the motion group are **held
