@@ -1662,6 +1662,8 @@ class Controller(L5xElement):
     # Pre-rendered attribute string for the <SafetyInfo> open tag (recovered from the
     # SafetyController record); "" on a non-safety project -> empty <SafetyInfo/>.
     _safety_info_attrs: str = field(default="")
+    # <SafetyTagMap> body text (" a=b, c=d" form); None omits the child.
+    _safety_tag_map: Union[str, None] = field(default=None)
     # Pre-rendered <AlarmDefinitions> element (per-datatype member alarm
     # definitions); "" when the project defines none.
     _alarm_definitions: str = field(default="")
@@ -1740,6 +1742,11 @@ class Controller(L5xElement):
         children on a safety-signed project, in the reference's sibling order; an
         unsigned project keeps the empty self-closing form."""
         children = ""
+        if self._safety_tag_map:
+            # The tag map precedes the signature children in the reference.
+            children += ("<SafetyTagMap>"
+                         + html.escape(_xml_sane(self._safety_tag_map))
+                         + "</SafetyTagMap>")
         for tag, pair in (
             ("RootSignature", self._root_signature),
             ("ControllerAttributesSignature", self._ctrl_attr_signature),
@@ -5781,8 +5788,61 @@ class ControllerBuilder(L5xElementBuilder):
         app_rollup_sig = _named_sig(142, "")
         safety_info_attrs = _safety_info_attr_string(self._cur, self._short_header)
         alarm_definitions = _alarm_definitions_xml(self._cur, self._short_header)
+        safety_tag_map = self._safety_tag_map_text()
         return (root_sig, ctrl_attr_sig, tag_map_sig, app_rollup_sig, safety_info_attrs,
-                alarm_definitions)
+                alarm_definitions, safety_tag_map)
+
+    def _safety_tag_map_text(self):
+        # <SafetyTagMap> body: the SafetyTask owns ONE nameless kind-0x899
+        # record holding an ordered u32 list of kind-0x89b pair records; each
+        # pair's two '@%08x@' UTF-16 strings are the standard/safety tag object
+        # ids. Fail-closed: anything unresolvable (or 2+ structurally valid
+        # lists) withholds the element (today's output). Validated byte-exact,
+        # including pair order, on every emitting file of both pools.
+        try:
+            _hexstr = re.compile(rb"\x40\x00((?:[0-9a-f]\x00){8})\x40\x00")
+            _oid2name = {o: n for o, n in self._cur.execute(
+                "SELECT object_id, comp_name FROM comps")}
+            _nameless = {o: (p, bytes(r)) for o, p, r in self._cur.execute(
+                "SELECT object_id, parent_id, record FROM nameless")
+                if r is not None}
+            _valid = []
+            for _noid, (_pid, _b) in _nameless.items():
+                if len(_b) < 20 or struct.unpack_from("<I", _b, 16)[0] != 0x899:
+                    continue
+                _off = 20
+                if len(_b) >= _off + 4 and _b[_off:_off + 4] == b"\xff\xff\xff\xff":
+                    _off += 4
+                if len(_b) < _off + 2:
+                    continue
+                _count = struct.unpack_from("<H", _b, _off)[0]
+                _off += 2
+                if _count == 0 or len(_b) < _off + 4 * _count:
+                    continue
+                _pairs = []
+                for _i in range(_count):
+                    _poid = struct.unpack_from("<I", _b, _off + 4 * _i)[0]
+                    _ent = _nameless.get(_poid)
+                    if _ent is None:
+                        break
+                    _pb = _ent[1]
+                    if len(_pb) < 20 or struct.unpack_from("<I", _pb, 16)[0] != 0x89b:
+                        break
+                    _hx = _hexstr.findall(_pb)
+                    if len(_hx) != 2:
+                        break
+                    _names = [_oid2name.get(int(_h.decode("utf-16-le"), 16))
+                              for _h in _hx]
+                    if None in _names:
+                        break
+                    _pairs.append("%s=%s" % (_names[0], _names[1]))
+                else:
+                    _valid.append(_pairs)
+            if len(_valid) != 1:
+                return None
+            return " " + ", ".join(_valid[0])
+        except Exception:
+            return None
 
     def build(self) -> Controller:
         # The root controller is the named FAFA component at parent_id=0 /
@@ -5866,7 +5926,7 @@ class ControllerBuilder(L5xElementBuilder):
         self._pass_message_alarm_data(tags, programs, modules)
         self._pass_motion_sync(tags, programs, modules)
         (root_sig, ctrl_attr_sig, tag_map_sig, app_rollup_sig, safety_info_attrs,
-         alarm_definitions) = self._pass_safety_info()
+         alarm_definitions, safety_tag_map) = self._pass_safety_info()
 
         controller = Controller(
             controller_name,
@@ -5928,6 +5988,7 @@ class ControllerBuilder(L5xElementBuilder):
             _app_rollup_signature=app_rollup_sig,
             _safety_info_attrs=safety_info_attrs,
             _alarm_definitions=alarm_definitions,
+            _safety_tag_map=safety_tag_map,
         )
         # Controller-scoped <Tags> safety signature (separate from the AOI-section one).
         if _ctrl_tags_sig:
