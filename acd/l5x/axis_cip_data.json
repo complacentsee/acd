@@ -2016,6 +2016,1909 @@
     }
    }
   },
+  "3666": {
+   "attrs": {
+    "AccelerationFeedforwardGain": {
+     "off": 378,
+     "render": "float"
+    },
+    "AccelerationLimit": {
+     "off": 2245,
+     "render": "float"
+    },
+    "ActuatorDiameter": {
+     "off": 3308,
+     "render": "float"
+    },
+    "ActuatorDiameterUnit": {
+     "off": 3312,
+     "render": "enum",
+     "w": 1
+    },
+    "ActuatorLead": {
+     "off": 3303,
+     "render": "float"
+    },
+    "ActuatorLeadUnit": {
+     "off": 3307,
+     "render": "enum",
+     "w": 1
+    },
+    "ActuatorType": {
+     "off": 3302,
+     "render": "enum",
+     "w": 1
+    },
+    "AdaptiveTuningConfiguration": {
+     "off": 3478,
+     "render": "enum",
+     "w": 1
+    },
+    "ApplicationType": {
+     "off": 2111,
+     "render": "enum",
+     "w": 1
+    },
+    "AverageVelocityTimebase": {
+     "off": 192,
+     "render": "float"
+    },
+    "AxisConfiguration": {
+     "off": 1904,
+     "render": "enum",
+     "w": 1
+    },
+    "AxisID": {
+     "off": 3386,
+     "render": "int",
+     "w": 4
+    },
+    "AxisUpdateSchedule": {
+     "off": 3440,
+     "render": "enum",
+     "w": 1
+    },
+    "BacklashCompensationWindow": {
+     "off": 2596,
+     "render": "enum",
+     "w": 4
+    },
+    "BacklashReversalOffset": {
+     "off": 1105,
+     "render": "enum",
+     "w": 4
+    },
+    "BrakeSlipTolerance": {
+     "off": 3454,
+     "render": "enum",
+     "w": 4
+    },
+    "BrakeTestTorque": {
+     "off": 3446,
+     "render": "enum",
+     "w": 4
+    },
+    "BusOvervoltageOperationalLimit": {
+     "off": 3650,
+     "render": "float"
+    },
+    "CIPAxisExceptionAction": {
+     "K": 64,
+     "off": 2469,
+     "render": "tokarr"
+    },
+    "CIPAxisExceptionActionRA": {
+     "K": 64,
+     "off": 2660,
+     "render": "tokarr"
+    },
+    "CoastingTimeLimit": {
+     "off": 3517,
+     "render": "enum",
+     "w": 4
+    },
+    "CommutationOffset": {
+     "off": 3235,
+     "render": "float"
+    },
+    "CommutationPolarity": {
+     "off": 3360,
+     "render": "enum",
+     "w": 1
+    },
+    "CommutationSelfSensingCurrent": {
+     "off": 2621,
+     "render": "enum",
+     "w": 4
+    },
+    "ConversionConstant": {
+     "off": 196,
+     "render": "float"
+    },
+    "ConverterCapacity": {
+     "off": 2435,
+     "render": "float"
+    },
+    "CurrentError": {
+     "off": 2333,
+     "render": "enum",
+     "w": 4
+    },
+    "CurrentVectorLimit": {
+     "off": 3356,
+     "render": "float"
+    },
+    "CyclicReadUpdateList": {
+     "codesoff": 1915,
+     "countoff": 1913,
+     "render": "u16list"
+    },
+    "CyclicWriteUpdateList": {
+     "codesoff": 1967,
+     "countoff": 1965,
+     "render": "u16list"
+    },
+    "DampingFactor": {
+     "off": 469,
+     "render": "float"
+    },
+    "DecelerationLimit": {
+     "off": 2249,
+     "render": "float"
+    },
+    "DriveModelTimeConstant": {
+     "off": 485,
+     "render": "float"
+    },
+    "DriveModelTimeConstantBase": {
+     "off": 3317,
+     "render": "float"
+    },
+    "DriveRatedPeakCurrent": {
+     "off": 3321,
+     "render": "float"
+    },
+    "DynamicsConfigurationBits": {
+     "off": 1182,
+     "render": "int",
+     "w": 4
+    },
+    "Feedback1AccelFilterBandwidth": {
+     "off": 2907,
+     "render": "enum",
+     "w": 4
+    },
+    "Feedback1AccelFilterTaps": {
+     "off": 2961,
+     "render": "int",
+     "w": 1
+    },
+    "Feedback1CycleInterpolation": {
+     "off": 2881,
+     "render": "int",
+     "w": 2
+    },
+    "Feedback1CycleResolution": {
+     "off": 2877,
+     "render": "int",
+     "w": 4
+    },
+    "Feedback1Polarity": {
+     "off": 2875,
+     "render": "enum",
+     "w": 1
+    },
+    "Feedback1StartupMethod": {
+     "off": 2876,
+     "render": "enum",
+     "w": 1
+    },
+    "Feedback1Turns": {
+     "off": 3215,
+     "render": "int",
+     "w": 2
+    },
+    "Feedback1Type": {
+     "off": 2874,
+     "render": "enum",
+     "w": 1
+    },
+    "Feedback1Unit": {
+     "render": "derive_motor_unit"
+    },
+    "Feedback1VelocityFilterBandwidth": {
+     "off": 2903,
+     "render": "float"
+    },
+    "Feedback1VelocityFilterTaps": {
+     "off": 2959,
+     "render": "int",
+     "w": 1
+    },
+    "Feedback2AccelFilterBandwidth": {
+     "off": 3173,
+     "render": "enum",
+     "w": 4
+    },
+    "Feedback2AccelFilterTaps": {
+     "off": 3180,
+     "render": "int",
+     "w": 2
+    },
+    "Feedback2CycleInterpolation": {
+     "off": 3147,
+     "render": "int",
+     "w": 2
+    },
+    "Feedback2CycleResolution": {
+     "off": 3143,
+     "render": "int",
+     "w": 4
+    },
+    "Feedback2Polarity": {
+     "off": 3141,
+     "render": "enum",
+     "w": 1
+    },
+    "Feedback2StartupMethod": {
+     "off": 3142,
+     "render": "enum",
+     "w": 1
+    },
+    "Feedback2Type": {
+     "off": 3140,
+     "render": "enum",
+     "w": 1
+    },
+    "Feedback2Unit": {
+     "render": "derive_motor_unit"
+    },
+    "Feedback2VelocityFilterBandwidth": {
+     "off": 3169,
+     "render": "float"
+    },
+    "Feedback2VelocityFilterTaps": {
+     "off": 3178,
+     "render": "int",
+     "w": 2
+    },
+    "FeedbackCommutationAligned": {
+     "render": "const",
+     "value": "Motor Offset"
+    },
+    "FeedbackConfiguration": {
+     "off": 3328,
+     "render": "enum",
+     "w": 1
+    },
+    "FeedbackDataLossUserLimit": {
+     "off": 2559,
+     "render": "int",
+     "w": 1
+    },
+    "FeedbackSignalLossUserLimit": {
+     "off": 2555,
+     "render": "enum",
+     "w": 4
+    },
+    "FeedbackUnitRatio": {
+     "off": 1909,
+     "render": "float"
+    },
+    "FluxCurrentReference": {
+     "off": 2329,
+     "render": "enum",
+     "w": 4
+    },
+    "FrictionCompensationSliding": {
+     "off": 2273,
+     "render": "enum",
+     "w": 4
+    },
+    "FrictionCompensationStatic": {
+     "off": 2277,
+     "render": "enum",
+     "w": 4
+    },
+    "FrictionCompensationViscous": {
+     "off": 2281,
+     "render": "enum",
+     "w": 4
+    },
+    "FrictionCompensationWindow": {
+     "off": 1101,
+     "render": "enum",
+     "w": 4
+    },
+    "GainTuningConfigurationBits": {
+     "off": 3247,
+     "render": "hex",
+     "w": 2
+    },
+    "HomeConfigurationBits": {
+     "off": 208,
+     "render": "hex",
+     "w": 4
+    },
+    "HomeDirection": {
+     "off": 206,
+     "render": "enum",
+     "w": 1
+    },
+    "HomeMode": {
+     "off": 205,
+     "render": "enum",
+     "w": 1
+    },
+    "HomeOffset": {
+     "off": 216,
+     "render": "float"
+    },
+    "HomePosition": {
+     "off": 212,
+     "render": "float"
+    },
+    "HomeReturnSpeed": {
+     "off": 224,
+     "render": "float"
+    },
+    "HomeSequence": {
+     "off": 207,
+     "render": "enum",
+     "w": 1
+    },
+    "HomeSpeed": {
+     "off": 220,
+     "render": "float"
+    },
+    "HookupTestDistance": {
+     "off": 3329,
+     "render": "float"
+    },
+    "HookupTestFeedbackChannel": {
+     "gated": "FeedbackConfiguration",
+     "render": "const",
+     "value": "Feedback 1"
+    },
+    "InterpolatedPositionConfiguration": {
+     "off": 3426,
+     "render": "hex",
+     "w": 4
+    },
+    "InverterCapacity": {
+     "off": 2431,
+     "render": "float"
+    },
+    "InverterOverloadAction": {
+     "off": 2440,
+     "render": "enum",
+     "w": 1
+    },
+    "InverterThermalOverloadUserLimit": {
+     "off": 2547,
+     "render": "enum",
+     "w": 4
+    },
+    "LoadCoupling": {
+     "off": 3343,
+     "render": "enum",
+     "w": 1
+    },
+    "LoadInertiaRatio": {
+     "off": 1149,
+     "render": "float"
+    },
+    "LoadObserverBandwidth": {
+     "off": 3370,
+     "render": "float"
+    },
+    "LoadObserverConfiguration": {
+     "off": 3369,
+     "render": "enum",
+     "w": 1
+    },
+    "LoadObserverFeedbackGain": {
+     "off": 3378,
+     "render": "float"
+    },
+    "LoadObserverIntegratorBandwidth": {
+     "off": 3374,
+     "render": "float"
+    },
+    "LoadRatio": {
+     "off": 3195,
+     "render": "float"
+    },
+    "LoadType": {
+     "off": 3293,
+     "render": "enum",
+     "w": 1
+    },
+    "LoopResponse": {
+     "off": 2112,
+     "render": "enum",
+     "w": 1
+    },
+    "MasterInputConfigurationBits": {
+     "off": 1129,
+     "render": "int",
+     "w": 1
+    },
+    "MasterPositionFilterBandwidth": {
+     "off": 1133,
+     "render": "float"
+    },
+    "MaximumAcceleration": {
+     "off": 232,
+     "render": "float"
+    },
+    "MaximumAccelerationJerk": {
+     "off": 1174,
+     "render": "float"
+    },
+    "MaximumDeceleration": {
+     "off": 236,
+     "render": "float"
+    },
+    "MaximumDecelerationJerk": {
+     "off": 1178,
+     "render": "float"
+    },
+    "MaximumSpeed": {
+     "off": 228,
+     "render": "float"
+    },
+    "MechanicalBrakeControl": {
+     "off": 2416,
+     "render": "enum",
+     "w": 1
+    },
+    "MechanicalBrakeEngageDelay": {
+     "off": 2421,
+     "render": "float"
+    },
+    "MechanicalBrakeReleaseDelay": {
+     "off": 2417,
+     "render": "float"
+    },
+    "MotionExceptionAction": {
+     "K": 32,
+     "off": 3102,
+     "render": "tokarr"
+    },
+    "MotionModule": {
+     "chan_off": 16,
+     "id_off": 12,
+     "id_w": 2,
+     "n_present": 218,
+     "note": "modid u16LE@12 + chan u8@16 -> NAME resolved from external module table (not in blob)",
+     "render": "xref_name",
+     "source": "blocker"
+    },
+    "MotionPolarity": {
+     "off": 2076,
+     "render": "enum",
+     "w": 1
+    },
+    "MotionResolution": {
+     "off": 2072,
+     "render": "int",
+     "w": 4
+    },
+    "MotionScalingConfiguration": {
+     "off": 2736,
+     "render": "enum",
+     "w": 1
+    },
+    "MotorCatalogNumber": {
+     "lenoff": 3053,
+     "off": 3055,
+     "render": "ascii"
+    },
+    "MotorDataSource": {
+     "off": 2730,
+     "render": "enum",
+     "w": 1
+    },
+    "MotorDeviceCode": {
+     "off": 2731,
+     "render": "hex",
+     "w": 4
+    },
+    "MotorIntegralThermalSwitch": {
+     "off": 2758,
+     "render": "enum",
+     "w": 1
+    },
+    "MotorMaxWindingTemperature": {
+     "off": 2759,
+     "render": "float"
+    },
+    "MotorOverloadAction": {
+     "off": 2439,
+     "render": "enum",
+     "w": 1
+    },
+    "MotorOverloadLimit": {
+     "off": 2754,
+     "render": "float"
+    },
+    "MotorOverspeedUserLimit": {
+     "off": 2539,
+     "render": "float"
+    },
+    "MotorPolarity": {
+     "off": 2737,
+     "render": "enum",
+     "w": 1
+    },
+    "MotorRatedContinuousCurrent": {
+     "off": 2742,
+     "render": "float"
+    },
+    "MotorRatedOutputPower": {
+     "off": 2750,
+     "render": "float"
+    },
+    "MotorRatedPeakCurrent": {
+     "off": 2746,
+     "render": "float"
+    },
+    "MotorRatedVoltage": {
+     "off": 2738,
+     "render": "float"
+    },
+    "MotorTestInductance": {
+     "off": 2085,
+     "render": "enum",
+     "w": 4
+    },
+    "MotorTestResistance": {
+     "off": 2081,
+     "render": "enum",
+     "w": 4
+    },
+    "MotorThermalOverloadUserLimit": {
+     "off": 2543,
+     "render": "enum",
+     "w": 4
+    },
+    "MotorType": {
+     "off": 2735,
+     "render": "enum",
+     "w": 1
+    },
+    "MotorUnit": {
+     "render": "derive_motor_unit"
+    },
+    "MotorWindingToAmbientCapacitance": {
+     "off": 2763,
+     "render": "float"
+    },
+    "MotorWindingToAmbientResistance": {
+     "off": 2767,
+     "render": "float"
+    },
+    "OutputCamExecutionTargets": {
+     "off": 1055,
+     "render": "int",
+     "w": 1
+    },
+    "OvertorqueLimit": {
+     "off": 2297,
+     "render": "float"
+    },
+    "OvertorqueLimitTime": {
+     "off": 2301,
+     "render": "float"
+    },
+    "PMMotorFluxSaturation": {
+     "K": 8,
+     "off": 2917,
+     "render": "farr"
+    },
+    "PMMotorInductance": {
+     "off": 2775,
+     "render": "float"
+    },
+    "PMMotorRatedTorque": {
+     "off": 2817,
+     "render": "float"
+    },
+    "PMMotorResistance": {
+     "off": 2771,
+     "render": "float"
+    },
+    "PMMotorRotaryVoltageConstant": {
+     "off": 2825,
+     "render": "float"
+    },
+    "PMMotorTorqueConstant": {
+     "off": 2821,
+     "render": "float"
+    },
+    "PositionErrorTolerance": {
+     "off": 419,
+     "render": "float"
+    },
+    "PositionErrorToleranceTime": {
+     "off": 2179,
+     "render": "float"
+    },
+    "PositionIntegratorBandwidth": {
+     "off": 2175,
+     "render": "enum",
+     "w": 4
+    },
+    "PositionIntegratorControl": {
+     "off": 2183,
+     "render": "int",
+     "w": 1
+    },
+    "PositionLeadLagFilterBandwidth": {
+     "off": 2580,
+     "render": "enum",
+     "w": 4
+    },
+    "PositionLeadLagFilterGain": {
+     "off": 2584,
+     "render": "enum",
+     "w": 4
+    },
+    "PositionLockTolerance": {
+     "off": 423,
+     "render": "float"
+    },
+    "PositionLoopBandwidth": {
+     "off": 2171,
+     "render": "float"
+    },
+    "PositionNotchFilterFrequency": {
+     "render": "const",
+     "value": "0.0"
+    },
+    "PositionScalingDenominator": {
+     "off": 2055,
+     "render": "float"
+    },
+    "PositionScalingNumerator": {
+     "off": 2051,
+     "render": "float"
+    },
+    "PositionServoBandwidth": {
+     "off": 473,
+     "render": "float"
+    },
+    "PositionUnits": {
+     "lenoff": 158,
+     "off": 160,
+     "render": "ascii"
+    },
+    "PositionUnwind": {
+     "off": 201,
+     "render": "int",
+     "w": 4
+    },
+    "PositionUnwindDenominator": {
+     "off": 2063,
+     "render": "float"
+    },
+    "PositionUnwindNumerator": {
+     "off": 2059,
+     "render": "float"
+    },
+    "ProgrammedStopMode": {
+     "off": 240,
+     "render": "enum",
+     "w": 1
+    },
+    "ProvingConfiguration": {
+     "off": 3441,
+     "render": "enum",
+     "w": 1
+    },
+    "RegistrationInputs": {
+     "off": 1171,
+     "render": "int",
+     "w": 1
+    },
+    "ResistiveBrakeContactDelay": {
+     "render": "const",
+     "value": "0.0"
+    },
+    "RotaryMotorInertia": {
+     "off": 2781,
+     "render": "float"
+    },
+    "RotaryMotorMaxSpeed": {
+     "off": 2789,
+     "render": "float"
+    },
+    "RotaryMotorPoles": {
+     "off": 2779,
+     "render": "int",
+     "w": 1
+    },
+    "RotaryMotorRatedSpeed": {
+     "off": 2785,
+     "render": "float"
+    },
+    "ScalingSource": {
+     "off": 2049,
+     "render": "enum",
+     "w": 1
+    },
+    "ShutdownAction": {
+     "render": "const",
+     "value": "Disable"
+    },
+    "SoftTravelLimitChecking": {
+     "off": 3099,
+     "render": "enum",
+     "w": 1
+    },
+    "SoftTravelLimitNegative": {
+     "off": 3211,
+     "render": "float"
+    },
+    "SoftTravelLimitPositive": {
+     "off": 3207,
+     "render": "float"
+    },
+    "StoppingAction": {
+     "off": 2415,
+     "render": "enum",
+     "w": 1
+    },
+    "StoppingTimeLimit": {
+     "off": 1039,
+     "render": "float"
+    },
+    "StoppingTorque": {
+     "off": 1035,
+     "render": "float"
+    },
+    "SystemAccelerationBase": {
+     "off": 3313,
+     "render": "float"
+    },
+    "SystemBandwidth": {
+     "off": 3243,
+     "render": "float"
+    },
+    "SystemDamping": {
+     "off": 3344,
+     "render": "float"
+    },
+    "SystemInertia": {
+     "off": 2269,
+     "render": "float"
+    },
+    "TorqueLeadLagFilterBandwidth": {
+     "off": 2600,
+     "render": "enum",
+     "w": 4
+    },
+    "TorqueLeadLagFilterGain": {
+     "off": 2604,
+     "render": "enum",
+     "w": 4
+    },
+    "TorqueLimitNegative": {
+     "off": 1025,
+     "render": "float"
+    },
+    "TorqueLimitPositive": {
+     "off": 1021,
+     "render": "float"
+    },
+    "TorqueLoopBandwidth": {
+     "off": 2349,
+     "render": "float"
+    },
+    "TorqueLowPassFilterBandwidth": {
+     "off": 2285,
+     "render": "float"
+    },
+    "TorqueNotchFilterFrequency": {
+     "off": 2289,
+     "render": "float"
+    },
+    "TorqueNotchFilterHighFrequencyLimit": {
+     "off": 3479,
+     "render": "float"
+    },
+    "TorqueNotchFilterLowFrequencyLimit": {
+     "off": 3483,
+     "render": "float"
+    },
+    "TorqueNotchFilterTuningThreshold": {
+     "off": 3487,
+     "render": "float"
+    },
+    "TorqueOffset": {
+     "off": 439,
+     "render": "enum",
+     "w": 4
+    },
+    "TorqueProveCurrent": {
+     "off": 3442,
+     "render": "enum",
+     "w": 4
+    },
+    "TorqueRateLimit": {
+     "off": 2293,
+     "render": "float"
+    },
+    "TorqueThreshold": {
+     "off": 1029,
+     "render": "float"
+    },
+    "TotalInertia": {
+     "off": 2105,
+     "render": "float"
+    },
+    "TransmissionRatioInput": {
+     "off": 3294,
+     "render": "int",
+     "w": 2
+    },
+    "TransmissionRatioOutput": {
+     "off": 3298,
+     "render": "int",
+     "w": 1
+    },
+    "TravelMode": {
+     "off": 2050,
+     "render": "enum",
+     "w": 1
+    },
+    "TravelRange": {
+     "off": 2067,
+     "render": "float"
+    },
+    "TuneFriction": {
+     "off": 2097,
+     "render": "float"
+    },
+    "TuneInertiaMass": {
+     "off": 3203,
+     "render": "float"
+    },
+    "TuneLoadOffset": {
+     "off": 2101,
+     "render": "float"
+    },
+    "TuningDirection": {
+     "off": 2110,
+     "render": "enum",
+     "w": 1
+    },
+    "TuningSelect": {
+     "off": 2109,
+     "render": "enum",
+     "w": 1
+    },
+    "TuningSpeed": {
+     "off": 461,
+     "render": "float"
+    },
+    "TuningTorque": {
+     "off": 465,
+     "render": "float"
+    },
+    "TuningTravelLimit": {
+     "off": 457,
+     "render": "float"
+    },
+    "UndertorqueLimit": {
+     "off": 2305,
+     "render": "float"
+    },
+    "UndertorqueLimitTime": {
+     "off": 2309,
+     "render": "enum",
+     "w": 4
+    },
+    "VelocityDroop": {
+     "off": 977,
+     "render": "enum",
+     "w": 4
+    },
+    "VelocityErrorTolerance": {
+     "off": 2216,
+     "render": "float"
+    },
+    "VelocityErrorToleranceTime": {
+     "off": 2220,
+     "render": "float"
+    },
+    "VelocityFeedforwardGain": {
+     "off": 374,
+     "render": "float"
+    },
+    "VelocityIntegratorBandwidth": {
+     "off": 2212,
+     "render": "float"
+    },
+    "VelocityIntegratorControl": {
+     "off": 2224,
+     "render": "int",
+     "w": 1
+    },
+    "VelocityLimitNegative": {
+     "off": 997,
+     "render": "float"
+    },
+    "VelocityLimitPositive": {
+     "off": 993,
+     "render": "float"
+    },
+    "VelocityLockTolerance": {
+     "off": 2233,
+     "render": "float"
+    },
+    "VelocityLoopBandwidth": {
+     "off": 2208,
+     "render": "float"
+    },
+    "VelocityLowPassFilterBandwidth": {
+     "off": 2229,
+     "render": "enum",
+     "w": 4
+    },
+    "VelocityNegativeFeedforwardGain": {
+     "off": 2592,
+     "render": "enum",
+     "w": 4
+    },
+    "VelocityOffset": {
+     "off": 435,
+     "render": "enum",
+     "w": 4
+    },
+    "VelocityServoBandwidth": {
+     "off": 477,
+     "render": "float"
+    },
+    "VelocityStandstillWindow": {
+     "off": 1009,
+     "render": "float"
+    },
+    "VelocityThreshold": {
+     "off": 1001,
+     "render": "float"
+    },
+    "ZeroSpeed": {
+     "off": 3466,
+     "render": "float"
+    },
+    "ZeroSpeedTime": {
+     "off": 3470,
+     "render": "float"
+    }
+   },
+   "emitset": {
+    "AXIS_CIP_DRIVE": {
+     "Position Loop": {
+      "always": [
+       "AccelerationFeedforwardGain",
+       "AccelerationLimit",
+       "ActuatorDiameter",
+       "ActuatorDiameterUnit",
+       "ActuatorLead",
+       "ActuatorLeadUnit",
+       "ActuatorType",
+       "ApplicationType",
+       "AverageVelocityTimebase",
+       "AxisConfiguration",
+       "AxisID",
+       "AxisUpdateSchedule",
+       "BacklashCompensationWindow",
+       "BacklashReversalOffset",
+       "BusOvervoltageOperationalLimit",
+       "CIPAxisExceptionAction",
+       "CIPAxisExceptionActionRA",
+       "CommutationOffset",
+       "ConversionConstant",
+       "ConverterCapacity",
+       "CurrentError",
+       "DampingFactor",
+       "DecelerationLimit",
+       "DriveModelTimeConstant",
+       "DriveModelTimeConstantBase",
+       "DriveRatedPeakCurrent",
+       "DynamicsConfigurationBits",
+       "Feedback1AccelFilterBandwidth",
+       "Feedback1AccelFilterTaps",
+       "Feedback1CycleInterpolation",
+       "Feedback1CycleResolution",
+       "Feedback1StartupMethod",
+       "Feedback1Turns",
+       "Feedback1Type",
+       "Feedback1Unit",
+       "Feedback1VelocityFilterBandwidth",
+       "Feedback1VelocityFilterTaps",
+       "FeedbackCommutationAligned",
+       "FeedbackConfiguration",
+       "FeedbackDataLossUserLimit",
+       "FluxCurrentReference",
+       "FrictionCompensationSliding",
+       "FrictionCompensationStatic",
+       "FrictionCompensationViscous",
+       "FrictionCompensationWindow",
+       "GainTuningConfigurationBits",
+       "HomeConfigurationBits",
+       "HomeDirection",
+       "HomeMode",
+       "HomeOffset",
+       "HomePosition",
+       "HomeReturnSpeed",
+       "HomeSequence",
+       "HomeSpeed",
+       "HookupTestDistance",
+       "HookupTestFeedbackChannel",
+       "InterpolatedPositionConfiguration",
+       "InverterCapacity",
+       "InverterOverloadAction",
+       "InverterThermalOverloadUserLimit",
+       "LoadCoupling",
+       "LoadInertiaRatio",
+       "LoadObserverBandwidth",
+       "LoadObserverConfiguration",
+       "LoadObserverFeedbackGain",
+       "LoadObserverIntegratorBandwidth",
+       "LoadRatio",
+       "LoadType",
+       "LoopResponse",
+       "MasterInputConfigurationBits",
+       "MasterPositionFilterBandwidth",
+       "MaximumAcceleration",
+       "MaximumAccelerationJerk",
+       "MaximumDeceleration",
+       "MaximumDecelerationJerk",
+       "MaximumSpeed",
+       "MechanicalBrakeControl",
+       "MechanicalBrakeEngageDelay",
+       "MechanicalBrakeReleaseDelay",
+       "MotionExceptionAction",
+       "MotionModule",
+       "MotionPolarity",
+       "MotionResolution",
+       "MotionScalingConfiguration",
+       "MotorCatalogNumber",
+       "MotorDataSource",
+       "MotorDeviceCode",
+       "MotorIntegralThermalSwitch",
+       "MotorOverloadAction",
+       "MotorOverloadLimit",
+       "MotorPolarity",
+       "MotorRatedContinuousCurrent",
+       "MotorRatedOutputPower",
+       "MotorRatedPeakCurrent",
+       "MotorRatedVoltage",
+       "MotorTestInductance",
+       "MotorTestResistance",
+       "MotorThermalOverloadUserLimit",
+       "MotorType",
+       "MotorUnit",
+       "MotorWindingToAmbientCapacitance",
+       "MotorWindingToAmbientResistance",
+       "OutputCamExecutionTargets",
+       "OvertorqueLimit",
+       "OvertorqueLimitTime",
+       "PMMotorFluxSaturation",
+       "PMMotorInductance",
+       "PMMotorRatedTorque",
+       "PMMotorResistance",
+       "PMMotorRotaryVoltageConstant",
+       "PMMotorTorqueConstant",
+       "PositionErrorTolerance",
+       "PositionErrorToleranceTime",
+       "PositionIntegratorBandwidth",
+       "PositionIntegratorControl",
+       "PositionLeadLagFilterBandwidth",
+       "PositionLeadLagFilterGain",
+       "PositionLockTolerance",
+       "PositionLoopBandwidth",
+       "PositionScalingDenominator",
+       "PositionScalingNumerator",
+       "PositionServoBandwidth",
+       "PositionUnits",
+       "PositionUnwind",
+       "PositionUnwindDenominator",
+       "PositionUnwindNumerator",
+       "ProgrammedStopMode",
+       "RegistrationInputs",
+       "RotaryMotorInertia",
+       "RotaryMotorMaxSpeed",
+       "RotaryMotorPoles",
+       "RotaryMotorRatedSpeed",
+       "ScalingSource",
+       "SoftTravelLimitChecking",
+       "SoftTravelLimitNegative",
+       "SoftTravelLimitPositive",
+       "StoppingAction",
+       "StoppingTimeLimit",
+       "StoppingTorque",
+       "SystemAccelerationBase",
+       "SystemBandwidth",
+       "SystemDamping",
+       "SystemInertia",
+       "TorqueLeadLagFilterBandwidth",
+       "TorqueLeadLagFilterGain",
+       "TorqueLimitNegative",
+       "TorqueLimitPositive",
+       "TorqueLoopBandwidth",
+       "TorqueLowPassFilterBandwidth",
+       "TorqueNotchFilterFrequency",
+       "TorqueOffset",
+       "TorqueRateLimit",
+       "TorqueThreshold",
+       "TotalInertia",
+       "TransmissionRatioInput",
+       "TransmissionRatioOutput",
+       "TravelMode",
+       "TravelRange",
+       "TuneFriction",
+       "TuneInertiaMass",
+       "TuneLoadOffset",
+       "TuningDirection",
+       "TuningSelect",
+       "TuningSpeed",
+       "TuningTorque",
+       "TuningTravelLimit",
+       "UndertorqueLimit",
+       "UndertorqueLimitTime",
+       "VelocityDroop",
+       "VelocityErrorTolerance",
+       "VelocityErrorToleranceTime",
+       "VelocityFeedforwardGain",
+       "VelocityIntegratorBandwidth",
+       "VelocityIntegratorControl",
+       "VelocityLimitNegative",
+       "VelocityLimitPositive",
+       "VelocityLockTolerance",
+       "VelocityLoopBandwidth",
+       "VelocityLowPassFilterBandwidth",
+       "VelocityNegativeFeedforwardGain",
+       "VelocityOffset",
+       "VelocityServoBandwidth",
+       "VelocityStandstillWindow",
+       "VelocityThreshold"
+      ],
+      "content": {
+       "CyclicReadUpdateList": 1913,
+       "CyclicWriteUpdateList": 1965
+      },
+      "groups": {
+       "AdaptiveTuningConfiguration": {
+        "attrs": [
+         "AdaptiveTuningConfiguration",
+         "BrakeSlipTolerance",
+         "BrakeTestTorque",
+         "CoastingTimeLimit",
+         "CurrentVectorLimit",
+         "MotorMaxWindingTemperature",
+         "MotorOverspeedUserLimit",
+         "ProvingConfiguration",
+         "TorqueNotchFilterHighFrequencyLimit",
+         "TorqueNotchFilterLowFrequencyLimit",
+         "TorqueNotchFilterTuningThreshold",
+         "TorqueProveCurrent",
+         "ZeroSpeed",
+         "ZeroSpeedTime"
+        ],
+        "gate": [
+         "bit",
+         2991,
+         3,
+         true
+        ]
+       },
+       "CommutationPolarity": {
+        "attrs": [
+         "CommutationPolarity",
+         "CommutationSelfSensingCurrent",
+         "Feedback1Polarity",
+         "FeedbackSignalLossUserLimit",
+         "FeedbackUnitRatio",
+         "PositionNotchFilterFrequency",
+         "ResistiveBrakeContactDelay",
+         "ShutdownAction"
+        ],
+        "gate": [
+         "bit",
+         2991,
+         3,
+         false
+        ]
+       },
+       "__content32_MotionGroup": {
+        "attrs": [
+         "MotionGroup"
+        ],
+        "gate": [
+         "u32nz",
+         1208
+        ]
+       },
+       "__content_Feedback2AccelFilterBandwidth": {
+        "attrs": [
+         "Feedback2AccelFilterBandwidth",
+         "Feedback2AccelFilterTaps",
+         "Feedback2CycleInterpolation",
+         "Feedback2CycleResolution",
+         "Feedback2Polarity",
+         "Feedback2StartupMethod",
+         "Feedback2Type",
+         "Feedback2Unit",
+         "Feedback2VelocityFilterBandwidth",
+         "Feedback2VelocityFilterTaps"
+        ],
+        "gate": [
+         "u16nz",
+         3140
+        ]
+       }
+      }
+     }
+    }
+   },
+   "emitset_key": {
+    "AXIS_CIP_DRIVE": "AxisConfiguration"
+   },
+   "enum_vocab": {
+    "ActuatorDiameterUnit": {
+     "0": "Millimeter",
+     "1": "Inch"
+    },
+    "ActuatorLeadUnit": {
+     "0": "Millimeter/Rev"
+    },
+    "ActuatorType": {
+     "0": "<none>",
+     "1": "Screw",
+     "2": "Belt and Pulley"
+    },
+    "AdaptiveTuningConfiguration": {
+     "0": "Disabled",
+     "1": "Tracking Notch",
+     "3": "Tracking Notch and Gain Stabilization"
+    },
+    "ApplicationType": {
+     "0": "Custom",
+     "1": "Basic",
+     "2": "Tracking",
+     "4": "Constant Speed"
+    },
+    "AxisConfiguration": {
+     "1": "Frequency Control",
+     "2": "Position Loop",
+     "3": "Velocity Loop",
+     "5": "Non-Regenerative AC/DC Converter"
+    },
+    "AxisUpdateSchedule": {
+     "0": "Base",
+     "2": "Alternate 2"
+    },
+    "BacklashCompensationWindow": {
+     "0": "0.0"
+    },
+    "BacklashReversalOffset": {
+     "0": "0.0"
+    },
+    "BrakeSlipTolerance": {
+     "0": "0.0"
+    },
+    "BrakeTestTorque": {
+     "0": "0.0"
+    },
+    "CoastingTimeLimit": {
+     "0": "0.0"
+    },
+    "CommutationPolarity": {
+     "0": "Normal"
+    },
+    "CommutationSelfSensingCurrent": {
+     "1120403456": "100.0"
+    },
+    "CurrentError": {
+     "0": "0.0"
+    },
+    "Feedback1AccelFilterBandwidth": {
+     "0": "0.0"
+    },
+    "Feedback1Polarity": {
+     "0": "Normal"
+    },
+    "Feedback1StartupMethod": {
+     "0": "Incremental",
+     "1": "Absolute"
+    },
+    "Feedback1Type": {
+     "1": "Digital AqB",
+     "12": "Hiperface DSL",
+     "6": "Hiperface"
+    },
+    "Feedback2AccelFilterBandwidth": {
+     "0": "0.0"
+    },
+    "Feedback2Polarity": {
+     "0": "Normal"
+    },
+    "Feedback2StartupMethod": {
+     "0": "Incremental",
+     "1": "Absolute"
+    },
+    "Feedback2Type": {
+     "1": "Digital AqB",
+     "12": "Hiperface DSL",
+     "6": "Hiperface"
+    },
+    "FeedbackConfiguration": {
+     "2": "Motor Feedback",
+     "3": "Load Feedback"
+    },
+    "FeedbackSignalLossUserLimit": {
+     "1120403456": "100.0"
+    },
+    "FluxCurrentReference": {
+     "0": "0.0"
+    },
+    "FrictionCompensationSliding": {
+     "0": "0.0"
+    },
+    "FrictionCompensationStatic": {
+     "0": "0.0"
+    },
+    "FrictionCompensationViscous": {
+     "0": "0.0"
+    },
+    "FrictionCompensationWindow": {
+     "0": "0.0"
+    },
+    "HomeDirection": {
+     "1": "Bi-directional Forward",
+     "2": "Uni-directional Reverse",
+     "3": "Bi-directional Reverse"
+    },
+    "HomeMode": {
+     "0": "Passive",
+     "1": "Active"
+    },
+    "HomeSequence": {
+     "0": "Immediate",
+     "2": "Marker"
+    },
+    "InverterOverloadAction": {
+     "0": "None"
+    },
+    "InverterThermalOverloadUserLimit": {
+     "1121714176": "110.0"
+    },
+    "LoadCoupling": {
+     "0": "Rigid",
+     "1": "Compliant"
+    },
+    "LoadObserverConfiguration": {
+     "0": "Disabled",
+     "2": "Load Observer with Velocity Estimate"
+    },
+    "LoadType": {
+     "0": "Direct Coupled Rotary",
+     "2": "Rotary Transmission",
+     "3": "Linear Actuator"
+    },
+    "LoopResponse": {
+     "0": "Low",
+     "1": "Medium",
+     "2": "High"
+    },
+    "MechanicalBrakeControl": {
+     "0": "Automatic"
+    },
+    "MotionPolarity": {
+     "0": "Normal",
+     "1": "Inverted"
+    },
+    "MotionScalingConfiguration": {
+     "0": "Control Scaling"
+    },
+    "MotorDataSource": {
+     "0": "Nameplate Datasheet",
+     "1": "Database"
+    },
+    "MotorIntegralThermalSwitch": {
+     "0": "false",
+     "1": "true"
+    },
+    "MotorOverloadAction": {
+     "0": "None"
+    },
+    "MotorPolarity": {
+     "0": "Normal",
+     "1": "Inverted"
+    },
+    "MotorTestInductance": {
+     "0": "0.0"
+    },
+    "MotorTestResistance": {
+     "0": "0.0"
+    },
+    "MotorThermalOverloadUserLimit": {
+     "1121714176": "110.0"
+    },
+    "MotorType": {
+     "1": "Rotary Permanent Magnet",
+     "2": "Rotary Induction"
+    },
+    "PositionIntegratorBandwidth": {
+     "0": "0.0"
+    },
+    "PositionLeadLagFilterBandwidth": {
+     "0": "0.0"
+    },
+    "PositionLeadLagFilterGain": {
+     "0": "0.0"
+    },
+    "ProgrammedStopMode": {
+     "0": "Fast Stop"
+    },
+    "ProvingConfiguration": {
+     "0": "Disabled"
+    },
+    "ScalingSource": {
+     "0": "From Calculator"
+    },
+    "SoftTravelLimitChecking": {
+     "0": "false",
+     "1": "true"
+    },
+    "StoppingAction": {
+     "0": "Disable Coast",
+     "1": "Current Decel Disable"
+    },
+    "TorqueLeadLagFilterBandwidth": {
+     "0": "0.0"
+    },
+    "TorqueLeadLagFilterGain": {
+     "1065353216": "1.0"
+    },
+    "TorqueOffset": {
+     "0": "0.0"
+    },
+    "TorqueProveCurrent": {
+     "0": "0.0"
+    },
+    "TravelMode": {
+     "0": "Unlimited",
+     "1": "Limited",
+     "2": "Cyclic"
+    },
+    "TuningDirection": {
+     "0": "Uni-directional Forward",
+     "2": "Bi-directional Forward"
+    },
+    "TuningSelect": {
+     "0": "Total Inertia",
+     "1": "Motor Inertia"
+    },
+    "UndertorqueLimitTime": {
+     "0": "0.0"
+    },
+    "VelocityDroop": {
+     "0": "0.0"
+    },
+    "VelocityLowPassFilterBandwidth": {
+     "0": "0.0"
+    },
+    "VelocityNegativeFeedforwardGain": {
+     "0": "0.0"
+    },
+    "VelocityOffset": {
+     "0": "0.0"
+    }
+   },
+   "list_vocab": {
+    "CyclicReadUpdateList": {
+     "131": "PositionError",
+     "134": "VelocityFeedback",
+     "135": "VelocityError",
+     "1402": "PositionFeedback1",
+     "1452": "PositionFeedback2",
+     "259": "MotorCapacity",
+     "262": "BusRegulatorCapacity",
+     "266": "DCBusVoltage",
+     "432": "PositionReference",
+     "453": "VelocityReference",
+     "492": "TorqueReference",
+     "495": "TorqueEstimate",
+     "529": "CurrentFeedback",
+     "600": "OutputFrequency",
+     "601": "OutputCurrent",
+     "602": "OutputVoltage",
+     "603": "OutputPower",
+     "605": "ConverterOutputCurrent",
+     "606": "ConverterOutputPower",
+     "636": "InverterCapacity",
+     "637": "ConverterCapacity",
+     "730": "DigitalInputs",
+     "791": "TorqueNotchFilterWidthEstimate",
+     "792": "TorqueNotchFilter2FrequencyEstimate",
+     "795": "TorqueNotchFilter3FrequencyEstimate",
+     "841": "TorqueNotchFilterFrequencyEstimate",
+     "842": "TorqueNotchFilterMagnitudeEstimate"
+    },
+    "CyclicWriteUpdateList": {
+     "131": "PositionError",
+     "134": "VelocityFeedback",
+     "135": "VelocityError",
+     "1402": "PositionFeedback1",
+     "1452": "PositionFeedback2",
+     "259": "MotorCapacity",
+     "262": "BusRegulatorCapacity",
+     "266": "DCBusVoltage",
+     "332": "TorqueLimitPositive",
+     "333": "TorqueLimitNegative",
+     "432": "PositionReference",
+     "453": "VelocityReference",
+     "492": "TorqueReference",
+     "495": "TorqueEstimate",
+     "529": "CurrentFeedback",
+     "600": "OutputFrequency",
+     "601": "OutputCurrent",
+     "602": "OutputVoltage",
+     "603": "OutputPower",
+     "605": "ConverterOutputCurrent",
+     "606": "ConverterOutputPower",
+     "636": "InverterCapacity",
+     "637": "ConverterCapacity",
+     "730": "DigitalInputs",
+     "791": "TorqueNotchFilterWidthEstimate",
+     "792": "TorqueNotchFilter2FrequencyEstimate",
+     "795": "TorqueNotchFilter3FrequencyEstimate",
+     "841": "TorqueNotchFilterFrequencyEstimate",
+     "842": "TorqueNotchFilterMagnitudeEstimate"
+    }
+   },
+   "motor_unit_map": {
+    "Rotary Induction": [
+     "Rev"
+    ],
+    "Rotary Permanent Magnet": [
+     "Rev"
+    ]
+   },
+   "motortype_off": 2735,
+   "order": [
+    "MotionGroup",
+    "MotionModule",
+    "ApplicationCatalogNumberInstance",
+    "ApplicationCatalogNumberVersion",
+    "AxisConfiguration",
+    "FeedbackConfiguration",
+    "MotorDataSource",
+    "MotorCatalogNumber",
+    "Feedback1Type",
+    "Feedback2Type",
+    "MotorType",
+    "MotionScalingConfiguration",
+    "ConversionConstant",
+    "OutputCamExecutionTargets",
+    "PositionUnits",
+    "AverageVelocityTimebase",
+    "PositionUnwind",
+    "HomeMode",
+    "HomeDirection",
+    "HomeSequence",
+    "HomeConfigurationBits",
+    "HomePosition",
+    "HomeOffset",
+    "HomeSpeed",
+    "HomeReturnSpeed",
+    "MaximumSpeed",
+    "MaximumAcceleration",
+    "MaximumDeceleration",
+    "ProgrammedStopMode",
+    "MasterInputConfigurationBits",
+    "MasterPositionFilterBandwidth",
+    "VelocityFeedforwardGain",
+    "AccelerationFeedforwardGain",
+    "PositionErrorTolerance",
+    "PositionLockTolerance",
+    "VelocityOffset",
+    "TorqueOffset",
+    "FrictionCompensationWindow",
+    "BacklashReversalOffset",
+    "TuningTravelLimit",
+    "TuningSpeed",
+    "TuningTorque",
+    "DampingFactor",
+    "DriveModelTimeConstant",
+    "PositionServoBandwidth",
+    "VelocityServoBandwidth",
+    "VelocityDroop",
+    "VelocityLimitPositive",
+    "VelocityLimitNegative",
+    "VelocityThreshold",
+    "VelocityStandstillWindow",
+    "TorqueLimitPositive",
+    "TorqueLimitNegative",
+    "TorqueThreshold",
+    "StoppingTorque",
+    "StoppingTimeLimit",
+    "LoadInertiaRatio",
+    "ResistiveBrakeContactDelay",
+    "RegistrationInputs",
+    "MaximumAccelerationJerk",
+    "MaximumDecelerationJerk",
+    "DynamicsConfigurationBits",
+    "FeedbackUnitRatio",
+    "AccelerationLimit",
+    "DecelerationLimit",
+    "PositionIntegratorBandwidth",
+    "PositionErrorToleranceTime",
+    "PositionIntegratorControl",
+    "RampJerkControl",
+    "FlyingStartEnable",
+    "SkipSpeed1",
+    "SkipSpeed2",
+    "CommandTorque",
+    "VelocityErrorTolerance",
+    "VelocityErrorToleranceTime",
+    "VelocityIntegratorControl",
+    "VelocityIntegratorPreload",
+    "SkipSpeed3",
+    "SkipSpeedBand",
+    "VelocityLockTolerance",
+    "SystemInertia",
+    "TorqueLowPassFilterBandwidth",
+    "TorqueNotchFilterFrequency",
+    "TorqueRateLimit",
+    "OvertorqueLimit",
+    "OvertorqueLimitTime",
+    "UndertorqueLimit",
+    "UndertorqueLimitTime",
+    "FluxCurrentReference",
+    "CurrentError",
+    "TorqueLoopBandwidth",
+    "FluxUpControl",
+    "FluxUpTime",
+    "FrequencyControlMethod",
+    "MaximumVoltage",
+    "MaximumFrequency",
+    "BreakVoltage",
+    "BreakFrequency",
+    "StartBoost",
+    "RunBoost",
+    "StoppingAction",
+    "MechanicalBrakeControl",
+    "MechanicalBrakeReleaseDelay",
+    "MechanicalBrakeEngageDelay",
+    "ShutdownAction",
+    "PowerLossAction",
+    "PowerLossThreshold",
+    "InverterCapacity",
+    "ConverterCapacity",
+    "InverterOverloadAction",
+    "MotorOverloadAction",
+    "CIPAxisExceptionAction",
+    "CIPAxisExceptionActionRA",
+    "MotorOverspeedUserLimit",
+    "MotorThermalOverloadUserLimit",
+    "InverterThermalOverloadUserLimit",
+    "PositionLeadLagFilterBandwidth",
+    "PositionLeadLagFilterGain",
+    "PositionNotchFilterFrequency",
+    "VelocityNegativeFeedforwardGain",
+    "BacklashCompensationWindow",
+    "TorqueLeadLagFilterBandwidth",
+    "TorqueLeadLagFilterGain",
+    "SLATConfiguration",
+    "SLATSetPoint",
+    "SLATTimeDelay",
+    "CommutationSelfSensingCurrent",
+    "DCInjectionBrakeCurrent",
+    "DCInjectionBrakeTime",
+    "MotorDeviceCode",
+    "MotorUnit",
+    "MotorPolarity",
+    "MotorRatedVoltage",
+    "MotorRatedContinuousCurrent",
+    "MotorRatedPeakCurrent",
+    "MotorRatedOutputPower",
+    "MotorOverloadLimit",
+    "MotorIntegralThermalSwitch",
+    "MotorMaxWindingTemperature",
+    "MotorWindingToAmbientCapacitance",
+    "MotorWindingToAmbientResistance",
+    "PMMotorResistance",
+    "PMMotorInductance",
+    "RotaryMotorPoles",
+    "RotaryMotorInertia",
+    "RotaryMotorRatedSpeed",
+    "RotaryMotorMaxSpeed",
+    "PMMotorRatedTorque",
+    "PMMotorTorqueConstant",
+    "PMMotorRotaryVoltageConstant",
+    "InductionMotorRatedFrequency",
+    "InductionMotorFluxCurrent",
+    "InductionMotorStatorResistance",
+    "InductionMotorStatorLeakageReactance",
+    "InductionMotorRotorLeakageReactance",
+    "Feedback1Unit",
+    "Feedback1Polarity",
+    "Feedback1StartupMethod",
+    "Feedback1CycleResolution",
+    "Feedback1CycleInterpolation",
+    "Feedback1Turns",
+    "Feedback1VelocityFilterBandwidth",
+    "Feedback1AccelFilterBandwidth",
+    "PMMotorFluxSaturation",
+    "Feedback1VelocityFilterTaps",
+    "Feedback1AccelFilterTaps",
+    "CyclicReadUpdateList",
+    "CyclicWriteUpdateList",
+    "ScalingSource",
+    "LoadType",
+    "ActuatorType",
+    "TravelMode",
+    "PositionScalingNumerator",
+    "PositionScalingDenominator",
+    "PositionUnwindNumerator",
+    "PositionUnwindDenominator",
+    "TravelRange",
+    "MotionResolution",
+    "MotionPolarity",
+    "MotorTestResistance",
+    "MotorTestInductance",
+    "MotorTestFluxCurrent",
+    "MotorTestSlipSpeed",
+    "TuneFriction",
+    "TuneLoadOffset",
+    "TotalInertia",
+    "TuningSelect",
+    "TuningDirection",
+    "ApplicationType",
+    "LoopResponse",
+    "FeedbackCommutationAligned",
+    "FrictionCompensationSliding",
+    "FrictionCompensationStatic",
+    "FrictionCompensationViscous",
+    "PositionLoopBandwidth",
+    "VelocityLoopBandwidth",
+    "VelocityIntegratorBandwidth",
+    "FeedbackNoiseUserLimit",
+    "FeedbackSignalLossUserLimit",
+    "FeedbackDataLossUserLimit",
+    "MotionExceptionAction",
+    "SoftTravelLimitChecking",
+    "Feedback2Unit",
+    "Feedback2Polarity",
+    "Feedback2StartupMethod",
+    "Feedback2CycleResolution",
+    "Feedback2CycleInterpolation",
+    "Feedback2VelocityFilterBandwidth",
+    "Feedback2AccelFilterBandwidth",
+    "Feedback2VelocityFilterTaps",
+    "Feedback2AccelFilterTaps",
+    "LoadRatio",
+    "TuneInertiaMass",
+    "SoftTravelLimitPositive",
+    "SoftTravelLimitNegative",
+    "GainTuningConfigurationBits",
+    "CommutationOffset",
+    "PowerLossTime",
+    "SystemBandwidth",
+    "VelocityLowPassFilterBandwidth",
+    "TransmissionRatioInput",
+    "TransmissionRatioOutput",
+    "ActuatorLead",
+    "ActuatorLeadUnit",
+    "ActuatorDiameter",
+    "ActuatorDiameterUnit",
+    "SystemAccelerationBase",
+    "DriveModelTimeConstantBase",
+    "DriveRatedPeakCurrent",
+    "HookupTestDistance",
+    "HookupTestFeedbackChannel",
+    "LoadCoupling",
+    "SystemDamping",
+    "HookupTestTime",
+    "CurrentVectorLimit",
+    "CommutationPolarity",
+    "InductionMotorRatedSlipSpeed",
+    "LoadObserverConfiguration",
+    "LoadObserverBandwidth",
+    "LoadObserverIntegratorBandwidth",
+    "LoadObserverFeedbackGain",
+    "AxisID",
+    "InterpolatedPositionConfiguration",
+    "AxisUpdateSchedule",
+    "ProvingConfiguration",
+    "TorqueProveCurrent",
+    "BrakeTestTorque",
+    "BrakeSlipTolerance",
+    "ZeroSpeed",
+    "ZeroSpeedTime",
+    "AdaptiveTuningConfiguration",
+    "TorqueNotchFilterHighFrequencyLimit",
+    "TorqueNotchFilterLowFrequencyLimit",
+    "TorqueNotchFilterTuningThreshold",
+    "CoastingTimeLimit",
+    "SafeTorqueOffAction",
+    "FlyingStartMethod",
+    "BusOvervoltageOperationalLimit",
+    "ConnectionLossStoppingAction",
+    "SafeTorqueOffActionSource",
+    "SafeStoppingAction",
+    "SafeStoppingActionSource",
+    "VerticalLoadControl",
+    "CurrentLoopBandwidthScalingFactor",
+    "CurrentLoopBandwidth",
+    "DriveRatedVoltage",
+    "MaxOutputFrequency",
+    "MotorTestDataValid",
+    "CommandNotchFilterFrequency",
+    "CommandNotchFilterWidth",
+    "CommandNotchFilterDepth",
+    "CommandNotchFilterGain",
+    "CommandNotchFilter2Frequency",
+    "CommandNotchFilter2Width",
+    "CommandNotchFilter2Depth",
+    "CommandNotchFilter2Gain",
+    "TorqueNotchFilter2Frequency",
+    "TorqueNotchFilter3Frequency",
+    "TorqueNotchFilter4Frequency",
+    "TorqueNotchFilterWidth",
+    "TorqueNotchFilterDepth",
+    "TorqueNotchFilterGain",
+    "TorqueNotchFilter2Width",
+    "TorqueNotchFilter2Depth",
+    "TorqueNotchFilter2Gain",
+    "TorqueNotchFilter3Width",
+    "TorqueNotchFilter3Depth",
+    "TorqueNotchFilter3Gain",
+    "TorqueNotchFilter4Width",
+    "TorqueNotchFilter4Depth",
+    "TorqueNotchFilter4Gain",
+    "AdaptiveTuningTrackingNotchFilters",
+    "AdaptiveTuningGainScalingFactorMin",
+    "TorqueLowPassFilterBandwidthMin",
+    "TorqueNotchFilterWidthMin",
+    "TorqueNotchFilterWidthMax",
+    "HookupTestSpeed",
+    "TorqueEstimateCrossoverSpeed",
+    "TorqueEstimateNotch1Frequency",
+    "TorqueEstimateNotch1Width",
+    "TorqueEstimateNotch1Depth",
+    "TorqueEstimateNotch1Gain",
+    "TorqueEstimateNotch2Frequency",
+    "TorqueEstimateNotch2Width",
+    "TorqueEstimateNotch2Depth",
+    "TorqueEstimateNotch2Gain",
+    "TestModeConfiguration",
+    "TestModeEnable"
+   ],
+   "tok_vocab": {
+    "CIPAxisExceptionAction": {
+     "0": "Ignore",
+     "255": "Unsupported",
+     "4": "StopDrive"
+    },
+    "CIPAxisExceptionActionRA": {
+     "0": "Ignore",
+     "255": "Unsupported",
+     "4": "StopDrive"
+    },
+    "MotionExceptionAction": {
+     "0": "Ignore",
+     "255": "Unsupported",
+     "4": "StopDrive"
+    }
+   }
+  },
   "5476": {
    "attrs": {
     "AccelerationFeedforwardGain": {
