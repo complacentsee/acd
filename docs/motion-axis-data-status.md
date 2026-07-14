@@ -26,19 +26,53 @@ exists) for the amplifier attribute group, and per-datatype emit-profile
 keying (AxisConfiguration for CIP, ServoLoopConfiguration for servo).
 Validated byte-exact on every servo-5965 axis; CIP-5965 output unchanged.
 
-FOLLOW-UPS (not yet done): other CIP lengths (5843/5476/3666/3654 — header offsets
-transfer, need per-length tail + emit-set validation); AXIS_SERVO_DRIVE 3430
-(different, smaller struct); MOTION_GROUP <Data>. See
-plans/motion-cip-drive-implementation.md.
+## UPDATE 2026-07-14 (second wave): the schema is LENGTH-KEYED and covers most generations
+
+`axis_cip_data.json` is now a per-blob-length table (5965/5843/5476/3666/3654/
+3430 + a separate MOTION_GROUP section). Each length was independently solved
+(offset transfer from 5965 where the struct region is shared, per-length
+re-pins across the proven piecewise shifts, per-generation vocab tables — the
+firmware generations use different enum code spaces) and validated byte-exact
+against every non-skew pool instance before inclusion; zero wrong blocks are
+tolerated (fail-closed withholding instead). Landed per target:
+
+| Target | byte-exact / instances | Notes |
+| --- | --- | --- |
+| AXIS_CIP_DRIVE 5965 | 192/192 | first wave |
+| AXIS_SERVO_DRIVE 5965 | 26/26 | first wave |
+| AXIS_CIP_DRIVE 5843 | 116/116 | no tail shift; Feedback2 block + cyclic-write list new |
+| AXIS_CIP_DRIVE 5476 | 32/33 | 1 motor-less axis self-gates out (fail-closed) |
+| AXIS_CIP_DRIVE 3666 | 63/63 | FeedbackCommutationAligned is corpus-constant (see below) |
+| AXIS_CIP_DRIVE 3654 | 12/12 | V29 generation; solved a 5965 token-array as a byproduct |
+| AXIS_SERVO_DRIVE 3430 | 33/125 | ungrouped-drive sentinel profile only (see below) |
+| MOTION_GROUP 621/1268/2304/2306 | 78/78 | `<Data Format="MotionGroup">` |
+
+Remaining held (fail-closed, still element_missing):
+- **AXIS_SERVO_DRIVE 3430 grouped-drive axes (92)**: values and order fully
+  reconstruct; the only residual is the emit gate for the amplifier attribute
+  group ({AmplifierCatalogNumber, MotorFeedbackType, PowerSupplyID}), which is
+  provably NOT in the config image (exhaustive in-blob search empty; emission
+  is module-record state). Closing it needs a converter-side join from the
+  axis modid to the drive-module record's state.
+- Tiny buckets with too few instances to fit a profile: CIP 4282/3430/5755,
+  SERVO_DRIVE 3424, AXIS_SERVO 3430.
+
+Corpus-constant fields: a handful of attributes hold a single value across
+every instance of both pools at a given generation and have no locatable
+offset (FeedbackCommutationAligned at 3666; GroupType/GeneralFaultType for
+MOTION_GROUP; the DataScaling family at servo-3430). They use the documented
+`const` render kind that the 5965 entry already established, and are emitted
+only under the fail-closed length/profile/vocab gates. A tracer round at
+those generations would convert them to reads.
 
 ## Summary
 
 | Axis datatype | `<Data>` emitted? | Notes |
 | --- | --- | --- |
 | `AXIS_VIRTUAL` | **Yes**, all fitting blob lengths | `_render_axis_virtual`; every field read from the blob, nothing hardcoded |
-| `AXIS_CIP_DRIVE` | No — documented floor | ~63% of fields decode; blocked by pool-invariant fields (below) |
-| `AXIS_SERVO_DRIVE` | **Yes at length 5965** | same struct as CIP_DRIVE, servo emit profile; other lengths held |
-| `MOTION_GROUP` | No — documented floor | `MotionGroupParameters`; same class of pool-invariant blocker |
+| `AXIS_CIP_DRIVE` | **Yes** at 5965/5843/5476/3666/3654 | length-keyed schema; tiny lengths (4282/3430/5755) held |
+| `AXIS_SERVO_DRIVE` | **Yes** at 5965, 3430 (sentinel profile) | grouped-drive 3430 axes held on the module-record gate |
+| `MOTION_GROUP` | **Yes** at 621/1268/2304/2306 | `<MotionGroupParameters>`, per-length anchor-keyed |
 
 `AXIS_VIRTUAL` is fully handled. The drive axes and the motion group are **held
 as a floor**: a present-but-wrong `<Data>` scores worse than the single
