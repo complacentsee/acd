@@ -88,6 +88,7 @@ class ConnectionParams:
     event_id: Optional[int]               # u8  @298  EventID
     input_production_trigger: Optional[int]   # u8 @302 (0=Cyclic, 2=Application)
     send_event_trigger: Optional[int]     # u32 @308  ProgrammaticallySend...
+    reaction_time_units: Optional[int]    # u16 @312  CIP-safety reaction-time limit, 0.128us units
     max_observed_delay_raw: Optional[int]  # u16 @314  count of 0.128us units
     timeout_multiplier: Optional[int]     # u8  @316
     network_delay_multiplier: Optional[int]   # u16 @317
@@ -125,6 +126,7 @@ class ConnectionParams:
             event_id=_u8(blob, 298),
             input_production_trigger=_u8(blob, 302),
             send_event_trigger=_u32(blob, 308),
+            reaction_time_units=_u16(blob, 312),
             max_observed_delay_raw=_u16(blob, 314),
             timeout_multiplier=_u8(blob, 316),
             network_delay_multiplier=_u16(blob, 317),

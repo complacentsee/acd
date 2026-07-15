@@ -425,12 +425,16 @@ def _conn_modern_attrs(cp: ConnectionParams, fmt: int) -> dict:
         if cp.max_observed_delay_raw is not None:
             out["MaxObservedNetworkDelay"] = _conn_num(
                 cp.max_observed_delay_raw * 0.128)
-        rpi_us = cp.rpi_us / 1000.0
-        if fmt in (28, 49):  # input
-            out["ReactionTimeLimit"] = _conn_num(
-                math.ceil(4 * rpi_us / 0.128) * 0.128)
-        else:                # output (29, 50)
-            out["ReactionTimeLimit"] = _conn_num(3 * rpi_us)
+        if cp.reaction_time_units is not None:
+            # ReactionTimeLimit is the stored CIP-safety limit in 0.128us units
+            # (u16 @312); the output direction reports it net of the RPI. Read it
+            # rather than reconstruct it from the RPI (the prior 4*/3* estimate
+            # was only ever an approximation).
+            base = cp.reaction_time_units * 0.128
+            if fmt in (28, 49):  # input
+                out["ReactionTimeLimit"] = _conn_num(base)
+            else:                # output (29, 50)
+                out["ReactionTimeLimit"] = _conn_num(base - cp.rpi_us / 1000.0)
     return {k: v for k, v in out.items() if v is not None}
 # Data-driven connection formats always carry the connection size; the plain
 # Output format carries size AND connection points, but only for generic/drive
@@ -443,6 +447,13 @@ _CONN_FMT_OUTPUT = 6
 # Module Definition already fixes the assembly. See ModuleBuilder.
 _CONN_DIRECT_PRODUCT_TYPES = {123, 127, 142, 143, 150, 151}
 _CONN_GENERIC_VENDOR = 1
+# Serial-ASCII carrier modules (1734-232ASC / 1734-485ASC) as
+# (vendor, product_type, product_code): the reference emits their connection's
+# CIP In/OutputCxnPoint + In/OutputSize, but the connection record is
+# byte-identical to non-carrier product-type-115 modules that omit them, so the
+# emit gate is keyed on module identity (same pattern as
+# _CONN_DIRECT_PRODUCT_TYPES). The values themselves are read from the record.
+_CONN_SERIAL_ASCII_KEYS = frozenset({(1, 115, 110), (1, 115, 133)})
 # The rack-optimized CommMethod (0x40000000): such a module bundles its I/O into
 # the rack adapter's connection and emits a single <RackConnection> instead of a
 # discrete <Connection>.

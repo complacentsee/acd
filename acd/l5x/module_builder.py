@@ -29,6 +29,7 @@ from acd.l5x.connections import (
     _CONN_DIRECT_PRODUCT_TYPES,
     _CONN_FMT_OUTPUT,
     _CONN_GENERIC_VENDOR,
+    _CONN_SERIAL_ASCII_KEYS,
     _RACK_COMM_METHOD,
     _config_holder_image,
 )
@@ -1425,6 +1426,7 @@ class ModuleBuilder(L5xElementBuilder):
         generic_drive = (
             product_type in _CONN_DIRECT_PRODUCT_TYPES
             or (product_type == 0 and vendor == _CONN_GENERIC_VENDOR)
+            or (vendor, product_type, product_code) in _CONN_SERIAL_ASCII_KEYS
         )
         # The local chassis / CPU module ("Local") exposes its backplane only as an
         # Output topology record (read above for chassis size/slot), never as a
