@@ -562,7 +562,7 @@ def _render_value_blocks(element: str,
     # Decorated <Structure>/<Array> (Logix renders STRING specially). Detect by
     # datatype name OR by the resolved TagInfo layout being the Logix STRING
     # shape (LEN u32 + DATA SINT[]) -- the latter catches custom string types
-    # (String50, PF525FaultDesc, CustomStr...). The short-header value image
+    # (String50, PF525FaultDesc, ...). The short-header value image
     # decodes the same LEN+DATA shape, so this runs on both header families
     # (verified byte-exact pool-wide).
     is_string = (dt_base == "STRING") and (
@@ -1952,7 +1952,8 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
         # (handled above -> "true"); a 0 there means an ordinary Base tag, which
         # OEM still writes as Constant="false". We must NOT stamp it on alias
         # tags, so gate on the long-header alias detector (dti -> &hex: module
-        # ref; validated 48/48 aliases, 0 false positives on PROJ_A+PROJ_C).
+        # ref; validated 48/48 aliases, 0 false positives across two long-header
+        # projects).
         # Wrapped/best-effort: a detector failure leaves `constant` as today.
         _lh_is_alias = False
         if not self._short_header and not is_io and constant is None:
@@ -2221,7 +2222,7 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
                 # comment carries a nonzero rung_content (the rung id); a genuine
                 # tag/own description has rung_content 0. Excluding nonzero
                 # rung_content drops the rung-comment collisions while keeping the
-                # real cip-0x68 descriptions (validated: PROJ_E keeps 11, drops 26
+                # real cip-0x68 descriptions (validated on one project: keeps 11, drops 26
                 # rung collisions; layout AX* over-emit gone).
                 # A long-header own description also carries object_id == 1; the
                 # scratch/operand rows that share (parent_key, member_ref) under a
@@ -2355,7 +2356,7 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
             #     by the (parent, owner_ref) pair -- gated on this tag's own
             #     pair being owned by exactly one live comp (unique_owner_key)
             #     and rows with owner_ref==0 stay suppressed. Cross-validated
-            #     537/537 vs OEM on PROJ_I / PROJ_F / PROJ_L.
+            #     537/537 vs OEM across three long-header projects.
             # A '.!<hex>' operand is a member token, (collection<<16)|member
             # into member_resolve; resolve_hex_operand rewrites it to the OEM
             # member path and is fail-closed (any unresolvable token keeps the
@@ -2743,7 +2744,7 @@ class ParameterBuilder(L5xElementBuilder):
         # ExternalAccess (u16 at ext01[0x21E])
         # Built-in reference-type InOut parameters don't carry Constant in the
         # reference L5X; every other InOut parameter (atomic, string, and user
-        # UDTs including axis-named ones like tstAxisUDT) still carries it. Match
+        # UDTs including axis-named ones) still carries it. Match
         # by exact DataType, never a name substring. The never-set set is the
         # corpus-proven six (0 with Constant vs 7,839/7,839 WITH on all other
         # InOut datatypes, 0 mixed): the motion references, MESSAGE, and MODULE.
@@ -3224,7 +3225,7 @@ class RoutineBuilder(L5xElementBuilder):
                     # each of its rung comments repeats it in the low u16 of
                     # member_ref, so match on it to scope to the true owner.
                     # Verified pool-wide: removes exactly the 15 cross-routine
-                    # over-emissions (RTN_B 11, RTN_A 2, RTN_C 2), 0 regressions.
+                    # over-emissions (11 + 2 + 2 across three routines), 0 regressions.
                     short_parent_key = 0x6D0000 | (r.comment_id & 0xFFFF)
                     short_mref_key = (
                         struct.unpack_from("<I", record, 14)[0] >> 16
@@ -3965,7 +3966,7 @@ class AoiBuilder(L5xElementBuilder):
 #     The 6 bytes at marker+14 flag a genuinely protected definition
 #     (00 00 01 00 10 00) versus a plaintext-at-rest look-alike whose rungs Studio
 #     re-decrypts and exports as plaintext (00 00 00 07 ..) -- the
-#     AreaD/VendorE/AreaA/AreaB/AreaC files, never suppressed.
+#     the plaintext-at-rest look-alike projects, never suppressed.
 #   * Plaintext key-bearing layout: a security-descriptor block inside ext-attr
 #     0x1 carries a 16-byte protection-key hash -- a real per-license hash when
 #     protected, the fixed no-protection sentinel when source-protection is
@@ -4259,8 +4260,8 @@ class ProgramBuilder(L5xElementBuilder):
         routines = []
         for child in routine_results:
             # A dead-relic (FDFD-only) routine is a deleted routine Studio never
-            # exports; skip it (P6.9). This is the visible C3 win: PROJ_H's SPARE/
-            # Spare2 programs carry such relics we currently over-emit.
+            # exports; skip it (P6.9). This is the visible C3 win: one project's
+            # spare programs carry such relics we currently over-emit.
             if child[1] in dead:
                 continue
             # In faithful mode, a source-protected routine is exported by Studio as
@@ -5544,8 +5545,9 @@ class ControllerBuilder(L5xElementBuilder):
                 + " ORDER BY seq_number"
             )
             # Drop dead-relic (FDFD-only) device children BEFORE either pass. These
-            # are deleted-module ghosts Studio never exports (e.g. PROJ_H's six
-            # UC_FAN_A fans, whose live 193-ECM-ETR twins we already emit in full).
+            # are deleted-module ghosts Studio never exports (e.g. one project's
+            # six ghost fan modules, whose live 193-ECM-ETR twins we already
+            # emit in full).
             # Filtering the source list keeps a ghost from BOTH emitting a spurious
             # <Module> AND writing modid_to_name/modid_to_oid unconditionally below
             # (a realigned ghost body could otherwise clobber a live module's modid
@@ -5602,7 +5604,7 @@ class ControllerBuilder(L5xElementBuilder):
                     # Module whose truncated record omits the 0x001 identity
                     # (or does not parse at all): the modid was recovered from
                     # the comps.record body so the adapter is mapped and its child
-                    # cards resolve their :C ConfigTag (e.g. VendorD point_IO_adapter / Local,
+                    # cards resolve their :C ConfigTag (e.g. a POINT I/O adapter / Local,
                     # whose own modid is the comment_id). Collision-safe:
                     # never overwrite a modid already mapped from a
                     # normally-parsed record.

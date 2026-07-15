@@ -536,8 +536,9 @@ class CompsRecord:
     # length == @size@<AOI> from TagInfo.XML (an integrity invariant). Per-child
     # value images are slices at the member's TagInfo byte offset/width.
     #
-    # Proven on MachineA acd.db: AOI_A image size 1328; PacketMax@128 = 82;
-    # ResetSign SignCommandCode@624 = 01 00 00 00 43 00 ('C').
+    # Proven on one project's staging db: an AOI image size 1328; a UDINT
+    # param@128 = 82; a second AOI's command-code param@624 = 01 00 00 00
+    # 43 00 ('C').
 
     @staticmethod
     def read_aoi_defval_image(cur, aoi_name: str, short_header: bool):

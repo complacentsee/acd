@@ -318,7 +318,7 @@ class ExportL5x:
         # comp matching (scope key, own key). Only pairs owned by exactly ONE
         # live comp are stored, so a collision (or an FDFD relic twin) fails
         # closed to today's suppression. Cross-validated 537/537 vs OEM
-        # (PROJ_I 270, PROJ_F 95, PROJ_L 72).
+        # (270 + 95 + 72 across three long-header projects).
         self._cur.execute(
             "CREATE TABLE unique_owner_key("
             "scope INTEGER, own INTEGER, PRIMARY KEY(scope, own))")

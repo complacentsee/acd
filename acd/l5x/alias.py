@@ -154,7 +154,7 @@ class TagAliasResolver:
         ``data_table_instance`` points at an ordinary RxData backing whose name
         is a plain identifier.  So an ``&hex:`` target name is a clean,
         file-independent alias discriminator (validated 48/48 aliases, 0 false
-        positives on PROJ_A + PROJ_C).
+        positives across two long-header projects).
 
         Returns False on any failure so the caller keeps today's Base-tag
         behaviour (no regression).
@@ -291,7 +291,7 @@ class TagAliasResolver:
         at raw_rec[0x26] is mapped to a member PATH inside the base symbol by
         walking the base datatype's TagInfo member layout. Covers module-I/O
         channel members (Local:2:I.Ch0Data), internal UDT members
-        (SomeUDT.Faults.Transducer), array-of-struct elements, nested structs /
+        (a nested UDT member path), array-of-struct elements, nested structs /
         bit members, and whole-element aliases. Fail-closed: returns None on any
         parse failure, a source-protected/undecodable base, or a walk that does
         not land on a real member, so the caller keeps the tag Base rather than
@@ -468,7 +468,7 @@ class TagAliasResolver:
         Two module sub-cases are cracked byte-exact:
           * EMBEDDED-IO (module friendly name ``Local``): suffix
             ``<module>:<slot>:<type>.Data.<bit>`` with ``bit = raw_rec[0x26] & 0x1F``
-            (the ``.Data.`` member is implicit). Validated 13/13 PROJ_A, 24/24 PROJ_C.
+            (the ``.Data.`` member is implicit). Validated 13/13 and 24/24 on two long-header projects.
           * NETWORKED module I/O (a real module, name != ``Local``): suffix
             ``<module>:<slot>:<type>.<bit>`` (no ``.Data``) with
             ``bit = u32@raw_rec[0x26] - (64 + slot*8)``, accepted only for a slotted
@@ -514,8 +514,8 @@ class TagAliasResolver:
                 # a slotless/config target, a multi-byte channel-structured point
                 # (analog .ChNData/.ChNFault), or a whole-element reference is left as
                 # Base rather than emit a wrong AliasFor. Validated byte-exact vs OEM
-                # on the long-header pool (PROJ_F 38, PROJ_G 34, PROJ_B 12,
-                # PROJ_A 11). This branch runs only on the long-header path (build()
+                # on the long-header pool (four projects: 38, 34, 12 and 11 aliases
+                # each). This branch runs only on the long-header path (build()
                 # gates on `not short_header`); short-header networked aliases are
                 # resolved separately by _short_header_alias_for. Extending it to the
                 # short-header families would additionally need an alias-is-BOOL /

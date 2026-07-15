@@ -350,7 +350,7 @@ class MemberBuilder(L5xElementBuilder):
             target: Union[str, None] = None
             bit_number: Union[int, None] = None
             if data_type == "BOOL":
-                # V10..V21 BIT rule (validated 5735/5735 on PROJ_D): a BOOL
+                # V10..V21 BIT rule (validated 5735/5735 on a V10 project): a BOOL
                 # member is a BIT alias UNLESS 0x68 == 0x800 (a real standalone
                 # BOOL). The bit index is 0x64; the backing field is the
                 # non-BIT member whose byte range covers 0x6c (or 0x60 when
@@ -488,7 +488,7 @@ class DataTypeBuilder(L5xElementBuilder):
         class_type = "User"
         if self._short_header:
             # V10..V21: module-defined (IO) types ALSO have built_in&3 set, so IO
-            # must take precedence (verified 142/142 vs OEM on PROJ_D). The long
+            # must take precedence (verified 142/142 vs OEM on a V10 project). The long
             # path keeps its original precedence below, untouched.
             if module_defined > 0:
                 class_type = "IO"

@@ -901,7 +901,7 @@ class ModuleBuilder(L5xElementBuilder):
         returned verbatim. Read from the UNTRUNCATED comps body (not the
         _rxdata_by_cid entry, whose long-header raw is clipped to the declared
         record length and can drop the closing ``</private>`` -- verified on
-        PROJ_M), with the decrypted 0x66 image as the
+        a long-header DNET project), with the decrypted 0x66 image as the
         source-protected fallback, mirroring the public extractor.
         """
         if not data_link:

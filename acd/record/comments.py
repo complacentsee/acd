@@ -306,7 +306,7 @@ class CommentsRecord:
                  scope-local ordinal u16). Nonzero on rows whose header parent
                  is a SHARED program-scope (cip-0x68) key; 0 when the parent
                  key alone identifies the tag. Attribution cross-validated
-                 537/537 vs OEM across PROJ_I / PROJ_F / PROJ_L.
+                 537/537 vs OEM across three long-header projects.
           [4:8]  unknown   [8:12] object_id (the OPERAND's member/element
                  token id, e.g. 5982+bit-index -- NOT the owning tag)
           [12]   pad
