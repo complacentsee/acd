@@ -41,6 +41,7 @@ from acd.l5x.base import (
     safety_signature_row,
     short_own_description,
 )
+from acd.l5x.encoded_data import encoded_routine, source_protection_config
 from acd.l5x.connections import (
     _DESC_BLOCK_RE,
     _build_config_holders,
@@ -1404,8 +1405,14 @@ class Routine(L5xElement):
     # the first child of its <Rung>.
     _custom_properties: str = field(default="")
     _rung_custom_properties: Dict[int, str] = field(default_factory=dict)
+    # A source-protected routine Studio exports as an <EncodedData> blob rather
+    # than a plaintext <Routine>; when the blob is reconstructable it is rendered
+    # here and replaces the whole element. None = an ordinary plaintext routine.
+    _encoded: Union[str, None] = field(default=None)
 
     def to_xml(self) -> str:
+        if self._encoded is not None:
+            return self._encoded
         rll_content = ""
         if self.type == "RLL" and self.rungs:
             rung_xmls = []
@@ -4257,11 +4264,11 @@ class ProgramBuilder(L5xElementBuilder):
             if child[1] in dead:
                 continue
             # In faithful mode, a source-protected routine is exported by Studio as
-            # <EncodedData>, not a plaintext <Routine>; skip it (the keyed ciphertext
-            # is unrecoverable -> under-emit rather than fabricate). Recovery mode
-            # keeps the decoded plaintext routine.
-            if self._faithful and _routine_is_source_protected(bytes(child[3])):
-                continue
+            # <EncodedData>, not a plaintext <Routine>. Rebuild that blob when every
+            # input resolves; otherwise emit nothing rather than fabricate one.
+            # Recovery mode keeps the decoded plaintext routine.
+            rec = bytes(child[3])
+            protected = self._faithful and _routine_is_source_protected(rec)
             _rt = RoutineBuilder(
                 self._cur, child[1], _short_header=self._short_header,
                 _short_routine_desc=self._short_routine_desc).build()
@@ -4270,6 +4277,13 @@ class ProgramBuilder(L5xElementBuilder):
             # them rather than fabricate a phantom <Routine>.
             if _rt.type in ("TypeLess", "Typeless"):
                 continue
+            if protected:
+                a1 = _ext_attr01(rec)
+                _rt._encoded = encoded_routine(
+                    _rt, a1, _RT_KEYHASH_OFF,
+                    source_protection_config(rec, a1, _RT_KEYHASH_OFF))
+                if _rt._encoded is None:
+                    continue
             routines.append(_rt)
 
         # Get the Program Scoped Tags

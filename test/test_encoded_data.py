@@ -1,0 +1,228 @@
+"""Unit tests for the <EncodedData> renderer (acd.l5x.encoded_data).
+
+A source-protected routine is exported by Studio as an <EncodedData> blob in
+place of the plaintext <Routine>. These fixtures pin the two derivations the
+renderer reads out of the routine's comps record -- the EncodedSourceKey and the
+SourceProtectionType flag bit, both inside ext-attr 0x1's security descriptor --
+plus the cipher/framing and every fail-closed branch.
+
+The renderer is all-or-nothing per routine: anything it cannot resolve must yield
+None so the caller emits nothing, because a wrong blob is worse than a missing
+one. Byte-exactness against the reference's own blobs is proven separately by
+whole-corpus differential execution.
+"""
+
+import base64
+import struct
+
+from acd.l5x.encoded_data import (
+    encoded_routine,
+    security_descriptor,
+    source_protection_config,
+    _encrypt_b64,
+)
+from acd.l5x.elements import Routine, _RT_KEYHASH_OFF
+from acd.record.comps import _SP_MARKER, _SP_KEYS, _sp_aes, _sp_cbc
+
+RT_OFF = _RT_KEYHASH_OFF        # 202
+KEY = bytes(range(48))          # a stand-in 48-byte EncodedSourceKey
+ESK = base64.b64encode(KEY).decode().rstrip("=")
+
+
+def _attr01(key=KEY, pad=b"\x00" * 18, flags=0, off=RT_OFF, tail=16, declared=None):
+    """ext-attr 0x1 carrying a security descriptor at ``off``."""
+    a1 = bytearray(off + 70 + tail)
+    a1[off - 2:off] = struct.pack(
+        "<H", len(key) + len(pad) if declared is None else declared)
+    a1[off:off + len(key)] = key
+    a1[off + 48:off + 48 + len(pad)] = pad
+    a1[off + 66:off + 70] = struct.pack("<I", flags)
+    return bytes(a1)
+
+
+def _body(marker=False):
+    """A comps record body, with or without the source-protection-at-rest marker."""
+    rec = bytearray(120)
+    if marker:
+        rec[78:82] = _SP_MARKER
+    return bytes(rec)
+
+
+def _routine(rtype="RLL", rungs=("XIC(a)OTE(b);",), **kw):
+    return Routine(_name="Routine", name="R1", type=rtype, rungs=list(rungs), **kw)
+
+
+# --- security descriptor ----------------------------------------------------
+def test_reads_key_and_full_protection():
+    assert security_descriptor(_attr01(flags=0), RT_OFF) == (ESK, "Full Protection")
+
+
+def test_both_declared_lengths_of_our_scheme_read_identically():
+    # The slot is a fixed 66 bytes either way, so a bare-key declaration and a
+    # key-plus-padding one must yield the same key.
+    assert (security_descriptor(_attr01(declared=48), RT_OFF)
+            == security_descriptor(_attr01(declared=66), RT_OFF) == (ESK, "Full Protection"))
+
+
+def test_viewable_is_flag_bit0():
+    assert security_descriptor(_attr01(flags=1), RT_OFF)[1] == "Viewable"
+
+
+def test_unrelated_flag_bits_do_not_change_protection_type():
+    # bit 9 rides alongside bit 0 on real records and means something else.
+    assert security_descriptor(_attr01(flags=0x200), RT_OFF)[1] == "Full Protection"
+    assert security_descriptor(_attr01(flags=0x201), RT_OFF)[1] == "Viewable"
+
+
+def test_key_is_read_at_the_offset_not_the_slot_start():
+    a1 = _attr01(key=KEY)
+    esk, _ = security_descriptor(a1, RT_OFF)
+    assert base64.b64decode(esk + "==") == KEY
+
+
+# --- fail-closed branches ---------------------------------------------------
+def test_unpadded_descriptor_is_withheld():
+    # The newer descriptor form fills all 66 bytes; its real key is not in the
+    # record, so reading the first 48 would emit a WRONG key -> withhold. It
+    # declares 66 like our scheme, so only the padding tells it apart.
+    assert security_descriptor(_attr01(pad=bytes(range(1, 19))), RT_OFF) is None
+
+
+def test_older_40_byte_key_scheme_is_withheld():
+    # The 40-byte-key scheme zero-fills the rest of the slot exactly as ours
+    # does, so the padding check passes and ONLY the declared length catches it.
+    # Reading 48 bytes here would splice 8 padding bytes onto a 40-byte key and
+    # emit that under the wrong @EncryptionConfig.
+    a1 = _attr01(key=bytes(range(40)), pad=b"\x00" * 26, declared=40)
+    assert a1[RT_OFF + 48:RT_OFF + 66] == b"\x00" * 18   # padding gate passes
+    assert security_descriptor(a1, RT_OFF) is None       # length gate catches it
+
+
+def test_older_scheme_has_no_derivable_config():
+    a1 = _attr01(key=bytes(range(40)), pad=b"\x00" * 26, declared=40)
+    assert source_protection_config(_body(), a1, RT_OFF) is None
+
+
+def test_unknown_declared_length_is_withheld():
+    assert security_descriptor(_attr01(declared=64), RT_OFF) is None
+    assert source_protection_config(_body(), _attr01(declared=64), RT_OFF) is None
+
+
+def test_missing_attr01_is_withheld():
+    assert security_descriptor(None, RT_OFF) is None
+
+
+def test_truncated_attr01_is_withheld():
+    assert security_descriptor(_attr01()[:RT_OFF + 60], RT_OFF) is None
+
+
+def test_encrypted_tail_layout_has_no_derivable_config():
+    assert source_protection_config(_body(marker=True), _attr01(), RT_OFF) is None
+
+
+def test_plaintext_keybearing_layout_is_config_3():
+    assert source_protection_config(_body(), _attr01(), RT_OFF) == 3
+
+
+def test_config_none_withholds_the_blob():
+    assert encoded_routine(_routine(), _attr01(), RT_OFF, None) is None
+
+
+def test_unserializable_routine_type_is_withheld():
+    assert encoded_routine(_routine(rtype="FBD"), _attr01(), RT_OFF, 3) is None
+
+
+def test_st_routine_without_lines_is_withheld():
+    assert encoded_routine(_routine(rtype="ST"), _attr01(), RT_OFF, 3) is None
+
+
+def test_config_without_a_key_is_withheld():
+    assert encoded_routine(_routine(), _attr01(), RT_OFF, 9) is None
+
+
+# --- element / document -----------------------------------------------------
+def _decrypt(body, config=3):
+    raw = base64.b64decode(body + "=" * (-len(body) % 4))
+    aes = _sp_aes(config, dict(_SP_KEYS)[config])
+    pt = _sp_cbc(raw, aes, len(raw) // 16)
+    return pt[:-pt[-1]].decode("utf-16-le")
+
+
+def test_element_shape_and_attribute_order():
+    xml = encoded_routine(_routine(), _attr01(), RT_OFF, 3)
+    assert xml.startswith('<EncodedData EncodedType="Routine" Name="R1"'
+                          ' Type="RLL" EncryptionConfig="3">\n')
+    assert xml.endswith("</EncodedData>")
+
+
+def test_body_is_single_line_base64_with_padding_stripped():
+    xml = encoded_routine(_routine(), _attr01(), RT_OFF, 3)
+    body = xml.split(">\n", 1)[1][: -len("</EncodedData>")]
+    assert "=" not in body and "\n" not in body
+
+
+def test_body_decrypts_to_the_inner_document():
+    xml = encoded_routine(_routine(), _attr01(flags=1), RT_OFF, 3)
+    body = xml.split(">\n", 1)[1][: -len("</EncodedData>")]
+    doc = _decrypt(body)
+    assert doc.startswith('<?xml version="1.0" encoding="UTF-16" standalone="yes"?>\n')
+    assert (f'<Routine Name="R1" Type="RLL" EncodedSourceKey="{ESK}"'
+            ' SourceProtectionType="Viewable">') in doc
+    assert "<![CDATA[XIC(a)OTE(b);]]>" in doc
+    assert doc.endswith("</Routine>\n")
+
+
+def test_inner_document_keeps_empty_rungs_and_does_not_strip():
+    # Unlike Routine.to_xml, the encoded document preserves rung indices verbatim.
+    xml = encoded_routine(_routine(rungs=("", " A;")), _attr01(), RT_OFF, 3)
+    doc = _decrypt(xml.split(">\n", 1)[1][: -len("</EncodedData>")])
+    assert '<Rung Number="0" Type="N">\n<Text>\n<![CDATA[]]>' in doc
+    assert '<Rung Number="1" Type="N">\n<Text>\n<![CDATA[ A;]]>' in doc
+
+
+def test_rung_comment_precedes_text():
+    rt = _routine()
+    rt._rung_comments = {0: "hi"}
+    doc = _decrypt(encoded_routine(rt, _attr01(), RT_OFF, 3)
+                   .split(">\n", 1)[1][: -len("</EncodedData>")])
+    assert "<Comment>\n<![CDATA[hi]]>\n</Comment>\n<Text>" in doc
+
+
+def test_st_routine_emits_st_content():
+    rt = _routine(rtype="ST", rungs=[])
+    rt._st_lines = ["a := 1;", ""]
+    doc = _decrypt(encoded_routine(rt, _attr01(), RT_OFF, 3)
+                   .split(">\n", 1)[1][: -len("</EncodedData>")])
+    assert '<STContent>\n<Line Number="0">\n<![CDATA[a := 1;]]>\n</Line>\n' in doc
+    assert "<RLLContent>" not in doc
+
+
+def test_description_precedes_content():
+    rt = _routine(_description="d")
+    doc = _decrypt(encoded_routine(rt, _attr01(), RT_OFF, 3)
+                   .split(">\n", 1)[1][: -len("</EncodedData>")])
+    assert "<Description>\n<![CDATA[d]]>\n</Description>\n<RLLContent>" in doc
+
+
+def test_name_is_xml_escaped_in_both_the_element_and_the_document():
+    rt = _routine()
+    rt.name = 'A&B"'
+    xml = encoded_routine(rt, _attr01(), RT_OFF, 3)
+    assert 'Name="A&amp;B&quot;"' in xml.split(">\n", 1)[0]
+    doc = _decrypt(xml.split(">\n", 1)[1][: -len("</EncodedData>")])
+    assert 'Name="A&amp;B&quot;"' in doc
+
+
+def test_cipher_is_cbc_iv_zero_pkcs7():
+    # A whole-block plaintext still gets a full block of padding.
+    body = _encrypt_b64(b"0123456789abcdef", 3)
+    raw = base64.b64decode(body + "=" * (-len(body) % 4))
+    assert len(raw) == 32
+    aes = _sp_aes(3, dict(_SP_KEYS)[3])
+    assert _sp_cbc(raw, aes, 2)[16:] == bytes([16]) * 16
+
+
+def test_routine_to_xml_renders_the_blob_verbatim():
+    rt = _routine()
+    rt._encoded = "<EncodedData/>"
+    assert rt.to_xml() == "<EncodedData/>"
