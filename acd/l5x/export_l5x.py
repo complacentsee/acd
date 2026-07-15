@@ -1,4 +1,5 @@
 import argparse
+import gzip
 import os
 import re
 import sqlite3
@@ -26,21 +27,43 @@ from acd.record.sbregion import SbRegionRecord
 from acd.record.source_protection import build_uid_name_map, is_v21_version
 
 
+_VERSION_LOG = "Version.Log"     # the container's per-save Studio version banner
+_GZIP_MAGIC = b"\x1f\x8b"        # container streams may be gzip-compressed
+_SAVED_VERSION_RE = re.compile(r"Saved - (V[\d.]+/[\d.]+)")
+
+
 def detect_acd_version(acd_filename: os.PathLike) -> Optional[str]:
     """Read the 'Saved - VNN.../NNNN.NNN' Studio version string from an ACD.
 
-    The version banner lives in the plaintext Version.Log at the very start of
-    the ACD container, so a short read of the file head suffices.  Returns the
-    last (most recent) saved version string, or None if not found.  Used to
+    Returns the LAST (most recent) saved version, or None if not found.  Used to
     select the V21 source-protection rung path (see acd.record.sbregion).
+
+    Version.Log records one line PER SAVE and is the container's first stream, so
+    its length tracks the project's save history, not the format: it runs to 175 KB
+    (3,429 saves) on the pool's most-edited project.  Read the whole STREAM through
+    the container's file table -- a fixed-size read of the file head truncates the
+    log mid-history on a long-lived project and silently returns some middle save
+    (22% of the pool's ACDs; a V31 project reported V10).  Bounding the read the
+    other way is no better: past Version.Log sits ProjectTemplate.ACD, a NESTED
+    container carrying its own Version.Log, so an over-long read finds a foreign
+    project's saves.
     """
     try:
-        with open(acd_filename, "rb") as fh:
-            head = fh.read(8192).decode("latin1")
-    except OSError:
+        for record in Unzip(acd_filename).records:
+            if record.filename != _VERSION_LOG:
+                continue
+            with open(acd_filename, "rb") as fh:
+                fh.seek(record.file_offset)
+                blob = fh.read(record.file_length)
+            if blob[:2] == _GZIP_MAGIC:
+                blob = gzip.decompress(blob)
+            matches = _SAVED_VERSION_RE.findall(blob.decode("latin1"))
+            return matches[-1] if matches else None
+    except (OSError, RuntimeError, struct.error, EOFError, gzip.BadGzipFile):
+        # RuntimeError: Unzip rejects a non-ACD outright. Callers have always been
+        # able to treat an unreadable version as absent rather than fatal.
         return None
-    matches = re.findall(r"Saved - (V[\d.]+/[\d.]+)", head)
-    return matches[-1] if matches else None
+    return None
 
 
 _FAFA_IDENTIFIER = 64250  # 0xFAFA stream identifier
