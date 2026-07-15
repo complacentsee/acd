@@ -3628,11 +3628,24 @@ class AoiBuilder(L5xElementBuilder):
         # AOIs with no ext[0x01] carry the revision inline at the second "20 24"
         # marker. Never emit "0.0"; fall back to the 1.0 default.
         rev_major = rev_minor = 0
+        _legacy_noe01 = False
         if e01:
             _moff, _noff = (0x9C, 0x9E) if len(e01) >= 0x160 else (0x1A, 0x1C)
             if len(e01) > _noff + 1:
                 rev_major = struct.unpack_from("<H", e01, _moff)[0]
                 rev_minor = struct.unpack_from("<H", e01, _noff)[0]
+        elif (len(aoi_record) > 0x11D and aoi_record[0x11B] == 0
+              and aoi_record[0x11D] == 0
+              and (aoi_record[0x11A] or aoi_record[0x11C])):
+            # Older AOI schema (no ext-attr 0x01, e.g. V16-17 imported libraries):
+            # the revision is a zero-padded major u16 @ 0x11A / minor u16 @ 0x11C
+            # in the definition record. The zero-high-byte guard (bytes
+            # 0x11B/0x11D == 0) fences this off from OTHER no-ext01 schemas whose
+            # 0x11A holds unrelated data -- such a record fails the guard and
+            # drops to the legacy "20 24" scan below (today's output, 0-worse).
+            rev_major = struct.unpack_from("<H", aoi_record, 0x11A)[0]
+            rev_minor = struct.unpack_from("<H", aoi_record, 0x11C)[0]
+            _legacy_noe01 = True
         else:
             _offs = [i for i in range(len(aoi_record) - 1)
                      if aoi_record[i] == 0x20 and aoi_record[i + 1] == 0x24]
@@ -3647,7 +3660,17 @@ class AoiBuilder(L5xElementBuilder):
         # source-protected ones; 0 false-positives pool-wide). ExecutePostscan is
         # never set in the reference, so it stays "false". Fail-safe to "false" when
         # the ext is absent/too short.
-        _flag_byte = e01[0x02] if len(e01) > 0x02 else 0
+        if len(e01) > 0x02:
+            _flag_byte = e01[0x02]
+        elif _legacy_noe01 and len(aoi_record) > 0x80:
+            # The same execution-config bitfield (bit0 = EnableInFalse,
+            # bit4 = Prescan), carried at record offset 0x80 in the older no-ext01
+            # schema. Trusted only when the revision gate above confirmed that
+            # schema (_legacy_noe01); every other no-ext01 record keeps the 0
+            # default (false), i.e. today's output.
+            _flag_byte = aoi_record[0x80]
+        else:
+            _flag_byte = 0
         execute_enable_in_false = "true" if (_flag_byte & 0x01) else "false"
         execute_prescan = "true" if (_flag_byte & 0x10) else "false"
 
@@ -3884,11 +3907,12 @@ class AoiBuilder(L5xElementBuilder):
             except Exception:
                 pass
 
-        # Class="Standard" on every AOI of a safety controller; omitted otherwise.
-        # A safety project carries a 'SafetyController' comp under the controller
-        # collection; the reference never classifies an AOI "Safety" in this corpus,
-        # so a uniform "Standard" is always correct (a future safety-scoped AOI would
-        # need a per-AOI discriminator that is not present here).
+        # @Class on a safety-controller project: Standard vs Safety per the AOI's
+        # stored class enum, a u16 at ext-attr 0x01 offset 0x7C (0 = Standard,
+        # 6 = Safety; verified string-exact on every classed AOI in both pools: 9
+        # Safety at code 6, 206 Standard at code 0). Fail-closed: an absent/short
+        # ext-attr or any unknown code keeps "Standard" (today's value). Omitted
+        # entirely on a non-safety project (no SafetyController comp).
         aoi_class: Union[str, None] = None
         try:
             _rcc = self._cur.execute(
@@ -3898,6 +3922,8 @@ class AoiBuilder(L5xElementBuilder):
                     "SELECT 1 FROM comps WHERE parent_id=? AND comp_name="
                     "'SafetyController' LIMIT 1", (_rcc[0],)).fetchone():
                 aoi_class = "Standard"
+                if len(e01) > 0x7D and struct.unpack_from("<H", e01, 0x7C)[0] == 6:
+                    aoi_class = "Safety"
         except Exception:
             aoi_class = None
 
