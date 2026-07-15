@@ -74,6 +74,7 @@ from acd.l5x.module_builder import (
 from acd.l5x import tag_value as _tag_value
 from acd.l5x.axis_cip import render_axis_cip_drive as _render_axis_cip_drive
 from acd.l5x.axis_cip import render_motion_group as _render_motion_group
+from acd.l5x.trends import build_trends
 from acd.record.blobs import ControllerProps
 from acd.record.comps import CompsRecord, _SP_MARKER, decrypt_sp_nameless
 
@@ -1680,6 +1681,11 @@ class Controller(L5xElement):
     # Pre-rendered <AlarmDefinitions> element (per-datatype member alarm
     # definitions); "" when the project defines none.
     _alarm_definitions: str = field(default="")
+    # Pre-rendered <Trends> section (see acd.l5x.trends). Sits between
+    # <WallClockTime> and <DataLogs>. Defaults to the bare '<Trends/>' the
+    # controller emitted before the renderer existed, which is also what the
+    # builder passes for a project with no reconstructable trend.
+    _trends_xml: str = field(default="<Trends/>")
 
     def __post_init__(self):
         super().__post_init__()
@@ -1740,7 +1746,7 @@ class Controller(L5xElement):
             + self._comm_ports_xml
             + f'<CST MasterID="{self._cst_master_id}"/>'
             + '<WallClockTime LocalTimeAdjustment="0" TimeZone="0"/>'
-            + '<Trends/>'
+            + self._trends_xml
             + ('<DataLogs/>' if self._emit_data_logs else '')
             + (f'<TimeSynchronize Priority1="{self._ts_priority1}" '
                f'Priority2="{self._ts_priority2}" PTPEnable="{self._ts_ptp_enable}"/>')
@@ -5880,6 +5886,23 @@ class ControllerBuilder(L5xElementBuilder):
         except Exception:
             pass
 
+    def _pass_trends(self):
+        # <Trends>: the RSTrendX trend objects hanging off the controller's
+        # RxTrendCollection (see acd.l5x.trends). sw_major is the DERIVED
+        # SoftwareRevision major from project_flags -- the same value the export
+        # header carries -- and keys the <Template> newline band and the v19 pen
+        # attribute order. It is underivable as 0, which no witnessed band covers,
+        # so the renderer then withholds every trend and the section degrades to
+        # the '<Trends/>' emitted before this pass existed.
+        try:
+            _pf = self._cur.execute(
+                "SELECT sw_major FROM project_flags").fetchone()
+            _sw_major = (_pf[0] if _pf else 0) or 0
+        except Exception:
+            _sw_major = 0
+        return build_trends(self._cur, self._object_id, self._short_header,
+                            _sw_major)
+
     def _pass_safety_info(self):
         # Controller-level <SafetyInfo> signature children (safety-signed projects
         # only). The named_safety_signatures table is keyed by (otype, embedded name);
@@ -6041,6 +6064,7 @@ class ControllerBuilder(L5xElementBuilder):
         self._pass_motion_sync(tags, programs, modules)
         (root_sig, ctrl_attr_sig, tag_map_sig, app_rollup_sig, safety_info_attrs,
          alarm_definitions, safety_tag_map) = self._pass_safety_info()
+        trends_xml = self._pass_trends()
 
         controller = Controller(
             controller_name,
@@ -6103,6 +6127,7 @@ class ControllerBuilder(L5xElementBuilder):
             _safety_info_attrs=safety_info_attrs,
             _alarm_definitions=alarm_definitions,
             _safety_tag_map=safety_tag_map,
+            _trends_xml=trends_xml,
         )
         # Controller-scoped <Tags> safety signature (separate from the AOI-section one).
         if _ctrl_tags_sig:
