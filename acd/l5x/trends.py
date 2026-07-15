@@ -45,6 +45,20 @@
 # Every field of the start struct re-appears at exactly +4118 in the stop struct
 # and drives the matching Stop* attribute, and the capture struct begins exactly
 # where the second trigger struct ends.
+#
+# Each trigger struct is
+#   +0 TriggerType, +4 ConditionCount, then conditions at +8, stride 0x55a,
+# and each condition is
+#   +0 TargetType, +4 Operation, +8 TargetValue, +0xc ValueType (u16),
+#   +0xb0 Tag (UTF-16), +0x352 TargetTag (UTF-16), +0x552 LogicalOp.
+# This inner layout is NOT fitted to the reference -- it is read out of the
+# vendor's own RxTrendGroup routines (the blob IS their sTriggerInfo struct,
+# memcpy'd into attr 0xbe at its natural size of 0x2268). That matters because
+# the reference holds exactly ONE distinct trigger configuration, so several
+# rival offset assignments score 2/2 against it: notably +4 reads 1 and would
+# "confirm" TargetValue1="1", but +4 is the CONDITION COUNT and reads 1 only
+# because this witness has one condition. Field identity here comes from the
+# code that writes each field, not from the values it happens to hold.
 
 import html
 import struct
@@ -55,6 +69,7 @@ from acd.l5x.base import (
     _AT_TOKEN_RE,
     _xml_sane,
     own_description,
+    resolve_at_tokens,
     short_own_description,
 )
 from acd.l5x.tag_value import _fmt_real_decorated, _format_int_radix
@@ -111,15 +126,62 @@ CAPTURE_BASE = TRIGGER_BASE_STOP + TRIGGER_STRIDE         # 8236
 
 #: relative to a trigger base
 OFF_TRIGGER_TYPE = 0
+OFF_CONDITION_COUNT = 4
+OFF_CONDITION_0 = 8
+
+#: A trigger's conditions are a dense array at trigger_base + 8, stride 0x55a.
+CONDITION_STRIDE = 0x55A  # 1370
+
+#: relative to a condition base
+OFF_COND_TARGET_TYPE = 0
+OFF_COND_OPERATION = 4
+OFF_COND_TARGET_VALUE = 8
+OFF_COND_VALUE_TYPE = 0x0C  # u16
+OFF_COND_TAG = 0xB0
+#: The tag slot is a fixed 674-byte (337 UTF-16 unit) buffer: cond+0xb0..+0x351,
+#: where the TargetTag buffer begins.
+COND_TAG_LEN = 0x352 - 0xB0
 
 #: absolute, inside the capture struct (expressed off CAPTURE_BASE so the
 #: three-struct factoring above stays the single source of these offsets)
+OFF_PRE_SAMPLE_TYPE = CAPTURE_BASE + 0      # 8236
+OFF_PRE_SAMPLES = CAPTURE_BASE + 4          # 8240
+OFF_POST_SAMPLE_TYPE = CAPTURE_BASE + 8     # 8244
+OFF_POST_SAMPLES = CAPTURE_BASE + 12        # 8248
 OFF_CAPTURE_UNIT = CAPTURE_BASE + 16        # 8252
 OFF_CAPTURE_SIZE = CAPTURE_BASE + 20        # 8256
 OFF_NUMBER_OF_CAPTURES = CAPTURE_BASE + 36  # 8272
 
 #: Vocabularies DERIVED from the reference; an unseen code fails closed.
-TRIGGER_TYPE_VOCAB = {2: "Event Trigger", 3: "No Trigger"}
+TRIGGER_TYPE_NONE = 3
+TRIGGER_TYPE_EVENT = 2
+TRIGGER_TYPE_VOCAB = {TRIGGER_TYPE_EVENT: "Event Trigger",
+                      TRIGGER_TYPE_NONE: "No Trigger"}
+
+#: Pre/PostSampleType. The companion count is a sample count under "Samples" and
+#: MILLISECONDS under "Time Period" -- either way the reference renders the
+#: stored u32 verbatim, so the unit never reaches the renderer.
+SAMPLE_TYPE_VOCAB = {1: "Samples", 2: "Time Period"}
+
+#: TriggerTargetType is a 0/1 selector: 1 = the target is a literal value, 0 =
+#: the target is a TAG (held at cond+0x352). Only 1 has a KNOWN L5X spelling --
+#: the string for 0 is absent from both the vendor binary and the reference, so
+#: 0 is deliberately NOT in this table and fails closed rather than guess
+#: "Target Tag". The cond+0x352 TargetTag slot is unreachable for the same
+#: reason and is therefore not decoded at all.
+TARGET_TYPE_VOCAB = {1: "Target Value"}
+
+#: TriggerTargetValue's storage discriminator (u16 at cond+0xc).
+VALUE_TYPE_INT = 1
+VALUE_TYPE_FLOAT = 2
+
+#: TriggerOperation is emitted as a RAW INTEGER -- there is no value->string
+#: table anywhere and the reference literally renders Operation1="0". The vendor
+#: validator rejects <0 and >14, so a code outside that range means the field has
+#: been mis-read -> fail closed. (The validator additionally rejects 9..14 for
+#: float operands; that is an operand-typing rule, not a decode rule, so it is
+#: not enforced here.)
+TRIGGER_OPERATION_MAX = 14
 
 CAPTURE_UNIT_SAMPLES = 1
 CAPTURE_UNIT_TIME = 2
@@ -128,15 +190,21 @@ CAPTURE_UNIT_TIME_AS_SAMPLES = 0xFFFFFFFF
 #: SamplePeriod: microseconds -> milliseconds.
 SAMPLE_PERIOD_DIVISOR = 1000
 
-#: FLAG -- CONST-RENDER. TrendxVersion is "5.2" on all 142 reference trends,
-#: across 9 SoftwareRevisions and both pools. It is not in the 0xbe blob, not a
-#: string in the OLE template, and the template's Contents header tracks neither
-#: it nor itself. Methodologically the target has ZERO variance across the whole
-#: reference, so any constant field would "derive" it and no candidate could ever
-#: be falsified -- a claimed derivation would be numerology. It is therefore
-#: const-rendered, following the in-repo precedent for a reference-constant
-#: literal (elements.py `schema_revision = "1.0"`). It is a single global
-#: constant, not a catalog/type-keyed table.
+#: CONST-RENDER -- SETTLED. TrendxVersion is "5.2" on all 142 reference trends,
+#: across 9 SoftwareRevisions and both pools, and it is not in the 0xbe blob, not
+#: a string in the OLE template, and not tracked by the template's Contents
+#: header. That alone could not settle it: with ZERO variance across the
+#: reference, any constant field would "derive" it and no candidate could ever be
+#: falsified. The vendor binary settles it. L"5.2" is a literal assigned to the
+#: RxTrendGroup member at +0x598 in its CONSTRUCTOR; the getter that feeds the
+#: export returns that member; the setter that would overwrite it has zero
+#: callers anywhere in the library; and the measured attr inventory of the trend
+#: record (137/137) carries no version attribute at all -- so there is nothing
+#: for it to be derived FROM. It is genuinely a build constant of the trend
+#: component, const-rendered like elements.py's `schema_revision = "1.0"`.
+#: SCOPE: it is a constant of the EXPORTING Studio build, not of the record, so a
+#: future Studio major could carry a different literal. Our reference is 100%
+#: "5.2" across V7-V37.
 TRENDX_VERSION = "5.2"
 
 #: --- pens ------------------------------------------------------------------
@@ -154,11 +222,15 @@ PROPS_SENTINEL = 0xFFFFFFFF
 
 VISIBLE_VOCAB = {0: "false", 1: "true"}
 TYPE_VOCAB = {0: "Analog", 1: "Digital"}
-#: Reference-degenerate: only 0 is witnessed for Style/Marker. Both offsets are
-#: READ (never const-rendered) and any other value fails closed, so an
-#: unwitnessed Style/Marker is never rendered -- but the OFFSET ASSIGNMENT itself
-#: cannot be confirmed from a corpus in which both fields are always 0, and is
-#: recorded here as a known soft spot.
+#: Reference-degenerate: only 0 is witnessed for Style/Marker, so the offset
+#: assignment could not be confirmed from a corpus in which both fields are
+#: always 0. The vendor binary CONFIRMS both: the pen blob is a verbatim memcpy
+#: of RxCChartPen+0x0c, and its one-instruction getters put Style at member
+#: +0x24 (= blob +24) and Marker at member +0x2c (= blob +32) -- exactly where
+#: this module reads them. The soft spot is closed for the OFFSETS. The
+#: VOCABULARIES stay reference-only and fail-closed: the binary bounds Style to
+#: 0..4 and Marker to 0..83 but never maps a code to an L5X spelling, so a
+#: non-zero pen still withholds rather than guess.
 STYLE_VOCAB = {0: "0"}
 MARKER_VOCAB = {0: "0"}
 
@@ -370,22 +442,130 @@ def _capture_size(blob: bytes, sp: int) -> Tuple[str, Optional[int]]:
     raise _Withhold("unseen capture-size unit %#x" % unit)
 
 
-def _trigger_type(blob: bytes, base: int) -> str:
+def _trigger_type(blob: bytes, base: int) -> Tuple[int, str]:
+    """(code, TriggerType string) for the trigger struct at `base`."""
     code = _u32(blob, base + OFF_TRIGGER_TYPE)
     try:
-        return TRIGGER_TYPE_VOCAB[code]
+        return code, TRIGGER_TYPE_VOCAB[code]
     except KeyError:
         raise _Withhold("unseen trigger-type code %r at +%d" % (code, base))
 
 
-def _trend_attrs(trend: _TrendRecord) -> List[Tuple[str, str]]:
+def _trigger_tag(cur: Cursor, blob: bytes, cond: int) -> str:
+    """The resolved source-tag name of one trigger condition.
+
+    The tag is NOT stored as a name: the exporter replaces names with object
+    UIDs on the way out (its own '@<hex>@<member path>' encoding), so the stored
+    '@6b2bd9d8@.2' has to be resolved through comps to render 'SomeTag.2'.
+    Emitting the stored string raw would emit garbage. Resolution reuses the
+    converter's existing @hex@ token resolver.
+    """
+    raw = blob[cond + OFF_COND_TAG:cond + OFF_COND_TAG + COND_TAG_LEN]
+    try:
+        stored = _utf16z(raw)
+    except (UnicodeDecodeError, ValueError):
+        raise _Withhold("trigger tag slot is not UTF-16LE")
+    if not stored:
+        raise _Withhold("event-trigger condition has an empty tag")
+    if not _AT_TOKEN_RE.search(stored):
+        # The on-disk form is UID-encoded; a bare name here is a shape neither
+        # the vendor's writer nor the reference witnesses, so it is not passed
+        # through on the assumption that it is already a name.
+        raise _Withhold("trigger tag %r carries no @hex@ token" % stored)
+    name = resolve_at_tokens(cur, stored)
+    if not name:
+        raise _Withhold("trigger tag %r does not resolve" % stored)
+    return name
+
+
+def _target_value(blob: bytes, cond: int) -> str:
+    """TriggerTargetValue, formatted per the condition's ValueType.
+
+    ValueType decides how the dword at cond+8 is ENCODED, so it cannot be
+    ignored: the reference's integer 1 reinterpreted as f32 would render
+    1.4e-45. Only the integer path is witnessed (ValueType=1 on both event
+    trends); the float path reads the dword as the f32 the vendor's own
+    string<->value converter stores there and hands it to the converter's
+    existing REAL formatter -- the same one this module already uses for a
+    <Pen>'s Min/Max.
+    """
+    vtype = struct.unpack_from("<H", blob, cond + OFF_COND_VALUE_TYPE)[0]
+    if vtype == VALUE_TYPE_INT:
+        return str(_u32(blob, cond + OFF_COND_TARGET_VALUE))
+    if vtype == VALUE_TYPE_FLOAT:
+        return _fmt_real_decorated(
+            struct.unpack_from("<f", blob, cond + OFF_COND_TARGET_VALUE)[0])
+    raise _Withhold("unseen trigger ValueType %r" % vtype)
+
+
+def _trigger_conditions(cur: Cursor, blob: bytes, base: int,
+                        prefix: str) -> List[Tuple[str, str]]:
+    """The <i>-suffixed condition attributes of one EVENT trigger.
+
+    ConditionCount MUST be 1. The struct holds room for more and the vendor
+    supports a second condition, but a second condition exists precisely when
+    condition 0's LogicalOp (cond+0x552) is non-zero -- and that logical
+    operator has to appear in the L5X too, under an attribute name and
+    vocabulary that are in neither the vendor binary nor the reference (which
+    contains no *Tag2/*Operation2/LogicalOp attribute at all). Rendering a
+    2-condition trigger would therefore silently DROP the operator that joins
+    them, which is exactly the partial emission this module refuses. So 2 fails
+    closed as loudly as 3 does, and costs nothing today.
+    """
+    count = _u32(blob, base + OFF_CONDITION_COUNT)
+    if count != 1:
+        raise _Withhold(
+            "trigger declares %d conditions; only the single-condition L5X "
+            "shape is known (the LogicalOp attribute is undecoded)" % count)
+    out: List[Tuple[str, str]] = []
+    for i in range(count):
+        cond = base + OFF_CONDITION_0 + i * CONDITION_STRIDE
+        n = str(i + 1)
+        op = _u32(blob, cond + OFF_COND_OPERATION)
+        if op > TRIGGER_OPERATION_MAX:
+            raise _Withhold("trigger operation %d is out of the vendor's "
+                            "0..%d range" % (op, TRIGGER_OPERATION_MAX))
+        ttype = _u32(blob, cond + OFF_COND_TARGET_TYPE)
+        if ttype not in TARGET_TYPE_VOCAB:
+            raise _Withhold(
+                "TriggerTargetType=%r has no known L5X spelling" % ttype)
+        out.append((prefix + "TriggerTag" + n, _trigger_tag(cur, blob, cond)))
+        out.append((prefix + "TriggerOperation" + n, str(op)))
+        out.append((prefix + "TriggerTargetType" + n, TARGET_TYPE_VOCAB[ttype]))
+        out.append((prefix + "TriggerTargetValue" + n, _target_value(blob, cond)))
+    return out
+
+
+def _sample_attrs(blob: bytes, type_off: int, count_off: int,
+                  type_attr: str, count_attr: str) -> List[Tuple[str, str]]:
+    """The Pre*/Post* sample-window attributes of one EVENT trigger.
+
+    The vendor binds the Pre window to the START trigger and the Post window to
+    the STOP trigger, and the reference agrees: the sample window appears on
+    exactly the 2 event trends and on none of the 140 'No Trigger' ones.
+    """
+    return [
+        (type_attr, _vocab(SAMPLE_TYPE_VOCAB, _u32(blob, type_off), type_attr)),
+        (count_attr, str(_u32(blob, count_off))),
+    ]
+
+
+def _trend_attrs(cur: Cursor, trend: _TrendRecord) -> List[Tuple[str, str]]:
     """The <Trend> attributes in reference order.
 
     Order (read off the raw reference text, not an attrib dict):
         Name, SamplePeriod, NumberOfCaptures, CaptureSizeType, [CaptureSize,]
-        StartTriggerType, [start event block,] StopTriggerType,
-        [stop event block,] TrendxVersion
-    The bracketed event blocks are withheld -- see _trend_body.
+        StartTriggerType, [StartTriggerTag1, StartTriggerOperation1,
+                           StartTriggerTargetType1, StartTriggerTargetValue1,
+                           PreSampleType, PreSamples,]
+        StopTriggerType,  [StopTriggerTag1, ... PostSampleType, PostSamples,]
+        TrendxVersion
+    Each bracketed event block is emitted iff ITS OWN trigger is an Event
+    Trigger -- the two triggers are independent structs and the vendor binds the
+    Pre window to the start trigger and the Post window to the stop trigger. All
+    137 in-scope trends are symmetric (both No Trigger, or both Event Trigger),
+    so a one-sided event trend renders by this per-trigger rule rather than by a
+    witnessed example; it costs 0 today.
     """
     blob = trend.attrs.get(ATTR_CAPTURE)
     if blob is None:
@@ -396,32 +576,8 @@ def _trend_attrs(trend: _TrendRecord) -> List[Tuple[str, str]]:
                         % (len(blob), CAPTURE_BLOB_LEN))
 
     sp = _sample_period_ms(trend.attrs)
-    start = _trigger_type(blob, TRIGGER_BASE_START)
-    stop = _trigger_type(blob, TRIGGER_BASE_STOP)
-
-    # An Event Trigger additionally carries StartTriggerTag1 /
-    # StartTriggerOperation1 / StartTriggerTargetType1 / StartTriggerTargetValue1
-    # / PreSampleType / PreSamples (and the Stop* twins). The reference holds
-    # exactly ONE DISTINCT event configuration (copied between two projects), in
-    # which Operation1="0", TargetType1="Target Value", TargetValue1="1". The
-    # candidate fields are +4=1, +8=1, +12=0, +16=1, so TargetValue1 could be read
-    # from +4, +8 OR +16 -- three assignments, all scoring 2/2, no evidence to
-    # choose; Operation1="0" could be +12 or any coincidentally-zero field; and
-    # TargetType1 has NO discriminating field at all (zero variance means no
-    # candidate can be confirmed or refuted). A renderer built on that would
-    # reproduce these 2 trends by construction and silently fabricate attributes
-    # on any project with a different trigger, so the whole trend fails closed.
-    # An ASYMMETRIC trend (start Event, stop No Trigger or vice versa) is likewise
-    # unwitnessed -- all 137 have StartTriggerType == StopTriggerType -- so the
-    # attribute order/presence of a one-sided event trend is unknown.
-    # TO UNLOCK: a project whose event triggers VARY -- a TargetValue != 1 pins
-    # the value field, a non-zero Operation pins the operation field, a second
-    # TargetType spelling pins the vocabulary.
-    if start == "Event Trigger" or stop == "Event Trigger":
-        raise _Withhold(
-            "the event-trigger attribute block is not derivable from the "
-            "reference's single distinct witness")
-
+    start_code, start = _trigger_type(blob, TRIGGER_BASE_START)
+    stop_code, stop = _trigger_type(blob, TRIGGER_BASE_STOP)
     cst, csize = _capture_size(blob, sp)
 
     out = [
@@ -432,8 +588,19 @@ def _trend_attrs(trend: _TrendRecord) -> List[Tuple[str, str]]:
     ]
     if csize is not None:
         out.append(("CaptureSize", str(csize)))
+
     out.append(("StartTriggerType", start))
+    if start_code == TRIGGER_TYPE_EVENT:
+        out += _trigger_conditions(cur, blob, TRIGGER_BASE_START, "Start")
+        out += _sample_attrs(blob, OFF_PRE_SAMPLE_TYPE, OFF_PRE_SAMPLES,
+                             "PreSampleType", "PreSamples")
+
     out.append(("StopTriggerType", stop))
+    if stop_code == TRIGGER_TYPE_EVENT:
+        out += _trigger_conditions(cur, blob, TRIGGER_BASE_STOP, "Stop")
+        out += _sample_attrs(blob, OFF_POST_SAMPLE_TYPE, OFF_POST_SAMPLES,
+                             "PostSampleType", "PostSamples")
+
     out.append(("TrendxVersion", TRENDX_VERSION))
     return out
 
@@ -639,7 +806,7 @@ def _trend_body(cur: Cursor, trend: _TrendRecord, short_header: bool,
     Child order, read off the raw reference text: Description (when present),
     Template, Pens (when the trend has pens).
     """
-    attrs = _trend_attrs(trend)
+    attrs = _trend_attrs(cur, trend)
     description = _trend_description(cur, trend, short_header)
     template = _render_template(trend, sw_major)
     pens = _render_pens(

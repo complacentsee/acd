@@ -343,6 +343,37 @@ def scope_owner_data_exchange_id(cur: Cursor, parent: int,
 _AT_TOKEN_RE = re.compile(r"@([0-9a-fA-F]+)@")
 
 
+def resolve_at_tokens(cur: Cursor, s: str) -> Union[str, None]:
+    """Resolve every ``@<hex>@`` comps-object token in `s`, or None.
+
+    Each ``@<hex>@`` is a comps object_id whose comp_name replaces the token in
+    place; a comp_name that is itself of the form ``&<parentHex><suffix>`` is a
+    further reference and is followed recursively (the module-reference
+    convention). Text outside the tokens passes through verbatim, so a stored
+    ``@6b2bd9d8@.2`` renders as ``SomeTag.2``.
+
+    FAIL-CLOSED: returns None unless EVERY token resolves -- a half-resolved
+    string still carries an '@' and would name the wrong object.
+    """
+    def _resolve(oid: int, depth: int = 0) -> "Union[str, None]":
+        if depth > 6:
+            return None
+        row = cur.execute(
+            "SELECT comp_name FROM comps WHERE object_id=?",
+            (oid,)).fetchone()
+        if not row or row[0] is None:
+            return None
+        m = re.match(r"^&([0-9a-fA-F]+)(.*)$", row[0])
+        if m:
+            p = _resolve(int(m.group(1), 16), depth + 1)
+            return (p + m.group(2)) if p is not None else None
+        return row[0]
+
+    out = _AT_TOKEN_RE.sub(
+        lambda m: (_resolve(int(m.group(1), 16)) or m.group(0)), s)
+    return out if "@" not in out else None
+
+
 def resolve_aoi_alias_target(cur: Cursor, raw_rec: bytes,
                              short_header: bool) -> Union[str, None]:
     """The AliasFor target of an AOI alias parameter, or None.
@@ -365,24 +396,7 @@ def resolve_aoi_alias_target(cur: Cursor, raw_rec: bytes,
         s = raw.decode("utf-16-le", errors="replace").split("\x00")[0]
         if not _AT_TOKEN_RE.search(s):
             return None
-
-        def _resolve(oid: int, depth: int = 0) -> "Union[str, None]":
-            if depth > 6:
-                return None
-            row = cur.execute(
-                "SELECT comp_name FROM comps WHERE object_id=?",
-                (oid,)).fetchone()
-            if not row or row[0] is None:
-                return None
-            m = re.match(r"^&([0-9a-fA-F]+)(.*)$", row[0])
-            if m:
-                p = _resolve(int(m.group(1), 16), depth + 1)
-                return (p + m.group(2)) if p is not None else None
-            return row[0]
-
-        out = _AT_TOKEN_RE.sub(
-            lambda m: (_resolve(int(m.group(1), 16)) or m.group(0)), s)
-        return out if "@" not in out else None
+        return resolve_at_tokens(cur, s)
     except Exception:
         return None
 
