@@ -328,19 +328,41 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count):
             # RemoteElement is a PLC data address (e.g. N20:0); LocalElement a tag.
             # These families render no ConnectedFlag. A connected DH+ message
             # (CommTypeCode 1) additionally carries the @Channel / @DHPlus*
-            # attrs, which are not decoded, so that case is skipped whole
-            # (under-emit rather than emit a wrong subset) for both SLC and
-            # PLC5. A connected EtherNet message (cf==1, ctc==0) gets
-            # CacheConnections (same byte-1 bit as CIP).
+            # routing attrs decoded from the config blob. A connected EtherNet
+            # message (cf==1, ctc==0) gets CacheConnections (same byte-1 bit as
+            # CIP).
             if re_el is None or le is None:
-                return None
-            if cf == 1 and ctc == 1:
                 return None
             P += [("RemoteElement", re_el), ("RequestedLength", str(req))]
             add_cp()
-            P += [("CommTypeCode", "0"), ("LocalIndex", "0"), ("LocalElement", le)]
-            if cf == 1:
-                P.append(("CacheConnections", cc_val))
+            if cf == 1 and ctc == 1:
+                # Connected DH+ variant. Channel = a1[320] (an ASCII channel
+                # letter, rendered single-quoted, e.g. "'A'"); DHPlusSourceLink =
+                # u16 @324, DHPlusDestinationLink = u16 @326,
+                # DHPlusDestinationNode = u16 @328 rendered in zero-padded octal
+                # (the Logix DH+ node radix, e.g. 8#000_060). The 354/428 length
+                # gate guarantees these offsets are present; still fail closed on
+                # an implausible (non-letter) Channel byte.
+                ch = a1[320]
+                if not (0x41 <= ch <= 0x5A):
+                    return None
+                src = a1[324] | (a1[325] << 8)
+                dst = a1[326] | (a1[327] << 8)
+                node = a1[328] | (a1[329] << 8)
+                node_oct = format(node, "06o")
+                node_oct = node_oct[:3] + "_" + node_oct[3:]
+                P += [("CommTypeCode", str(ctc)),
+                      ("Channel", "'" + chr(ch) + "'"),
+                      ("DHPlusSourceLink", str(src)),
+                      ("DHPlusDestinationLink", str(dst)),
+                      ("DHPlusDestinationNode", "8#" + node_oct),
+                      ("LocalIndex", "0"), ("LocalElement", le),
+                      ("CacheConnections", cc_val)]
+            else:
+                P += [("CommTypeCode", "0"), ("LocalIndex", "0"),
+                      ("LocalElement", le)]
+                if cf == 1:
+                    P.append(("CacheConnections", cc_val))
         elif mt == "Module Reconfigure":
             P += [("RequestedLength", str(req))]
             add_cp()
@@ -349,7 +371,14 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count):
             P += [("RequestedLength", str(req)), ("CommTypeCode", "0"), ("LocalIndex", "0")]
         else:
             return None
-        params = " ".join('%s="%s"' % (k, html.escape(str(v), quote=True)) for k, v in P)
+        # L5X attribute values are double-quoted, so an apostrophe is legal
+        # unescaped; the reference leaves the DH+ Channel quotes literal
+        # (Channel="'A'"), so that one attribute escapes with quote=False (still
+        # escaping & < >) while every other attribute keeps quote=True. "Channel"
+        # occurs only in the DH+ branch, so no other family changes.
+        params = " ".join(
+            '%s="%s"' % (k, html.escape(str(v), quote=(k != "Channel")))
+            for k, v in P)
         return '<Data Format="Message">\n<MessageParameters ' + params + '/>\n</Data>'
     except Exception:
         return None
