@@ -8,8 +8,9 @@
 # existence: an FDFD-only relic (CompsRecord.dead_oids) is a deleted component
 # Studio never exports, so it is treated as absent rather than emitted from
 # its stale record (0-FP/0-FN over the 116-project reference pool). The one OEM
-# attribute with no in-record source (SerialPort Channel, reference-invariant
-# "0") is omitted rather than fabricated. Unrecognised enum codes or
+# attribute with no in-record source (SerialPort Channel, the reference-invariant
+# CommPort index "0") is const-rendered (see _SERIAL_CHANNEL), not read from the
+# record. Unrecognised enum codes or
 # short/absent payloads degrade to omitting the element (the pre-existing
 # missing-element residual) instead of guessing.
 
@@ -31,6 +32,16 @@ _EMBEDDED_RESPONSE = {0: "Autodetect"}
 _DF1_MODE = {0: "Pt to Pt"}
 _POLLING_MODE = {1: "Message Based (slave can initiate messages)"}
 _MASTER_MSG_TRANSMIT = {0: "Between station polls"}
+
+# CONST-RENDER (flagged structural constant, in the class of trends.TRENDX_VERSION
+# and the "1.0" schema revision). SerialPort @Channel is "0" on every reference
+# SerialPort of both pools (zero variance, zero omissions). It is not a stored
+# record field -- the v21 vendor object model's RxSerialPort exposes no
+# Get/Check/SetChannel accessor, and the record head is a version/gate word, not a
+# channel index -- it is the CommPort collection index, structurally "0" for a
+# controller's single serial channel. There is nothing in the record to derive it
+# from, so it is rendered as the schema constant.
+_SERIAL_CHANNEL = "0"
 
 # The EthernetPort config block sits at offset 106 of the record's 0x1
 # ext-attr value (verified at that one location across all 127 readable
@@ -96,10 +107,11 @@ def build_comm_ports(cur: Cursor, controller_oid: int,
             val = struct.unpack("<I", raw[:4])[0]
             return "&lt;NA&gt;" if val == 0xFFFFFFFF else str(val)
 
-        # OEM Channel="0" has no in-record source (reference-invariant) and is
-        # deliberately omitted here.
+        # Channel is the CommPort collection index (structural "0", see
+        # _SERIAL_CHANNEL); it is the first SerialPort attribute.
         serial = (
-            f'BaudRate="{struct.unpack_from("<I", p, 2)[0] * 256}"'
+            f'Channel="{_SERIAL_CHANNEL}"'
+            f' BaudRate="{struct.unpack_from("<I", p, 2)[0] * 256}"'
             f' Parity="{_PARITY[p[9]]}"'
             f' DataBits="{p[6]} Bits of Data"'
             f' StopBits="{_STOP_BITS[p[7]]}"'
