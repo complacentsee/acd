@@ -38,6 +38,47 @@ from acd.l5x import tag_value as _tag_value
 from acd.record.comps import CompsRecord
 
 
+# --- Nameless module-port object graph ---------------------------------------
+# Nameless.Dat holds the editor's live object graph. Every record's class id is
+# the u16 at offset 0x10 (the same field _safety_tag_map_text reads to find its
+# 0x899 records), and records are linked by the nameless parent_id column.
+#
+# A module owns a port collection, which owns one port per physical port, each of
+# which owns its bus object:
+#     comps module.object_id
+#       -> port collection (0x836)
+#         -> port (0x835)           payload: [u32 bus object_id][u32 port id]
+#           -> bus                  payload (sizeable classes): [u32 Max][u32 Size]
+_NM_PORT_KIND = 0x835
+_NM_PORT_COLLECTION_KIND = 0x836
+
+# Bus classes that carry a [u32 Max][u32 Size] payload -- i.e. the vendor's
+# RxSSizeableBus<T> template instantiations, one class id per bus type. The other
+# bus classes carry no capacity and the reference renders them as a bare <Bus/>.
+# Enumerated from both pools rather than assumed: over every reference <Bus>, a
+# record of one of these classes reproduces Bus@Size exactly (582/582, zero
+# mismatches) and no record of any other class ever does. A class not listed here
+# fails closed (no Size), as does an absent or truncated record.
+_NM_SIZED_BUS_KINDS = frozenset({0x837, 0x83A, 0x83D, 0x83F, 0x85F, 0x860})
+
+
+def _nm_kind(rec: bytes) -> Union[int, None]:
+    """The class id of a nameless record (u16 @ 0x10), or None if too short."""
+    return struct.unpack_from("<H", rec, 0x10)[0] if len(rec) >= 0x12 else None
+
+
+def _nm_payload_off(rec: bytes) -> int:
+    """Offset of a nameless record's payload.
+
+    The fixed header is followed by an optional 0xffffffff filler; probing for it
+    is the same convention ``_safety_tag_map_text`` uses to find its list header.
+    """
+    off = 0x14
+    if len(rec) >= off + 4 and rec[off:off + 4] == b"\xff\xff\xff\xff":
+        off += 4
+    return off
+
+
 @dataclass
 class Module(L5xElement):
     """Represents a Logix hardware module (<Module> in L5X)."""
@@ -963,6 +1004,9 @@ class ModuleBuilder(L5xElementBuilder):
         # Per-port Safety Network Numbers (safety modules only); injected into the
         # decoded ports. {} for non-safety modules.
         port_sn = self._port_safety_networks()
+        # Per-port backplane sizes from this module's Nameless port subtree, used
+        # only for ports the blob leaves with no Bus at all (see _decode_ports_blob).
+        bus_sizes = self._bus_sizes_from_nameless()
 
         def _finish(res):
             # A controller-chassis module's data_link can mis-resolve to an unrelated
@@ -991,7 +1035,8 @@ class ModuleBuilder(L5xElementBuilder):
                 j = raw.find(b"</in>", i)
                 if j >= 0:
                     return _finish(self._decode_ports_blob(
-                        raw[i:j + 5].decode("latin-1", errors="replace"), port_sn))
+                        raw[i:j + 5].decode("latin-1", errors="replace"), port_sn,
+                        bus_sizes))
             # Otherwise the topology is in the child's decrypted ext-attr 0x66
             # image -- either the plaintext body was truncated mid-blob (the root
             # case) or the whole blob is encrypted there with no plaintext copy
@@ -1006,11 +1051,61 @@ class ModuleBuilder(L5xElementBuilder):
                     jj = txt.find("</in>", ii) if ii >= 0 else -1
                     if ii >= 0 and jj >= 0:
                         return _finish(self._decode_ports_blob(
-                            txt[ii:jj + 5], port_sn))
+                            txt[ii:jj + 5], port_sn, bus_sizes))
             except Exception:
                 pass
             # neither plaintext nor 0x66 had a blob; try the next matching child
         return None
+
+    def _bus_sizes_from_nameless(self) -> dict:
+        """{port_id: Bus Size} for this module, read from its Nameless port subtree.
+
+        Walks comps module.object_id -> port collection -> port -> bus (see the
+        _NM_* notes above). The walk is anchored on this module's own object_id
+        and each hop is checked (class id, and the bus must point back at the port
+        that named it), so a project holding several bus objects -- e.g. one whose
+        ControlBus is (Max=32, Size=17) alongside a CompactBus (31, 31) -- still
+        resolves each port to its own record rather than to whichever comes first.
+
+        Fail-closed: a port whose bus record is missing, of a non-sizeable class,
+        truncated, or not back-linked is omitted, leaving today's output intact.
+        """
+        try:
+            colls = self._cur.execute(
+                "SELECT object_id, record FROM nameless WHERE parent_id=?",
+                (self._object_id,)).fetchall()
+        except Exception:
+            return {}
+        out: Dict[int, int] = {}
+        for coll_oid, coll_rec in colls:
+            if coll_rec is None or _nm_kind(bytes(coll_rec)) != _NM_PORT_COLLECTION_KIND:
+                continue
+            for port_oid, prec in self._cur.execute(
+                    "SELECT object_id, record FROM nameless WHERE parent_id=?",
+                    (coll_oid,)).fetchall():
+                if prec is None:
+                    continue
+                prec = bytes(prec)
+                if _nm_kind(prec) != _NM_PORT_KIND:
+                    continue
+                poff = _nm_payload_off(prec)
+                if len(prec) < poff + 8:
+                    continue
+                bus_oid, port_id = struct.unpack_from("<II", prec, poff)
+                row = self._cur.execute(
+                    "SELECT parent_id, record FROM nameless WHERE object_id=?",
+                    (bus_oid,)).fetchone()
+                # The bus must be the child of the port that pointed at it.
+                if row is None or row[0] != port_oid or row[1] is None:
+                    continue
+                brec = bytes(row[1])
+                if _nm_kind(brec) not in _NM_SIZED_BUS_KINDS:
+                    continue
+                boff = _nm_payload_off(brec)
+                if len(brec) < boff + 8:
+                    continue
+                out[port_id] = struct.unpack_from("<I", brec, boff + 4)[0]
+        return out
 
     def _port_safety_networks(self) -> dict:
         """Per-port Safety Network Numbers for a safety module's ports.
@@ -1064,7 +1159,8 @@ class ModuleBuilder(L5xElementBuilder):
         return {}
 
     @staticmethod
-    def _decode_ports_blob(blob: str, port_sn: dict = None) -> "Union[str, None]":
+    def _decode_ports_blob(blob: str, port_sn: dict = None,
+                           bus_sizes: dict = None) -> "Union[str, None]":
         """Render an ``<in>`` topology blob into an L5X ``<Ports>`` block.
 
         Rules (validated byte-for-byte against the reference): Type EN->Ethernet,
@@ -1136,6 +1232,18 @@ class ModuleBuilder(L5xElementBuilder):
                 _pidi = int(pid)
             except (TypeError, ValueError):
                 _pidi = 0
+            # The blob leaves a backplane port's Bus implied on some projects, and
+            # the ACD's own Nameless object graph is the only place its capacity is
+            # recorded. Consulted strictly as a last resort: only a port that none
+            # of the rules above gave a Bus (i.e. one we would emit with no Bus
+            # element at all) is filled in, so no already-correct Bus -- sized or
+            # bare -- can be overwritten. Pool-wide this is exactly sound: every
+            # reference port with no Bus has no bus record either, so a size is
+            # never fabricated for a port the reference leaves bare.
+            if bus is None and bus_sizes:
+                _nb = bus_sizes.get(_pidi)
+                if _nb is not None:
+                    bus = str(_nb)
             addr_attr = f' Address="{addr}"' if addr is not None else ""
             # SafetyNetwork (safety modules only) follows Upstream, matching OEM.
             _snv = port_sn.get(_pidi)
