@@ -616,7 +616,7 @@ class Module(L5xElement):
 # The controller's last-online identity string, ASCII inside the
 # 'TimeSynchronize' record under RxControllerCollection:
 #   '<vendor>;<catalog>[/<series>][ <name>];<serialhex>'
-# e.g. 'Rockwell Automation;1768-L43/C LOGIX5343;6034DD05'. Anchored by a u32
+# e.g. 'Rockwell Automation;1768-L43/C LOGIX5343;0A1B2C3D'. Anchored by a u32
 # length prefix immediately before the match.
 _ROOT_IDENTITY_RE = re.compile(rb"([ -:<-~]{2,64});([ -:<-~]{2,64});([0-9A-Fa-f]{4,16})")
 _ROOT_CATALOG_SHAPE = re.compile(r"^\d{4}-[A-Za-z0-9-]+$")

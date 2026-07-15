@@ -567,7 +567,7 @@ def _render_value_blocks(element: str,
     # (verified byte-exact pool-wide).
     is_string = (dt_base == "STRING") and (
         dimensions is None or string_array_as_string)
-    # A custom-string ARRAY (String50[16], CustomStrUDT[]...) is rendered by
+    # A custom-string ARRAY (String50[16], a custom STRING UDT[]...) is rendered by
     # OEM as a single Format="String" block (element[0]) just like a scalar
     # custom string, so admit the layout-based detection for arrays too when the
     # caller opts in (string_array_as_string, the short-header raw-hex-first era).
@@ -818,7 +818,7 @@ class Tag(L5xElement):
     _comments: List[Tuple[str, str]]
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
     # Operand-keyed member/bit/array comments: list of (operand, text) pairs,
-    # e.g. ("[3]", "Hydraulic Pump\r\nStart"). Empty by default (long-header
+    # e.g. ("[3]", "Some Motor\r\nStart"). Empty by default (long-header
     # path leaves these untouched).
     _operand_comments: List[Tuple[str, str]] = field(default_factory=list)
     # Operand-keyed EngineeringUnit / Max / Min entries from the same comment
