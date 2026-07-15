@@ -19,12 +19,17 @@
 # WIRE FORMAT
 #
 #   <EncodedData EncodedType="Routine" Name="{name}" Type="{type}"
-#                EncryptionConfig="{config}">\n{base64}</EncodedData>
+#                EncryptionConfig="{config}">\n[<Description>]{base64}</EncodedData>
 #
 # The outer attributes are a projection of the inner document's root: EncodedType
 # first, then the root's own attributes filtered to (Name, Type) in root order,
 # then EncryptionConfig last. The body carries a leading newline, the base64 on a
 # single line with its '=' padding STRIPPED, and no trailing newline.
+#
+# The element also REPEATS the document's own <Description> in plaintext ahead of
+# the base64: the blob hides a routine's logic, not its description. (Studio
+# exposes the same way for the other encoded types -- an AOI's <Parameters> and
+# <RevisionNote> ride outside the blob too -- but only routines are rendered here.)
 #
 # INNER DOCUMENT -- a standalone UTF-16LE XML document, flat (no indentation),
 # LF-only structural newlines, exactly one trailing LF, no BOM:
@@ -188,6 +193,18 @@ def source_protection_config(rec: bytes, a1: Optional[bytes],
     return _SCHEME_CONFIG if declared in _SCHEME_LENGTHS else None
 
 
+def _description_block(routine) -> str:
+    """The routine's <Description>, or "" -- shared by the document and the element.
+
+    Studio repeats it in BOTH: encrypted inside the document, and again as
+    plaintext on the element (the encoded blob hides a component's logic, not its
+    description). Gating both on the one field keeps them in step.
+    """
+    if not routine._description:
+        return ""
+    return f"<Description>\n<![CDATA[{routine._description}]]>\n</Description>\n"
+
+
 def _inner_document(routine, esk: str, spt: str) -> Optional[str]:
     """The routine's standalone inner L5X document, or None if unserializable."""
     body = []
@@ -212,16 +229,13 @@ def _inner_document(routine, esk: str, spt: str) -> Optional[str]:
     else:
         # FBD/SFC and the relic TypeLess routines have no serializer here.
         return None
-    desc = ""
-    if routine._description:
-        desc = f"<Description>\n<![CDATA[{routine._description}]]>\n</Description>\n"
     return (
         f"{_DECL}\n"
         f'<Routine Name="{html.escape(routine.name, quote=True)}"'
         f' Type="{routine.type}"'
         f' EncodedSourceKey="{esk}"'
         f' SourceProtectionType="{html.escape(spt, quote=True)}">\n'
-        f"{desc}{''.join(body)}"
+        f"{_description_block(routine)}{''.join(body)}"
         f"</Routine>\n"
     )
 
@@ -249,5 +263,6 @@ def encoded_routine(routine, a1: Optional[bytes], keyhash_off: int,
         f'<EncodedData EncodedType="Routine"'
         f' Name="{html.escape(routine.name, quote=True)}"'
         f' Type="{routine.type}"'
-        f' EncryptionConfig="{config}">\n{body}</EncodedData>'
+        f' EncryptionConfig="{config}">\n'
+        f"{_description_block(routine)}{body}</EncodedData>"
     )

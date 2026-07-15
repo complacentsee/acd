@@ -199,9 +199,25 @@ def test_st_routine_emits_st_content():
 
 def test_description_precedes_content():
     rt = _routine(_description="d")
-    doc = _decrypt(encoded_routine(rt, _attr01(), RT_OFF, 3)
-                   .split(">\n", 1)[1][: -len("</EncodedData>")])
-    assert "<Description>\n<![CDATA[d]]>\n</Description>\n<RLLContent>" in doc
+    xml = encoded_routine(rt, _attr01(), RT_OFF, 3)
+    body = xml.split(">\n", 1)[1].split("</Description>\n", 1)[1][: -len("</EncodedData>")]
+    assert "<Description>\n<![CDATA[d]]>\n</Description>\n<RLLContent>" in _decrypt(body)
+
+
+def test_description_is_repeated_in_plaintext_on_the_element():
+    # The blob hides the logic, not the description: Studio emits it BOTH inside
+    # the document and as a plaintext child ahead of the base64. Omitting the
+    # child costs element_missing:Description AND text_mismatch:EncodedData,
+    # because the base64 then sits in .text rather than the child's tail.
+    xml = encoded_routine(_routine(_description="d"), _attr01(), RT_OFF, 3)
+    head, rest = xml.split(">\n", 1)
+    assert rest.startswith("<Description>\n<![CDATA[d]]>\n</Description>\n")
+
+
+def test_no_description_emits_no_plaintext_child():
+    xml = encoded_routine(_routine(), _attr01(), RT_OFF, 3)
+    assert "<Description>" not in xml
+    assert xml.split(">\n", 1)[1][:4] not in ("<Des",)
 
 
 def test_name_is_xml_escaped_in_both_the_element_and_the_document():
