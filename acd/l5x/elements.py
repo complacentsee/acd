@@ -3161,6 +3161,16 @@ class RoutineBuilder(L5xElementBuilder):
                     )
                 rungs = [_resolve(r) if r else r for r in rungs]
 
+        # A tag-based-alarm condition member is stored internally as
+        # ``@Alarms._CA<8 hex>_<Name>`` (the ``_CA<id>_`` prefix is the alarm
+        # object's generated key); the reference export strips it to
+        # ``@Alarms.<Name>``. The prefix is a fixed shape that only this
+        # system-generated reference produces, so the rewrite is scoped to the
+        # ``@Alarms.`` context and leaves every other operand untouched.
+        if any(r and "@Alarms._CA" in r for r in rungs):
+            _ALARM_CA_RE = _re.compile(r"(@Alarms\.)_CA[0-9A-Fa-f]{8}_")
+            rungs = [_ALARM_CA_RE.sub(r"\1", r) if r else r for r in rungs]
+
         # Fetch rung-level comments and map each to its rung Number.
         #
         # A rung comment lives in Comments.Dat keyed only by its own rung_content
