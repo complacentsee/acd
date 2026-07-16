@@ -3673,6 +3673,17 @@ class AoiBuilder(L5xElementBuilder):
                 mdt_base = (mdt or "").split("[")[0].upper()
                 # BOOL: read the bit from the host word; emit a 1-byte image.
                 if mdt_base in ("BOOL", "BIT"):
+                    # A BOOL ARRAY default is packed 32 bits per DINT word (the
+                    # universal Logix rule), sliced whole from the image -- not a
+                    # single host bit. Fail closed if the packed words overrun.
+                    if dims:
+                        total = 1
+                        for _d in dims:
+                            total *= _d
+                        width = ((total + 31) // 32) * 4
+                        if width <= 0 or off + width > len(defval_image):
+                            return None
+                        return defval_image[off:off + width]
                     if bit is not None:
                         byte_off = off + (bit // 8)
                         if byte_off >= len(defval_image):
