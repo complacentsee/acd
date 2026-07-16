@@ -228,6 +228,11 @@ _PRODUCE_EXT_PRODUCED = 0x191   # produced-tag object_id (on the connection reco
 _PRODUCE_EXT_CONSUMED = 0x190   # present on consumed / module I/O connections
 _PRODUCE_EXT_PARAMS = 0x01      # connection parameter blob
 _PRODUCE_EXT_PLCMAP = 0x67      # PLCMappingFile (u32) on the tag's own record
+# Legacy (V1x) produced-tag blobs pack their fields into a short blob (<= this)
+# with the RPI triple right after the flags, instead of the V24+ long blob's
+# 774/778/782 triple; any length beyond this and below the long form is an
+# unrecognised layout the decoder refuses (fail-closed).
+_PRODUCE_SHORT_BLOB_MAX = 342
 
 
 def _produce_rpi_ms(us: int) -> str:
@@ -288,29 +293,50 @@ def _build_produce_map(cur, short_header: bool) -> Dict[int, dict]:
                 if not blob:
                     continue
                 cp = ConnectionParams.from_bytes(blob)
-                # default_rpi_us present reproduces the old len >= 786 gate; the
-                # produced-tag format gate compares the full leading dword.
-                if cp.default_rpi_us is None:
-                    continue
                 if cp.fmt_dword not in (_PRODUCE_CONN_FMT,
                                         _PRODUCE_CONN_FMT_SAFETY):
                     continue
                 tag_oid = struct.unpack_from("<I", a191, 0)[0]
                 if tag_oid in (0, 0xFFFFFFFF):
                     continue
+                # Two blob layouts carry the produced-tag fields. The LONG (V24+)
+                # blob keeps the RPI triple at 774/778/782 (cp.min/max/default_rpi_us,
+                # None below 786). The legacy SHORT blob packs the same head fields
+                # (ProduceCount u16@321, SendEventTrigger u32@308) but reads the
+                # UnicastPermitted flag as u8@324 -- a u32 there would swallow the
+                # min-RPI bytes -- and the RPI triple immediately after, at
+                # 326/330/334; fields past the blob's end are the format defaults
+                # Studio materialises on import. An in-between length is an
+                # unrecognised layout -> skip (fail-closed).
+                L = len(blob)
+                rpi3 = None
+                if cp.default_rpi_us is not None:
+                    pc, se, up = (cp.produce_count, cp.send_event_trigger,
+                                  cp.unicast_permitted)
+                    if cp.fmt_dword == _PRODUCE_CONN_FMT:
+                        # A safety produced tag (fmt 31) omits the triple (matches OEM).
+                        rpi3 = (cp.min_rpi_us, cp.max_rpi_us, cp.default_rpi_us)
+                elif L <= _PRODUCE_SHORT_BLOB_MAX and cp.fmt_dword == _PRODUCE_CONN_FMT:
+                    pc = struct.unpack_from("<H", blob, 321)[0] if L >= 323 else 1
+                    se = struct.unpack_from("<I", blob, 308)[0] if L >= 312 else 0
+                    up = blob[324] if L >= 325 else 0
+                    rpi3 = (
+                        struct.unpack_from("<I", blob, 326)[0] if L >= 330 else 200,
+                        struct.unpack_from("<I", blob, 330)[0] if L >= 334 else 536870900,
+                        struct.unpack_from("<I", blob, 334)[0] if L >= 338 else 0,
+                    )
+                else:
+                    continue
                 out[tag_oid] = {
-                    "ProduceCount": str(cp.produce_count),
-                    "ProgrammaticallySendEventTrigger":
-                        "true" if cp.send_event_trigger else "false",
-                    "UnicastPermitted": "true" if cp.unicast_permitted else "false",
+                    "ProduceCount": str(pc),
+                    "ProgrammaticallySendEventTrigger": "true" if se else "false",
+                    "UnicastPermitted": "true" if up else "false",
                 }
-                if cp.fmt_dword == _PRODUCE_CONN_FMT:
-                    # The RPI triple is a standard-produce attribute set; a
-                    # safety produced tag (fmt 31) omits it (matches OEM).
+                if rpi3 is not None:
                     out[tag_oid].update({
-                        "MinimumRPI": _produce_rpi_ms(cp.min_rpi_us),
-                        "MaximumRPI": _produce_rpi_ms(cp.max_rpi_us),
-                        "DefaultRPI": _produce_rpi_ms(cp.default_rpi_us),
+                        "MinimumRPI": _produce_rpi_ms(rpi3[0]),
+                        "MaximumRPI": _produce_rpi_ms(rpi3[1]),
+                        "DefaultRPI": _produce_rpi_ms(rpi3[2]),
                     })
             elif cip == 0x6B and plc_sig in rec:
                 if oid in out:
