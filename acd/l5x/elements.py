@@ -3218,22 +3218,23 @@ class RoutineBuilder(L5xElementBuilder):
         )
 
         self._cur.execute(
-            "SELECT rm.object_id, r.rung FROM region_map rm "
+            "SELECT rm.object_id, r.rung, rm.unknown FROM region_map rm "
             "LEFT JOIN rungs r ON r.object_id = rm.object_id "
             "WHERE rm.parent_id=" + str(self._object_id) + " ORDER BY rm.unknown"
         )
-        # The region map can carry a redundant duplicate entry for a rung (an
-        # identical (object_id, unknown, seq) row repeated, or the rungs join
-        # multiplying it); the reference emits each rung once, so keep the first
-        # occurrence of each rung object_id. Without this the duplicate rung shifts
-        # every following rung's Number, mismatching the rung text from there on.
-        rows = []
-        _seen_rung: set = set()
-        for row in self._cur.fetchall():
-            if row[1] is None or row[0] in _seen_rung:
-                continue
-            _seen_rung.add(row[0])
-            rows.append((row[0], row[1]))
+        # The region map can carry two entries for one rung object_id: an OLD one
+        # (lower 'unknown') left behind when the rung was moved, and the LIVE one
+        # (higher 'unknown'). The reference emits each rung once, at its live slot,
+        # so keep the HIGHEST-'unknown' occurrence per object_id and order the kept
+        # rungs by that 'unknown'. An exact duplicate shares its 'unknown', so
+        # keep-last == keep-first there and nothing changes; a moved rung lands at
+        # its live Number instead of shifting every following rung's text.
+        _keep = {}
+        for oid, rung, unk in self._cur.fetchall():
+            if rung is not None:
+                _keep[oid] = (unk, rung)
+        rows = [(oid, kv[1]) for oid, kv in
+                sorted(_keep.items(), key=lambda item: item[1][0])]
         rung_ids = [row[0] for row in rows]
         rungs = [row[1] for row in rows]
 
