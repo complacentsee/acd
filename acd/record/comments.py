@@ -10,6 +10,21 @@ from acd.record.comps import (
 )
 
 
+# A Min/Max operand row declares its limit's type with the CIP elementary type
+# code, which fixes both the width to read and the rendering. Only the codes
+# whose Logix rendering is established are listed; anything else fails closed in
+# the parser rather than render a wrong limit. LREAL/BOOL are deliberately
+# absent: _fmt_real_decorated is a float32 formatter and cannot render an LREAL,
+# and a BOOL limit's form is unobserved.
+_MINMAX_VALUE_FMT = {
+    0xC2: ("<b", 1),   # SINT
+    0xC3: ("<h", 2),   # INT
+    0xC4: ("<i", 4),   # DINT
+    0xC5: ("<q", 8),   # LINT
+    0xCA: ("<f", 4),   # REAL
+}
+
+
 def _decrypt_sp_comment_text(raw_full: bytes) -> Optional[str]:
     """Recover the plaintext text of a source-protected comment record, or None.
 
@@ -362,15 +377,32 @@ class CommentsRecord:
             # they leak in as spurious <Comment> rows.
             return None
         if kind in (0x02, 0x03):
-            # Min/Max: the payload is the trailing little-endian REAL (there is
-            # no text, which is why these records used to decode to '' and be
-            # dropped). Render it in the Decorated style at staging so the
-            # builder emits it verbatim.
-            if len(body) < pos + 4:
+            # Min/Max: the payload after the operand is
+            #   [pos:pos+2]   u16 CIP type tag of the limit datum
+            #   [pos+2:pos+14] 12 reserved bytes (zero)
+            #   [pos+14:]     the value, little-endian, width from the type tag
+            # The width is the type's, NOT a fixed 4: a SINT row is 15 bytes
+            # past the operand, an INT 16, a REAL 18. Some rows carry unrelated
+            # trailing text after the value, so the value must be read at its
+            # offset rather than from the record's tail. Render it in the
+            # Decorated style at staging so the builder emits it verbatim.
+            if len(body) < pos + 14:
                 return None
             from acd.l5x.tag_value import _fmt_real_decorated
-            value_text = _fmt_real_decorated(
-                struct.unpack("<f", body[-4:])[0])
+            type_tag = struct.unpack_from("<H", body, pos)[0]
+            fmt = _MINMAX_VALUE_FMT.get(type_tag)
+            if fmt is None:
+                # Fail closed: an unresolved type cannot be rendered, and a
+                # wrong limit is worse than an absent one.
+                return None
+            code, width = fmt
+            if len(body) < pos + 14 + width:
+                return None
+            raw_value = struct.unpack_from(code, body, pos + 14)[0]
+            value_text = (
+                _fmt_real_decorated(raw_value)
+                if code in ("<f", "<d") else str(raw_value)
+            )
             return (
                 seq_number,
                 sub_record_length,
