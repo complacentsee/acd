@@ -2906,11 +2906,10 @@ class ParameterBuilder(L5xElementBuilder):
                 if desc_row and desc_row[0]:
                     description = desc_row[0]
 
-        # Operand-keyed member/bit/array comments (long header). The short-header
-        # AOI operand records currently mis-decode in the comments parser, so hold
-        # them (no comments, never a wrong render).
-        operand_comments = ([] if self._short_header
-                            else _aoi_operand_comments(self._cur, r, raw_rec))
+        # Operand-keyed member/bit/array comments, both header forms. Short-header
+        # AOI operand records decode through the 0x338 scope branch in
+        # _parse_short_operand_body; attribution stays fail-closed via unique_owner_key.
+        operand_comments = _aoi_operand_comments(self._cur, r, raw_rec)
 
         return Parameter(
             name,
@@ -3021,9 +3020,8 @@ class LocalTagBuilder(L5xElementBuilder):
                 if desc_row and desc_row[0]:
                     description = desc_row[0]
 
-        # Operand-keyed member/bit/array comments (long header); short-header held.
-        operand_comments = ([] if self._short_header
-                            else _aoi_operand_comments(self._cur, r, raw_rec))
+        # Operand-keyed member/bit/array comments (both header forms).
+        operand_comments = _aoi_operand_comments(self._cur, r, raw_rec)
 
         return LocalTag(name, name, data_type, dimensions, radix,
                         external_access, description, operand_comments)

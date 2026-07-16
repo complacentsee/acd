@@ -206,8 +206,11 @@ class CommentsRecord:
         # return None so the caller degrades gracefully. The type is an ordinal,
         # not an enum, so this must reject cleanly for every record_type.
         _controller_form = (body[0:6] == b"\x00\x00\x00\x00\x00\x00")
+        # 0x68 = program scope, 0x338 = AOI-definition scope (the format constant
+        # already used by _aoi_operand_comments); both carry the owner ordinal at
+        # body[0:2] and the same owner-key layout, so they parse identically.
         _program_form = (
-            scope_cip == 0x68 and owner_cip == 0x6B and owner_ord != 0
+            scope_cip in (0x68, 0x338) and owner_cip == 0x6B and owner_ord != 0
             and body[2:6] == b"\x00\x00\x00\x00")
         if (not _controller_form and not _program_form) or body[12] != 0:
             return None
