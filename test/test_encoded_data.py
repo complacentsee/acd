@@ -40,6 +40,40 @@ def _attr01(key=KEY, pad=b"\x00" * 18, flags=0, off=RT_OFF, tail=16, declared=No
     return bytes(a1)
 
 
+def _cbc_e(pt, key):
+    from acd.record._aes import AES
+    aes = AES(key)
+    out = bytearray()
+    prev = b"\x00" * 16
+    for i in range(0, len(pt), 16):
+        prev = aes.encrypt_block(bytes(x ^ y for x, y in zip(pt[i:i + 16], prev)))
+        out += prev
+    return bytes(out)
+
+
+def _name_field(name):
+    """The source key's 40-byte NUL-padded name field, PKCS7-padded to 48."""
+    return name.ljust(40, b"\x00") + bytes([8]) * 8
+
+
+def _filled_attr01(name=b"sample_srckey", tag=b"\xab\xcd", off=RT_OFF, tail=16):
+    """ext-attr 0x1 carrying the FILLED (wrapped-key) descriptor form: the source
+    key stored by NAME, wrapped under cfg5 with a per-definition frame tag, as the
+    newer Studio writes it (its EncodedSourceKey is the name re-wrapped under the
+    export config, NOT the slot bytes)."""
+    k5 = dict(_SP_KEYS)[5]
+    group_body = b"\x00\x05" + _cbc_e(_name_field(name), k5)   # version + wrapped
+    framed = (tag + group_body[0:16] + tag + group_body[16:32]
+              + tag + group_body[32:50] + tag)                 # 58 bytes
+    framed += bytes([6]) * 6                                   # PKCS7 pad to 64
+    slot = b"\x00\x05" + _cbc_e(framed, k5)                    # 66 bytes
+    a1 = bytearray(off + 70 + tail)
+    a1[off - 2:off] = struct.pack("<H", 66)
+    a1[off:off + 66] = slot
+    a1[off + 66:off + 70] = struct.pack("<I", 0)
+    return bytes(a1)
+
+
 def _body(marker=False):
     """A comps record body, with or without the source-protection-at-rest marker."""
     rec = bytearray(120)
@@ -80,11 +114,27 @@ def test_key_is_read_at_the_offset_not_the_slot_start():
     assert base64.b64decode(esk + "==") == KEY
 
 
+# --- filled (wrapped-key) form ----------------------------------------------
+def test_filled_form_recovers_name_and_rewraps_under_export_config():
+    # The filled slot stores the source key by NAME, wrapped; its EncodedSourceKey
+    # is that name re-wrapped under the EXPORT config -- byte-identical to the
+    # base64 the padded form keeps in the clear. Only public key material is used.
+    esk, spt = security_descriptor(_filled_attr01(b"sample_srckey"), RT_OFF, 3)
+    expected = base64.b64encode(
+        _cbc_e(_name_field(b"sample_srckey"), dict(_SP_KEYS)[3])).decode().rstrip("=")
+    assert esk == expected and spt == "Full Protection"
+
+
+def test_filled_form_withheld_without_export_config():
+    # No export config -> we cannot pick the re-wrap key -> withhold the blob.
+    assert security_descriptor(_filled_attr01(), RT_OFF, None) is None
+
+
 # --- fail-closed branches ---------------------------------------------------
-def test_unpadded_descriptor_is_withheld():
-    # The newer descriptor form fills all 66 bytes; its real key is not in the
-    # record, so reading the first 48 would emit a WRONG key -> withhold. It
-    # declares 66 like our scheme, so only the padding tells it apart.
+def test_unknown_filled_shape_is_withheld():
+    # A slot filled to all 66 bytes that is NOT the wrapped-key form (its lead
+    # word is not the cfg5 version) is a shape we do not decode; reading the
+    # first 48 would emit a WRONG key, so the non-zero padding withholds it.
     assert security_descriptor(_attr01(pad=bytes(range(1, 19))), RT_OFF) is None
 
 

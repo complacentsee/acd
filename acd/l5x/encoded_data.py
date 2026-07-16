@@ -167,35 +167,89 @@ def _pkcs7_unpad(buf: bytes) -> Optional[bytes]:
     return buf[:-n]
 
 
-def source_key_unwraps(a1: Optional[bytes], keyhash_off: int) -> bool:
-    """True iff the descriptor's wrapped-key slot decrypts to a well-formed key.
-
-    Fail-closed: a slot that is absent, is not the wrapped-key form, holds no
-    key we can decrypt, or unwraps to a structurally invalid plaintext all
-    return False. The structural check is pure internal self-consistency -- a
-    2-byte item tag repeated at fixed positions and at the plaintext's end -- so
-    nothing here is keyed by catalog, type, plant or file.
-    """
-    end = keyhash_off + 2 + _WRAPPED_KEY_LEN
-    if a1 is None or len(a1) < end:
-        return False
-    if a1[keyhash_off:keyhash_off + 2] != _WRAPPED_KEY_VERSION:
-        return False
-    aes = _aes(_WRAPPED_KEY_CONFIG)
-    if aes is None:
-        return False
-    ct = a1[keyhash_off + 2:end]
+def _cbc_decrypt(ct: bytes, aes: AES) -> bytes:
+    """AES-256-CBC decrypt, IV = 16 zero bytes."""
     out = bytearray()
     prev = b"\x00" * 16
     for i in range(0, len(ct), 16):
         blk = ct[i:i + 16]
         out += bytes(x ^ y for x, y in zip(aes.decrypt_block(blk), prev))
         prev = blk
-    pt = _pkcs7_unpad(bytes(out))
+    return bytes(out)
+
+
+def _cbc_encrypt(pt: bytes, aes: AES) -> bytes:
+    """AES-256-CBC encrypt, IV = 16 zero bytes (input already block-aligned)."""
+    out = bytearray()
+    prev = b"\x00" * 16
+    for i in range(0, len(pt), 16):
+        prev = aes.encrypt_block(bytes(x ^ y for x, y in zip(pt[i:i + 16], prev)))
+        out += prev
+    return bytes(out)
+
+
+def _unwrap_group_body(a1: Optional[bytes], keyhash_off: int) -> Optional[bytes]:
+    """The wrapped-key slot's group BODY (its frame tags removed), or None.
+
+    The slot decrypts (cfg5) to a plaintext framed by a per-definition 2-byte tag
+    repeated at fixed positions and at the plaintext's end; dropping the frame
+    yields the group body. Fail-closed: None unless the slot is the wrapped-key
+    form and the frame is self-consistent -- a pure internal check (the tag is
+    keyed by nothing external, so this is not keyed by catalog, type, plant or
+    file).
+    """
+    end = keyhash_off + 2 + _WRAPPED_KEY_LEN
+    if a1 is None or len(a1) < end:
+        return None
+    if a1[keyhash_off:keyhash_off + 2] != _WRAPPED_KEY_VERSION:
+        return None
+    aes = _aes(_WRAPPED_KEY_CONFIG)
+    if aes is None:
+        return None
+    pt = _pkcs7_unpad(_cbc_decrypt(a1[keyhash_off + 2:end], aes))
     if pt is None or len(pt) < 38:
-        return False
+        return None
     tag = pt[0:2]
-    return pt[18:20] == tag and pt[36:38] == tag and pt[-2:] == tag
+    if pt[18:20] != tag or pt[36:38] != tag or pt[-2:] != tag:
+        return None
+    return pt[2:18] + pt[20:36] + pt[38:-2]
+
+
+def source_key_unwraps(a1: Optional[bytes], keyhash_off: int) -> bool:
+    """True iff the descriptor's wrapped-key slot decrypts to a well-formed group.
+
+    Fail-closed: a slot that is absent, is not the wrapped-key form, holds no key
+    we can decrypt, or unwraps to a structurally invalid plaintext all return
+    False (see ``_unwrap_group_body``).
+    """
+    return _unwrap_group_body(a1, keyhash_off) is not None
+
+
+def _source_key_name_esk(a1: Optional[bytes], keyhash_off: int,
+                         export_config: int) -> Optional[str]:
+    """EncodedSourceKey for the filled-slot (wrapped-key) descriptor form, or None.
+
+    Unlike the padded form -- whose slot IS the source key already wrapped under
+    the export config, so its EncodedSourceKey is a plain base64 of the slot --
+    the filled slot stores the source key by NAME, wrapped: the group body is a
+    2-byte version word followed by the name field wrapped under that version's
+    config. Recovering the name field and re-wrapping it under the EXPORT config
+    reproduces the exact EncodedSourceKey Studio writes (identical to what the
+    padded form keeps in the clear). Only public key material we already hold is
+    used; every step fails closed, so an unresolved input withholds the whole
+    blob rather than emit a wrong key.
+    """
+    body = _unwrap_group_body(a1, keyhash_off)
+    if body is None or len(body) < 18 or (len(body) - 2) % 16 != 0:
+        return None
+    inner = _aes(body[1])          # body[0:2] = LE version word -> the wrap config
+    out = _aes(export_config)
+    if inner is None or out is None:
+        return None
+    name_field = _cbc_decrypt(body[2:], inner)
+    if _pkcs7_unpad(name_field) is None:   # must be a padded name field
+        return None
+    return base64.b64encode(_cbc_encrypt(name_field, out)).decode("ascii").rstrip("=")
 
 
 _AES_CACHE: dict = {}
@@ -224,28 +278,41 @@ def _encrypt_b64(plaintext: bytes, config: int) -> Optional[str]:
     return base64.b64encode(bytes(out)).decode("ascii").rstrip("=")
 
 
-def security_descriptor(a1: Optional[bytes], keyhash_off: int) -> Optional[Tuple[str, str]]:
+def security_descriptor(a1: Optional[bytes], keyhash_off: int,
+                        config: Optional[int] = None) -> Optional[Tuple[str, str]]:
     """(EncodedSourceKey, SourceProtectionType) from ext-attr 0x1, or None.
 
     None means the descriptor is absent, truncated, from another source-protection
     scheme, or a form we do not decode -- every caller must then withhold the whole
     blob. ``keyhash_off`` is the family's protection-key hash offset (the same one
-    the source-protection detector uses).
+    the source-protection detector uses); ``config`` is the export EncryptionConfig
+    (the key the filled form re-wraps the source-key name under).
     """
     if a1 is None or len(a1) < keyhash_off + _SD_TOTAL or keyhash_off + _SD_LEN_OFF < 0:
         return None
     declared = int.from_bytes(a1[keyhash_off + _SD_LEN_OFF:keyhash_off], "little")
     if declared not in _SCHEME_LENGTHS:
         return None       # another scheme: its key is a different length
-    slot = a1[keyhash_off:keyhash_off + _SD_SLOT_LEN]
-    # Our scheme zero-pads its key out to the slot; the newer form fills the slot
-    # and keeps its real key elsewhere, so reading one would emit a wrong key.
-    if not keyhash_slot_readable(a1, keyhash_off):
-        return None
+    # The flags word follows the whole slot in BOTH descriptor forms (the padded
+    # key + its zero pad, or the filled wrapped key), so SourceProtectionType is
+    # read the same way for each.
     flags = int.from_bytes(
         a1[keyhash_off + _SD_SLOT_LEN:keyhash_off + _SD_TOTAL], "little")
-    esk = base64.b64encode(slot[:_SCHEME_KEY_LEN]).decode("ascii").rstrip("=")
     spt = _SPT_VIEWABLE if flags & _SPT_VIEWABLE_BIT else _SPT_FULL
+    if a1[keyhash_off:keyhash_off + 2] == _WRAPPED_KEY_VERSION:
+        # Filled form: the slot wraps the source-key NAME, not the plaintext key.
+        # Recover it and re-wrap under the export config (withhold if unresolved).
+        if config is None:
+            return None
+        esk = _source_key_name_esk(a1, keyhash_off, config)
+        return (esk, spt) if esk is not None else None
+    # Padded form: the slot zero-pads the already-export-wrapped key to its end,
+    # so the key is base64'd straight out. The newer *filled* form (handled above)
+    # fills the slot instead; this guards any OTHER filled shape we do not decode.
+    if not keyhash_slot_readable(a1, keyhash_off):
+        return None
+    slot = a1[keyhash_off:keyhash_off + _SD_SLOT_LEN]
+    esk = base64.b64encode(slot[:_SCHEME_KEY_LEN]).decode("ascii").rstrip("=")
     return esk, spt
 
 
@@ -327,7 +394,7 @@ def encoded_routine(routine, a1: Optional[bytes], keyhash_off: int,
     """
     if config is None:
         return None
-    desc = security_descriptor(a1, keyhash_off)
+    desc = security_descriptor(a1, keyhash_off, config)
     if desc is None:
         return None
     esk, spt = desc
