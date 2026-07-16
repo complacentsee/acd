@@ -1,18 +1,18 @@
-"""End-to-end validation of V21 'Rung NT' source-protection READ support.
+"""End-to-end validation of source-protected 'Rung NT' READ support.
 
 Drives the *real fork read path* (Unzip -> DbExtract -> CompsRecord ->
-SbRegionRecord.parse) against a V21 ACD and compares the decoded rung text to
-the ground-truth L5X exported by Studio.
+SbRegionRecord.parse) against a source-protected ACD and compares the decoded
+rung text to the ground-truth L5X exported by Studio.
 
-Because the on-disk V21 body is intentionally lossy by the final ~8-15 UTF-16
-chars (the engine stores the ciphertext truncated by the last 16 plaintext
-bytes — see acd.record.source_protection), exact full-text recovery is only
-possible for rungs whose whole text fits in the recoverable prefix (all NOPs and
-the short rungs).  This script reports BOTH:
+Nothing is lost at rest: the stored ciphertext is complete, so every rung should
+recover byte-exact (see acd.record.source_protection).  This script reports BOTH:
 
-  * exact full-text matches (the honest, no-fabrication ceiling), and
+  * exact full-text matches, and
   * prefix-correct rungs (decoded text is a true prefix of the L5X text — i.e.
     everything recovered is correct, nothing is wrong/fabricated).
+
+The two coincide when the reader is correct; a gap between them is the signal
+that a rung is being truncated or fabricated.
 
 Defaults target the v21_gm_FuncGen fixtures.  Override with --acd / --l5x.
 """
@@ -81,7 +81,7 @@ def run_validation(acd_path=DEFAULT_ACD, l5x_path=DEFAULT_L5X):
     sb_db = DbExtract(os.path.join(tmp, "SbRegion.Dat")).read()
     decoded = []
     for rec in sb_db.records.record:
-        t = SbRegionRecord.parse(rec, name_lookup, version)
+        t = SbRegionRecord.parse(rec, name_lookup)
         if t is not None:
             decoded.append(t[1])
 

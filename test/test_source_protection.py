@@ -1,25 +1,60 @@
-"""Tests for V21 'Rung NT' source-protection (EncryptionConfig 5) READ support.
+"""Tests for source-protected 'Rung NT' rung READ support.
 
 The headline validation against the v21_gm_FuncGen corpus (94 rungs) is run by
-``scripts/validate_source_protection.py``.  Its ACD/L5X fixtures are now
-embedded in ``resources/`` so ``test_v21_gm_corpus_read`` exercises the real
-fork read path end-to-end here.  The remaining unit tests are self-contained:
-they pin the AES primitive (FIPS-197 KAT + V21 key), the cipher mode
-(encrypt/decrypt inverse), the framing/header model, and the documented NOP-rung
-wire bytes, so the codec is covered even without the corpus.
+``scripts/validate_source_protection.py``.  Its ACD/L5X fixtures are embedded in
+``resources/`` so ``test_v21_gm_corpus_read`` exercises the real fork read path
+end-to-end here.  The remaining unit tests are self-contained: they pin the AES
+primitive (FIPS-197 KAT), the SP key table, the cipher mode (zero-IV CBC), the
+framing model, and -- crucially -- the fail-closed refusals, so the codec is
+covered even without the corpus.
 """
-import hashlib
 import os
+import struct
 import sys
 
 from acd.record._aes import AES
-from acd.record import source_protection as v21
+from acd.record import source_protection as sp
 
 # scripts/ is not a package; add it to the path to reuse the validation driver.
 sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
 )
-import validate_source_protection as v21val  # noqa: E402
+import validate_source_protection as spval  # noqa: E402
+
+
+# --- test-only rung builder --------------------------------------------------
+# The READ path never builds buffers, so the encryptor lives here rather than in
+# the module. Mirrors the documented wire format exactly.
+def _cbc_encrypt_pkcs7(pt: bytes, aes: AES) -> bytes:
+    pad = 16 - (len(pt) % 16)
+    pt = pt + bytes([pad]) * pad
+    out = bytearray()
+    prev = b"\x00" * 16
+    for i in range(0, len(pt), 16):
+        blk = bytes(x ^ y for x, y in zip(pt[i:i + 16], prev))
+        prev = aes.encrypt_block(blk)
+        out += prev
+    return bytes(out)
+
+
+def _build_rung(text: str, config: int = 7, trailer: bytes = b"") -> bytes:
+    """Assemble a protected rung buffer (rbuf) carrying ``text``.
+
+    ``trailer`` appends slot filler past the ciphertext, which the reader must
+    ignore.
+    """
+    pt = b"\x00" + text[1:].encode("utf-16-le") + b"\x00\x00"
+    key = dict(sp._SP_KEYS)[config]
+    ct = _cbc_encrypt_pkcs7(pt, AES(key))
+    rbuf = bytearray(19)
+    rbuf[0] = ord(text[0])
+    rbuf[1:5] = sp._SP_MARKER
+    rbuf[8] = 0xA0
+    rbuf[10:13] = b"\x55\x69\x55"
+    struct.pack_into("<I", rbuf, 13, len(pt))   # marker+12: plaintext length
+    rbuf[17] = 0x00                             # legacy framing discriminator
+    rbuf[18] = config                           # marker+17: EncryptionConfig
+    return bytes(rbuf) + ct + trailer
 
 
 # --- vendored AES primitive --------------------------------------------------
@@ -42,75 +77,114 @@ def test_aes128_fips197_kat():
     assert AES(key).decrypt_block(ct) == pt
 
 
-# --- V21 key derivation ------------------------------------------------------
-def test_v21_key_is_sha256_of_keymatl5():
-    assert v21.AES_KEY == hashlib.sha256(v21._KEYMATL5).digest()
-    assert v21.AES_KEY.hex() == (
+# --- SP key table ------------------------------------------------------------
+def test_sp_key_table_pins_known_configs():
+    keys = dict(sp._SP_KEYS)
+    assert keys[5].hex() == (
         "42b572526846f3ed853c8428dad960c7c9c6827d4818f8ff8ea9d24af0ed2b58"
     )
+    assert keys[7].hex() == (
+        "1bac9fc4fe56e90b3467ade286dc75e35e1bd7520887ebd68ca6861c4dde8966"
+    )
+    # Config 9 has no key material -- its absence is what makes the config-9
+    # framing fail closed rather than decrypt to garbage.
+    assert 9 not in keys
+    assert sp._SP_KEY_BY_CONFIG == keys
 
 
-# --- cipher mode (CBC full blocks + CFB final partial) -----------------------
-def test_encrypt_decrypt_inverse_full_blocks():
-    pt = b"A" * 48
-    assert v21.decrypt(v21.encrypt(pt)) == pt
+# --- cipher mode (zero-IV CBC) -----------------------------------------------
+def test_sp_cbc_is_zero_iv_cbc():
+    aes = AES(dict(sp._SP_KEYS)[7])
+    pt = b"0123456789abcdef" * 3
+    ct = _cbc_encrypt_pkcs7(pt, aes)
+    # _sp_cbc decrypts whole blocks; the 4th block is the pure-pad block.
+    assert sp._sp_cbc(ct, aes, 3) == pt
 
 
-def test_encrypt_decrypt_inverse_partial_tail():
-    pt = b"hello world this is a partial tail test!!"  # 41 bytes (not /16)
-    assert v21.decrypt(v21.encrypt(pt)) == pt
-
-
-def test_decrypt_recoverable_matches_full_blocks():
-    pt = b"X" * 40  # 2 full blocks + 8 byte partial
-    ct = v21.encrypt(pt)
-    # recoverable == first 32 bytes (the two whole CBC blocks)
-    assert v21.decrypt_recoverable(ct) == pt[:32]
+def test_sp_unpad_rejects_invalid_padding():
+    assert sp._sp_unpad(b"abc" + bytes([3]) * 3) == b"abc"
+    assert sp._sp_unpad(b"abc" + bytes([9]) * 3) is None
+    assert sp._sp_unpad(b"") is None
 
 
 # --- framing / detection -----------------------------------------------------
-def test_nop_rung_wire_bytes_and_decode():
-    nop = bytes.fromhex("4eaa96aa0a050000a05d5569550d")
-    assert v21.is_nop(nop)
-    assert v21.looks_like_source_protected_rung(nop)
-    assert not v21.is_cipher_form(nop)
-    assert v21.decode_rung(nop) == "NOP();"
-
-
-def test_looks_like_v21_rejects_plaintext_utf16():
-    # V30+ plaintext UTF-16 'XIC(' never matches the V21 scaffold.
+def test_looks_like_sp_rung_rejects_plaintext_utf16():
+    # Plaintext UTF-16 'XIC(' never matches the SP scaffold.
     plain = "XIC(@e2da9d52@)OTE(@bb593e67@);".encode("utf-16-le")
-    assert not v21.looks_like_source_protected_rung(plain)
+    assert not sp.looks_like_source_protected_rung(plain)
 
 
 def test_is_v21_version():
-    assert v21.is_v21_version("V21.03.02/3541.000")
-    assert not v21.is_v21_version("V36.00.00/1234.000")
-    assert not v21.is_v21_version(None)
+    assert sp.is_v21_version("V21.03.02/3541.000")
+    assert not sp.is_v21_version("V36.00.00/1234.000")
+    assert not sp.is_v21_version(None)
 
 
 # --- round-trip: build a cipher rung, decode it back -------------------------
-def test_decode_recovers_verifiable_prefix():
-    # The on-disk body is lossy by the final ~8 chars (see module docstring): the
-    # plaintext is always odd-length (1 prefix + 2*chars), so the last UTF-16
-    # unit is never block-aligned and is never fabricated.  decode_rung returns a
-    # true prefix of the full text, with each *complete* @hex@ operand intact.
+def test_decode_recovers_full_text_exactly():
+    # Nothing is lossy at rest: the whole text comes back, including the final
+    # operand and the closing paren.
     text = "XIO(@1f9611fa@)OTE(@9db369e9@);"
-    pt = bytes([v21._PREFIX_BYTE]) + text[1:].encode("utf-16-le")
-    rbuf = v21._build_test_rbuf(text[0], v21.encrypt(pt))
-    assert v21.looks_like_source_protected_rung(rbuf)
-    dec = v21.decode_rung(rbuf)
-    assert text.startswith(dec)            # never fabricates beyond the body
-    assert dec == "XIO(@1f9611fa@)OTE("    # first complete operand recovered
+    rbuf = _build_rung(text)
+    assert sp.looks_like_source_protected_rung(rbuf)
+    assert sp.decode_rung(rbuf) == text
 
 
-def test_name_resolution_on_recovered_operands():
+def test_decode_ignores_slot_filler_past_the_ciphertext():
+    # The ciphertext length is derived from the declared plaintext length, so
+    # trailing filler must not reach the cipher.
     text = "XIO(@1f9611fa@)OTE(@9db369e9@);"
-    pt = bytes([v21._PREFIX_BYTE]) + text[1:].encode("utf-16-le")
-    rbuf = v21._build_test_rbuf(text[0], v21.encrypt(pt))
-    out = v21.decode_rung(rbuf, name_lookup={0x1f9611fa: "D1", 0x9db369e9: "D3"}.get)
-    # complete @hex@ operands resolve to names; the lossy tail is not fabricated.
-    assert out == "XIO(D1)OTE("
+    assert sp.decode_rung(_build_rung(text, trailer=b"\xff" * 32)) == text
+
+
+def test_decode_short_rung_is_not_assumed_to_be_nop():
+    # A short rung ("RET();") has a 13-byte plaintext and a single 16-byte
+    # ciphertext block. Treating such a buffer as a cipher-less NOP header
+    # renders every one of these as "NOP();" -- silently wrong output.
+    for text in ("NOP();", "RET();", "TND();"):
+        assert sp.decode_rung(_build_rung(text)) == text
+
+
+def test_name_resolution_on_decoded_operands():
+    text = "XIO(@1f9611fa@)OTE(@9db369e9@);"
+    out = sp.decode_rung(
+        _build_rung(text), name_lookup={0x1f9611fa: "D1", 0x9db369e9: "D3"}.get
+    )
+    assert out == "XIO(D1)OTE(D3);"
+
+
+def test_config_is_read_from_the_wire_not_hardcoded():
+    # The same text under two different configs must both decode -- the config
+    # byte at marker+17 selects the key.
+    text = "XIO(@1f9611fa@)OTE(@9db369e9@);"
+    assert sp.decode_rung(_build_rung(text, config=5)) == text
+    assert sp.decode_rung(_build_rung(text, config=7)) == text
+
+
+# --- fail-closed refusals ----------------------------------------------------
+def test_config9_framing_fails_closed():
+    # rbuf[17:19] == 0x0001 selects the config-9 framing; no key material exists
+    # for it, so the reader must return None rather than emit a wrong rung.
+    rbuf = bytearray(_build_rung("XIO(@1f9611fa@);"))
+    struct.pack_into("<H", rbuf, 17, 1)
+    assert sp.decode_rung(bytes(rbuf)) is None
+
+
+def test_unknown_config_fails_closed():
+    rbuf = bytearray(_build_rung("XIO(@1f9611fa@);"))
+    rbuf[18] = 0x0B  # no key material for this config
+    assert sp.decode_rung(bytes(rbuf)) is None
+
+
+def test_truncated_ciphertext_fails_closed():
+    rbuf = _build_rung("XIO(@1f9611fa@)OTE(@9db369e9@);")
+    assert sp.decode_rung(rbuf[:-16]) is None
+
+
+def test_declared_length_mismatch_fails_closed():
+    rbuf = bytearray(_build_rung("XIO(@1f9611fa@)OTE(@9db369e9@);"))
+    struct.pack_into("<I", rbuf, 13, 4)  # lie about the plaintext length
+    assert sp.decode_rung(bytes(rbuf)) is None
 
 
 # --- end-to-end against the embedded v21_gm_FuncGen corpus -------------------
@@ -118,15 +192,16 @@ def test_v21_gm_corpus_read():
     """Drive the real fork read path over the embedded V21 corpus.
 
     Asserts the no-fabrication invariant (every decoded rung is a true prefix of
-    the Studio L5X ground truth) plus the exact-recovery floor for the rungs
-    that fit in the recoverable prefix (all 50 NOPs).
+    the Studio L5X ground truth) and exact full-text recovery for every rung,
+    cipher rungs included: nothing is lost at rest.
     """
-    r = v21val.run_validation()  # defaults point at resources/v21_gm_FuncGen.*
-    assert v21.is_v21_version(r["version"])
+    r = spval.run_validation()  # defaults point at resources/v21_gm_FuncGen.*
+    assert sp.is_v21_version(r["version"])
     assert r["n"] == 94
     # Nothing fabricated: decoded text is always a true prefix of the L5X text.
     assert r["prefix_ok"] == r["n"]
-    # Exact full-text recovery for the 50 NOP rungs; no cipher rung is faked.
-    assert r["exact"] == 50
+    # Exact full-text recovery for every rung -- the ciphertext is complete at
+    # rest, so the cipher rungs come back byte-exact too.
+    assert r["exact"] == 94
     assert r["nop_exact"] == 50
-    assert r["cipher_exact"] == 0
+    assert r["cipher_exact"] == 44

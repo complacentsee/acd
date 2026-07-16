@@ -24,7 +24,12 @@ from acd.record.comments import CommentsRecord
 from acd.record.comps import CompsRecord, record_uses_short_header
 from acd.record.nameless import NamelessRecord
 from acd.record.sbregion import SbRegionRecord
-from acd.record.source_protection import build_uid_name_map, is_v21_version
+from acd.record.source_protection import (
+    _SP_MARKER,
+    build_uid_name_map,
+    is_v21_version,
+    sp_decrypt_framed,
+)
 
 
 _VERSION_LOG = "Version.Log"     # the container's per-save Studio version banner
@@ -597,7 +602,7 @@ class ExportL5x:
             "Getting records from ACD SbRegion file and storing in sqllite database"
         )
         sb_region_db = DbExtract(os.path.join(self._temp_dir, "SbRegion.Dat")).read()
-        rung_tuples = [t for record in sb_region_db.records.record if (t := SbRegionRecord.parse(record, rung_name_lookup, self._acd_version)) is not None]
+        rung_tuples = [t for record in sb_region_db.records.record if (t := SbRegionRecord.parse(record, rung_name_lookup)) is not None]
         self._cur.executemany("INSERT INTO rungs VALUES (?,?,?)", rung_tuples)
         self._db.commit()
 
@@ -952,40 +957,16 @@ class ExportL5x:
 
         if len(results) == 0:
             return
-        record = results[0][3]
+        entries = self._region_map_entries(results[0][3])
 
-        identifier_offset = 70
-
-        if len(record) < (identifier_offset + 8):
-            return
-
-        region_length = struct.unpack(
-            "I", record[identifier_offset + 4 : identifier_offset + 8]
-        )[0]
-
-        identifier_offset = 78
-        # The entry array spans [78, 78 + region_length); the last entry starts
-        # at 78 + region_length - 16, so the bound must admit it (a former -4
-        # slack dropped the physically-last entry on every long-header file).
-        region_end = min(len(record), identifier_offset + region_length)
-        c = 0
-        while identifier_offset + 16 <= region_end:
-            parent_id_identifier = struct.unpack(
-                "I", record[identifier_offset : identifier_offset + 4]
-            )[0]
-
-            unknown_identifier = struct.unpack(
-                "I", record[identifier_offset + 4 : identifier_offset + 8]
-            )[0]
-
-            seq_identifier = struct.unpack(
-                "I", record[identifier_offset + 8 : identifier_offset + 12]
-            )[0]
-
-            c += 1
-            object_id_identifier = struct.unpack(
-                "I", record[identifier_offset + 12 : identifier_offset + 16]
-            )[0]
+        identifier_offset = 0
+        while identifier_offset + 16 <= len(entries):
+            (
+                parent_id_identifier,
+                unknown_identifier,
+                seq_identifier,
+                object_id_identifier,
+            ) = struct.unpack_from("<IIII", entries, identifier_offset)
 
             query: str = "INSERT INTO region_map VALUES (?, ?, ?, ?, ?)"
             enty: tuple = (
@@ -993,12 +974,36 @@ class ExportL5x:
                 parent_id_identifier,
                 unknown_identifier,
                 seq_identifier,
-                record[identifier_offset : identifier_offset + 16],
+                entries[identifier_offset : identifier_offset + 16],
             )
             self._cur.execute(query, enty)
             identifier_offset += 16
 
         self._db.commit()
+
+    @staticmethod
+    def _region_map_entries(record: bytes) -> bytes:
+        """Return a Region Map record's plaintext array of 16-byte entries.
+
+        The array spans [78, 78 + region_length) where region_length is the u32 at
+        74; the last entry starts at 78 + region_length - 16, so the bound must
+        admit it (a former -4 slack dropped the physically-last entry on every
+        long-header file).
+
+        On a source-protected project the array at body+78 is replaced by the SP
+        marker framing, with the EncryptionConfig on the wire -- so decrypt it
+        back. Without this the marker and ciphertext are walked AS entries, which
+        yields a full array of garbage rows rather than nothing.
+
+        Fail closed: an undecryptable tail yields NO entries rather than a wrong
+        array, which would mis-key every rung in the project.
+        """
+        if len(record) < 78:
+            return b""
+        region_length = struct.unpack_from("<I", record, 74)[0]
+        if record[78:82] == _SP_MARKER:
+            return sp_decrypt_framed(record, 78) or b""
+        return record[78:78 + region_length]
 
     # ---- SHORT (V10..V21) region map ---------------------------------------
     # The short-header Region Map comps record (parent_id=0, comp_name='Region

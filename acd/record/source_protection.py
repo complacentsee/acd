@@ -1,218 +1,280 @@
-"""V21 'Rung NT' source-protection (EncryptionConfig 5) READ support.
+"""Source-protection framing/crypto primitives, and 'Rung NT' rung READ support.
 
-RSLogix 5000 **V21** stores ladder rung logic in ``SbRegion.Dat`` differently
-from V30+.  In V30/V34/V36 the FAFA ``Rung NT`` record's ``record_buffer`` is
-plaintext UTF-16LE neutral text with ``@HEX@`` object-id placeholders (e.g.
-``XIC(@e2da9d52@)OTE(@bb593e67@);``), which :class:`acd.record.sbregion.
-SbRegionRecord` decodes directly.
+A source-protected project AES-encrypts several record tails at rest, always
+behind the same ``aa 96 aa 0a`` marker: the comps extended-attribute tail (see
+:mod:`acd.record.comps`), the comments text tail (see :mod:`acd.record.comments`)
+and -- handled here -- the ``SbRegion.Dat`` ladder-rung neutral text.  This module
+owns the shared marker/key/CBC primitives so every consumer decrypts the same
+way; :mod:`acd.record.comps` imports them from here.
 
-In V21 the ``record_buffer`` is a **plaintext framing header + AES-encrypted
-neutral text** (the "Source Protection 5" scheme).  Decoding it as UTF-16 (the
-V30+ path) yields CJK noise.  This module decrypts the buffer back to neutral
-text so the existing ``@HEX@`` -> tag-name resolution and L5X export work.
+An unprotected project stores the FAFA ``Rung NT`` / ``REGION NT`` record's rung
+buffer as plaintext UTF-16LE neutral text with ``@HEX@`` object-id placeholders
+(e.g. ``XIC(@e2da9d52@)OTE(@bb593e67@);``), which :class:`acd.record.sbregion.
+SbRegionRecord` decodes directly.  A protected project replaces that buffer with
+the marker framing below.  Protection is a per-project setting, not a firmware
+version: detect it by the marker, never by the version.
 
-WIRE FORMAT  (m = len(rbuf) - 1)
---------------------------------
-* **NOP rung** (cipher-less): a 14-byte header only, no SEP / ciphertext.
-  Byte-identical across the corpus: ``4eaa96aa0a050000a05d5569550d`` ("NOP();").
-* **Cipher rung**: ``[14-byte header][5-byte SEP][ciphertext]``.
+BUFFER EXTENT  (read this first -- ``record_buffer`` is SHORT)
+-------------------------------------------------------------
+Inside the FAFA record body::
 
-  HEADER (14 bytes)::
+    [0:4]    u32 record_length
+    [4:6]    u16 sb_regions
+    [6:10]   u32 identifier
+    [10:51]  language_type, NUL-terminated ASCII ("Rung NT" / "REGION NT" / ...)
+    [51:55]  u32 len_record_buffer
+    [55:]    the rung buffer
 
-      [0]      ASCII first char of the neutral text  (N/X/S/C/A/G/L/M/...)
-      [1:5]    AA 96 AA 0A                            (magic)
-      [5]      0x05 | (m & 0xF0)
-      [6:8]    00 00
-      [8]      A0
-      [9]      0x50 | (m & 0x0F)
-      [10:13]  55 69 55
-      [13]     m & 0xFF
-  SEP (5 bytes, cipher rungs only): ``00 00 00 00 05``.
-  CIPHERTEXT: ``rbuf[19:]``.
+On a protected rung ``len_record_buffer`` is **not** the length of the stored
+buffer.  It tracks the *plaintext* length the buffer would have had, not the
+ciphertext, so slicing the buffer at ``len_record_buffer`` truncates the
+ciphertext.  The stored buffer runs to the END of the record body.  Always read
+``body[55:]``; the kaitai grammar exposes the remainder as ``trailing``, so
+``record_buffer + trailing`` is the true buffer.
 
-PLAINTEXT
----------
-``pt = decrypt(rbuf[19:])``.  ``pt[0]`` is a 1-byte prefix (always ``0x00``);
-``pt[1:]`` is the neutral text **minus its first char**, UTF-16LE.  The first
-char lives in ``header[0]``::
+Slicing at ``len_record_buffer`` is also what makes a short-plaintext rung look
+like a "cipher-less 14-byte NOP header": its framing and 16-byte ciphertext are
+simply past the cut.  **There is no cipher-less rung form** -- every protected
+rung carries a ciphertext, and rungs whose text is not ``NOP();`` (e.g. ``RET();``
+and ``TND();``) hide behind exactly that cut and decode to ``NOP();`` if it is
+honoured.
 
-    full_text = chr(rbuf[0]) + pt[1:].decode('utf-16-le')
+WIRE FORMAT  (rbuf = body[55:]; the marker sits at rbuf[1])
+-----------------------------------------------------------
+::
 
-CIPHER (verified ``encrypt(decrypt(ct)) == ct`` 44/44)
-------------------------------------------------------
-AES-256, IV = 16 zero bytes, ``key = SHA256(keymatl5)`` where ``keymatl5`` is
-the Source-Protection master key material.  Full 16-byte blocks are standard
-**CBC** (IV=0); any **final partial** block is **CFB-style**:
-``ks = AES_ENC(prev_ciphertext_block); partial = data XOR ks[:rem]``.
+    [0]      ASCII first char of the neutral text  (N/X/S/C/A/G/L/M/[/...)
+    [1:5]    AA 96 AA 0A                       marker (_SP_MARKER)
+    [8]      A0
+    [10:13]  55 69 55
+    [13:17]  u32  marker+12   PLAINTEXT BYTE LENGTH
+    [17:19]  u16  marker+16   FRAMING DISCRIMINATOR
+                                low byte 0 -> legacy framing: the high byte
+                                    (rbuf[18], marker+17) is the EncryptionConfig
+                                    and the ciphertext starts at rbuf[19]
+                                    (marker + _SP_CT_OFFSET)
+                                == 1     -> EncryptionConfig 9 framing:
+                                    u16 @ [19:21] = 16, u32 @ [21:25] = ct length,
+                                    ciphertext at rbuf[25].  No config-9 key
+                                    material exists, so this fails closed.
+    [19:]    CIPHERTEXT  (legacy framing), a whole number of 16-byte blocks
 
-OPERAND / ``@HEX@`` RULE (cracked)
-----------------------------------
+The redundant length nibbles at ``[5]``/``[9]`` mirror the plaintext length.  The
+u16 at ``marker+4`` is NOT the plaintext byte length -- do not reuse the
+AOI-nameless offsets from :mod:`acd.record.comps` here; only ``_SP_CT_OFFSET`` is
+genuinely shared.  Use the u32 at ``marker+12``.
+
+CONFIG BYTE
+-----------
+``config = rbuf[18]``.  It is a real wire field, not a constant -- reading it is
+what lets one code path serve every project.  The AES-256 key is
+``_SP_KEY_BY_CONFIG[config]``.  An unknown config is a fail-closed refusal, never
+a wrong decrypt.
+
+CIPHER
+------
+AES-256-**CBC**, IV = 16 zero bytes, **PKCS7** padding.  There is no CFB-style
+partial final block and nothing is truncated at rest: the ciphertext is block
+aligned, the PKCS7 pad is valid, and the unpadded length equals the declared
+plaintext length.  The plaintext recovered here is complete.
+
+PLAINTEXT -> TEXT
+-----------------
+``pt[0]`` is a 1-byte prefix; ``pt[1:]`` is the neutral text **minus its first
+character**, plus the UTF-16 NUL terminator.  The first char lives in ``rbuf[0]``::
+
+    text = chr(rbuf[0]) + pt[1:].decode("utf-16-le").rstrip("\\x00")
+
+This is exactly the string the plaintext path produces, so the same ``@HEX@``
+resolution applies.
+
+OPERAND / ``@HEX@`` RULE
+------------------------
 Operands are tag references written ``@<8hex>@`` where ``<8hex>`` is the operand
-tag's CompUId (``self_lcg``, the comps record ``object_id``) as 8-digit
-lowercase big-endian hex, no byte-swap (e.g. ``D1.self_lcg = 0x1f9611fa ->
-@1f9611fa@``).  Bit members: ``@<tag_uid>@.@<bit_uid>@``.  Immediates are inline
-decimal text.  Verified: every fully-decoded ``@hex@`` in the corpus is a real
-``rtype==256`` tag ``self_lcg`` (66/66, 0 invalid).  This is exactly the comps
-``object_id`` the V30+ path already resolves via the name lookup.
-
-LOSSY TRAILING BYTES (the one residual gap)
--------------------------------------------
-The stored ciphertext is the encryption of the FULL plaintext **truncated by
-the last 16 plaintext bytes** (the header length field still records the full
-length).  Because CBC ciphertext byte ``k`` depends only on plaintext bytes
-``0..k``, the stored body decrypts cleanly up to the last *full* 16-byte block,
-but the final ~8-15 UTF-16 chars (the tail of the last operand, e.g. the
-destination tag of a ``MOV``/``ADD``, or a closing ``)``) are **not present** in
-the body and cannot be recovered from it.  :func:`decode_rung` therefore returns
-the verifiable prefix and **never fabricates** the missing tail (naively closing
-parens would produce wrong text such as ``LIM(...)OTE;`` instead of
-``LIM(...)OTE(F1);``).  Full recovery requires the original neutral text (e.g. a
-live-PLC upload or a Studio round-trip), which is outside the on-disk body.
+tag's CompUId (the comps record ``object_id``) as 8-digit lowercase big-endian
+hex, no byte-swap.  Bit members: ``@<tag_uid>@.@<bit_uid>@``.  Immediates are
+inline decimal text.  This is the same comps ``object_id`` the plaintext path
+resolves via the name lookup.
 """
 from __future__ import annotations
 
-import hashlib
 import re
 from typing import Callable, Optional
 
 from acd.record._aes import AES
 
 # ---------------------------------------------------------------------------
-# Key material (Source-Protection master; public, from
-# skdatmonster/DecryptSourceProtection) -> AES-256 key = SHA256(keymatl5).
+# Shared source-protection framing / key material.
+#
+# IV = 16 zero bytes; KEY = SHA256(keymatl_N) for the public Rockwell source-
+# protection key material (configs from skdatmonster/DecryptSourceProtection).
+# The config is project-wide, so a consumer that has to search -- the comps
+# ext-attr and comments text tails carry no config byte -- caches the winning
+# config in _SP_KEY_HINT and tries it first.  The rung path never searches: its
+# config is on the wire.
 # ---------------------------------------------------------------------------
-_KEYMATL5 = bytes.fromhex(
-    "5300340079005400560049005A007A00240063003E005700380026005D0078002F00"
-    "3B004F00550065003F00660051006F007A003300620063005700260042007B003100"
-    "5A00240068002B006F00460033005C004C003D0023004B005E006500550025005800"
-    "32007300480048002B0055003D004D0063004E0037002900"
-)
-AES_KEY = hashlib.sha256(_KEYMATL5).digest()
-# == 42b572526846f3ed853c8428dad960c7c9c6827d4818f8ff8ea9d24af0ed2b58
+_SP_MARKER = b"\xaa\x96\xaa\x0a"
+_SP_CT_OFFSET = 18  # ciphertext starts marker_index + 18
+# (config_number, AES-256 key = SHA256(keymatl_config)).
+_SP_KEYS = [
+    (7, bytes.fromhex("1bac9fc4fe56e90b3467ade286dc75e35e1bd7520887ebd68ca6861c4dde8966")),
+    (5, bytes.fromhex("42b572526846f3ed853c8428dad960c7c9c6827d4818f8ff8ea9d24af0ed2b58")),
+    (3, bytes.fromhex("a082ef440f1659d637bce1e0181a86e05b9bf7561bdc0d0f726c48b4e75c5ddc")),
+    (6, bytes.fromhex("08de99aef6d12ed4b92be37f042a237add19d8d7e15ce2eae88d645288e97cb2")),
+    (8, bytes.fromhex("19927a3e5b1eff2c11dd6e7cee9b0c889e3258a339a2c63c5e0b2835402588c7")),
+]
+# Same table keyed for the config-on-the-wire lookup (the rung path); hoisted so
+# a per-rung dict() rebuild never lands in the decode loop.
+_SP_KEY_BY_CONFIG = dict(_SP_KEYS)
+_SP_AES_CACHE: dict = {}          # config -> AES instance (lazy key expansion)
+_SP_KEY_HINT: list = [None]       # winning config for this process, tried first
 
-_HDR_MAGIC = b"\xaa\x96\xaa\x0a"
-_SEP = b"\x00\x00\x00\x00\x05"
-_NOP_RBUF = bytes.fromhex("4eaa96aa0a050000a05d5569550d")  # "NOP();"
-_NOP_TEXT = "NOP();"
-_HEADER_LEN = 14
-_FRAMED_LEN = 19  # header (14) + SEP (5)
-_PREFIX_BYTE = 0x00
+
+def _sp_aes(config: int, key: bytes) -> AES:
+    aes = _SP_AES_CACHE.get(config)
+    if aes is None:
+        aes = AES(key)
+        _SP_AES_CACHE[config] = aes
+    return aes
+
+
+def _sp_cbc(ciphertext: bytes, aes: AES, nblocks: int) -> bytes:
+    """Decrypt the first ``nblocks`` CBC blocks (IV=0) of ``ciphertext``."""
+    out = bytearray()
+    prev = b"\x00" * 16
+    for i in range(nblocks):
+        blk = ciphertext[i * 16:i * 16 + 16]
+        out += bytes(x ^ y for x, y in zip(aes.decrypt_block(blk), prev))
+        prev = blk
+    return bytes(out)
+
+
+def _sp_unpad(plaintext: bytes) -> Optional[bytes]:
+    """Strip PKCS7 padding, or return None when the pad is not valid."""
+    if not plaintext:
+        return None
+    pad = plaintext[-1]
+    if 1 <= pad <= 16 and plaintext[-pad:] == bytes([pad]) * pad:
+        return plaintext[:-pad]
+    return None
+
+
+def sp_decrypt_framed(buf: bytes, marker_index: int) -> Optional[bytes]:
+    """Decrypt a marker-framed tail whose EncryptionConfig is on the wire.
+
+    ``buf[marker_index:]`` must start with :data:`_SP_MARKER`.  Reads the declared
+    u32 plaintext length at ``marker+12`` and the config byte at ``marker+17``,
+    decrypts the ciphertext at ``marker + _SP_CT_OFFSET`` and returns the
+    unpadded plaintext.
+
+    The ciphertext length is derived from the declared length, NOT from the rest
+    of the buffer: padding is PKCS7, which always appends 1..16 bytes, so the
+    ciphertext is ``declared + 16 - declared % 16`` bytes.  Anything after that is
+    slot filler and must not be fed to the cipher.  (Taking the ciphertext as
+    "everything to the end of the buffer" works only where there is no filler;
+    deriving it with ``ceil(declared/16)*16`` instead silently drops the whole pad
+    block whenever ``declared`` is already block aligned.)
+
+    Fail-closed: returns None unless the config has key material, the buffer
+    actually holds the whole ciphertext, the PKCS7 pad is valid, AND the unpadded
+    length equals the declared length exactly.
+    """
+    if len(buf) <= marker_index + 17:
+        return None
+    config = buf[marker_index + 17]
+    key = _SP_KEY_BY_CONFIG.get(config)
+    if key is None:
+        return None
+    declared = int.from_bytes(buf[marker_index + 12:marker_index + 16], "little")
+    ct_len = declared + 16 - (declared % 16)
+    ct_start = marker_index + _SP_CT_OFFSET
+    ct = buf[ct_start:ct_start + ct_len]
+    if len(ct) != ct_len:
+        return None
+    pt = _sp_unpad(_sp_cbc(ct, _sp_aes(config, key), ct_len // 16))
+    if pt is None or len(pt) != declared:
+        return None
+    return pt
+
+
+# ---------------------------------------------------------------------------
+# rung framing
+# ---------------------------------------------------------------------------
+_RUNG_MARKER_OFF = 1                             # marker index within rbuf
+_RUNG_DISC_OFF = _RUNG_MARKER_OFF + 16           # u16 framing discriminator
+_RUNG_CT_OFF = _RUNG_MARKER_OFF + _SP_CT_OFFSET  # legacy-framing ciphertext
+_DISC_CONFIG9 = 1                                # newer framing; no key material
 
 _TOKEN_RE = re.compile(r"@([0-9a-fA-F]{8})@")
-# A trailing, never-closed @<0..8 hex> token left by the lossy 16-byte tail.
-_PARTIAL_TOK = re.compile(r"@[0-9a-fA-F]{0,8}$")
 
 
-# ---------------------------------------------------------------------------
-# AES backend (one shared instance; block ops only).  Vendored, no third-party
-# dependency.  CBC full blocks + CFB-style final partial are built here.
-# ---------------------------------------------------------------------------
-_AES = AES(AES_KEY)
-
-
-def _xor(a: bytes, b: bytes) -> bytes:
-    return bytes(x ^ y for x, y in zip(a, b))
-
-
-def decrypt(ct: bytes, iv: bytes = b"\x00" * 16) -> bytes:
-    """Decrypt a *whole* ciphertext: CBC full blocks + CFB-style final partial.
-
-    Exact byte-inverse of :func:`encrypt` (so ``encrypt(decrypt(ct)) == ct``).
-    Used for the framing round-trip self-test; for reading a genuine (truncated)
-    body, prefer :func:`decrypt_recoverable`, which returns only the verifiably
-    correct full-block plaintext.
-    """
-    nf, rem = divmod(len(ct), 16)
-    out = bytearray()
-    prev = iv
-    for i in range(nf):
-        blk = ct[i * 16:i * 16 + 16]
-        out += _xor(_AES.decrypt_block(blk), prev)
-        prev = blk
-    if rem:
-        ks = _AES.encrypt_block(prev)
-        out += _xor(ct[nf * 16:], ks[:rem])
-    return bytes(out)
-
-
-def decrypt_recoverable(ct: bytes, iv: bytes = b"\x00" * 16) -> bytes:
-    """Decrypt only the FULL 16-byte CBC blocks (drop any trailing partial).
-
-    For a genuine V21 body (ciphertext truncated by the last 16 plaintext bytes)
-    this returns exactly the verifiably-correct recoverable plaintext, with no
-    garbled tail.
-    """
-    nf = len(ct) // 16
-    out = bytearray()
-    prev = iv
-    for i in range(nf):
-        blk = ct[i * 16:i * 16 + 16]
-        out += _xor(_AES.decrypt_block(blk), prev)
-        prev = blk
-    return bytes(out)
-
-
-def encrypt(pt: bytes, iv: bytes = b"\x00" * 16) -> bytes:
-    """CBC full blocks + CFB-style final partial.  Inverse of :func:`decrypt`."""
-    nf, rem = divmod(len(pt), 16)
-    out = bytearray()
-    prev = iv
-    for i in range(nf):
-        c = _AES.encrypt_block(_xor(pt[i * 16:i * 16 + 16], prev))
-        out += c
-        prev = c
-    if rem:
-        ks = _AES.encrypt_block(prev)
-        out += _xor(pt[nf * 16:], ks[:rem])
-    return bytes(out)
-
-
-# ---------------------------------------------------------------------------
-# framing / detection
-# ---------------------------------------------------------------------------
 def looks_like_source_protected_rung(rbuf: bytes) -> bool:
-    """True iff the buffer carries the V21 source-protection header scaffold.
+    """True iff the buffer carries the source-protection header scaffold.
 
-    Version-independent: matches the fixed magic that V21 rungs carry and that
-    V30+ plaintext UTF-16 text never produces, so the V30+ path is never
+    Matches the fixed marker scaffold that protected rungs carry and that
+    plaintext UTF-16 neutral text never produces, so the plaintext path is never
     diverted for genuine plaintext.
     """
     return (
-        len(rbuf) >= 13
-        and rbuf[1:5] == _HDR_MAGIC
+        len(rbuf) >= _RUNG_CT_OFF
+        and rbuf[_RUNG_MARKER_OFF:_RUNG_MARKER_OFF + 4] == _SP_MARKER
         and rbuf[8] == 0xA0
         and rbuf[10:13] == b"\x55\x69\x55"
     )
 
 
-def is_nop(rbuf: bytes) -> bool:
-    """True for the empty/NOP rung (header only, no ciphertext)."""
-    return len(rbuf) == _HEADER_LEN
+def resolve_names(
+    neutral_text: str,
+    name_lookup: Optional[Callable[[int], Optional[str]]],
+) -> str:
+    """Replace every complete ``@hex@`` with its tag name via ``name_lookup``.
 
-
-def is_cipher_form(rbuf: bytes) -> bool:
-    """True for a bodied (encrypted) V21 rung."""
-    return looks_like_source_protected_rung(rbuf) and len(rbuf) > _FRAMED_LEN
-
-
-# ---------------------------------------------------------------------------
-# plaintext -> neutral text
-# ---------------------------------------------------------------------------
-def _plaintext_to_text(first_char: str, pt: bytes) -> str:
-    body = pt[1:]
-    if len(body) % 2:
-        body = body[:-1]  # drop a half UTF-16 unit from the lossy boundary
-    return first_char + body.decode("utf-16-le", "replace")
-
-
-def _strip_partial_token(text: str) -> str:
-    """Drop a trailing, never-closed ``@<hex>`` token left by the lossy tail.
-
-    A *complete* ``@dddddddd@`` token (closing ``@`` present) is never touched.
+    ``name_lookup(object_id) -> name | None``.  Unmapped ids are left as
+    ``@hex@`` (the same behaviour as the plaintext path).
     """
-    return _PARTIAL_TOK.sub("", text)
+    if name_lookup is None:
+        return neutral_text
+
+    def rep(m: "re.Match") -> str:
+        name = name_lookup(int(m.group(1), 16))
+        return name if name else m.group(0)
+
+    return _TOKEN_RE.sub(rep, neutral_text)
 
 
+def decode_rung(
+    rbuf: bytes,
+    name_lookup: Optional[Callable[[int], Optional[str]]] = None,
+) -> Optional[str]:
+    """Decode a source-protected rung buffer to neutral L5X rung text.
+
+    ``rbuf`` MUST be the whole buffer (FAFA ``body[55:]``), not the grammar's
+    ``record_buffer`` field, which is cut at ``len_record_buffer`` and so
+    truncates the ciphertext.
+
+    Fail-closed -- returns None rather than a wrong or partial rung when the
+    framing carries no key material (config 9), the ciphertext is not block
+    aligned, the PKCS7 pad is invalid, the recovered length disagrees with the
+    declared plaintext length, or the text is not valid UTF-16.  ``@hex@``
+    operands are resolved to tag names when ``name_lookup`` is supplied.
+    """
+    if not looks_like_source_protected_rung(rbuf):
+        raise ValueError("not a source-protected rung buffer")
+    if int.from_bytes(rbuf[_RUNG_DISC_OFF:_RUNG_DISC_OFF + 2], "little") == _DISC_CONFIG9:
+        return None
+    pt = sp_decrypt_framed(rbuf, _RUNG_MARKER_OFF)
+    if pt is None:
+        return None
+    try:
+        text = chr(rbuf[0]) + pt[1:].decode("utf-16-le").rstrip("\x00")
+    except UnicodeDecodeError:
+        return None
+    return resolve_names(text, name_lookup)
+
+
+# ---------------------------------------------------------------------------
+# V21 (short-header) comps name map -- unrelated to source protection
+# ---------------------------------------------------------------------------
 def _utf16z(buf: bytes) -> str:
     """Decode a NUL-terminated UTF-16LE string, aligned to 2-byte units.
 
@@ -236,8 +298,8 @@ def _utf16z(buf: bytes) -> str:
 #   reclen u4 @0, rtype u2 @10, self_lcg/CompUId u4 @12, parent u4 @16,
 #   name UTF-16LE @20.  These differ from the V30+ layout the shared
 #   acd.generated.comps.FafaComps parser assumes (it consumes reclen first and
-#   then seeks, landing 4 bytes too far for V21), so the V21 rung path builds
-#   its own object_id -> name map here rather than reusing the V30+ comps table.
+#   then seeks, landing 4 bytes too far for V21), so the V21 path builds its own
+#   object_id -> name map here rather than reusing the V30+ comps table.
 _V21_COMP_TYPE_TAG = 256  # rtype for tag/component records carrying a CompUId
 
 
@@ -264,74 +326,9 @@ def build_uid_name_map(comps_db) -> dict:
     return out
 
 
-def resolve_names(neutral_text: str, name_lookup: Optional[Callable[[int], Optional[str]]]) -> str:
-    """Replace every complete ``@hex@`` with its tag name via ``name_lookup``.
-
-    ``name_lookup(object_id) -> name | None``.  Unmapped ids are left as
-    ``@hex@`` (the same behaviour as the V30+ path).
-    """
-    if name_lookup is None:
-        return neutral_text
-
-    def rep(m: "re.Match") -> str:
-        uid = int(m.group(1), 16)
-        name = name_lookup(uid)
-        return name if name else m.group(0)
-
-    return _TOKEN_RE.sub(rep, neutral_text)
-
-
-# ---------------------------------------------------------------------------
-# top-level READ entry point
-# ---------------------------------------------------------------------------
-def decode_rung(
-    rbuf: bytes,
-    name_lookup: Optional[Callable[[int], Optional[str]]] = None,
-) -> str:
-    """Decode a V21 'Rung NT' ``record_buffer`` to neutral L5X rung text.
-
-    NOP rungs decode to ``"NOP();"``.  Cipher rungs are decrypted to the
-    verifiable neutral-text prefix (see the module docstring's LOSSY note: the
-    last ~8-15 chars of the final operand are not present in the on-disk body and
-    are not fabricated).  ``@hex@`` operands are resolved to tag names when
-    ``name_lookup`` is supplied.
-    """
-    if is_nop(rbuf):
-        return _NOP_TEXT
-    if not looks_like_source_protected_rung(rbuf):
-        raise ValueError("not a V21 source-protected Rung NT buffer")
-    first_char = chr(rbuf[0])
-    ct = rbuf[_FRAMED_LEN:]
-    pt = decrypt_recoverable(ct)
-    text = _plaintext_to_text(first_char, pt)
-    text = _strip_partial_token(text)
-    return resolve_names(text, name_lookup)
-
-
 def is_v21_version(version_string: Optional[str]) -> bool:
     """Return True for a V21.xx ACD version string (e.g. 'V21.03.02/3541.000')."""
     if not version_string:
         return False
     m = re.search(r"V(\d+)", version_string)
     return bool(m) and int(m.group(1)) == 21
-
-
-def _build_test_rbuf(first_char: str, ciphertext: bytes) -> bytes:
-    """Assemble a V21 cipher-rung ``record_buffer`` (header + SEP + ciphertext).
-
-    Test/diagnostic helper only — the read path never builds buffers.  ``m`` is
-    derived from the final length so the header length fields are self-consistent.
-    """
-    rbuf_len = _FRAMED_LEN + len(ciphertext)
-    m = rbuf_len - 1
-    header = bytearray(_HEADER_LEN)
-    header[0] = ord(first_char) & 0xFF
-    header[1:5] = _HDR_MAGIC
-    header[5] = 0x05 | (m & 0xF0)
-    header[6] = 0x00
-    header[7] = 0x00
-    header[8] = 0xA0
-    header[9] = 0x50 | (m & 0x0F)
-    header[10:13] = b"\x55\x69\x55"
-    header[13] = m & 0xFF
-    return bytes(header) + _SEP + ciphertext

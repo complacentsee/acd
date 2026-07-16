@@ -3160,21 +3160,40 @@ class RoutineBuilder(L5xElementBuilder):
         )
         results = self._cur.fetchall()
 
-        try:
-            r = RxGeneric.from_bytes(results[0][3])
-            # The ext-attr tail parses lazily; materialise it here so a
-            # source-protected routine still takes the raw-offset fallback.
-            r.extended_records
-        except Exception:
-            # RxGeneric cannot parse a source-protected routine record, but the
-            # routine type index still sits at raw record offset 0x3e (1=RLL,
-            # 2=FBD, 3=SFC, 4=ST). Recover @Type from it instead of emitting "".
-            rec0 = results[0][3]
-            rtype = routine_type_enum(rec0[0x3e]) if len(rec0) > 0x3e else ""
-            return Routine(results[0][0], results[0][0], rtype, [])
-
         record = results[0][3]
         name = results[0][0]
+
+        def _typeless_routine() -> Routine:
+            # The routine type index still sits at raw record offset 0x3e
+            # (1=RLL, 2=FBD, 3=SFC, 4=ST). Recover @Type from it instead of
+            # emitting "", and emit no rungs.
+            rtype = routine_type_enum(record[0x3e]) if len(record) > 0x3e else ""
+            return Routine(name, name, rtype, [])
+
+        try:
+            r = RxGeneric.from_bytes(record)
+        except Exception:
+            return _typeless_routine()
+        try:
+            # The ext-attr tail parses lazily; materialise it here so a record
+            # whose tail cannot be read is handled once, up front.
+            r.extended_records
+        except Exception:
+            # A source-protected routine keeps its prelude and main_record
+            # PLAINTEXT and AES-encrypts only the ext-attr tail, replacing the
+            # count_record word at body+78 with the SP marker. RxGeneric reads
+            # that word as a repeat count, so materialising the tail raises --
+            # but the rungs do NOT live in that tail. They come from the
+            # region_map/rungs join below, which needs only object_id, and the
+            # fields read here (cip_type, comment_id, main_record) are all
+            # plaintext. So carry on rather than abandoning the routine's rungs.
+            #
+            # Scoped to records that actually carry the marker: any OTHER tail
+            # failure keeps the previous behaviour exactly, so this cannot change
+            # a routine that is not source-protected.
+            if record[_SP_MARKER_OFF:_SP_MARKER_OFF + 4] != _SP_MARKER:
+                return _typeless_routine()
+
         routine_type = routine_type_enum(
             struct.unpack_from("<H", r.record_buffer, 0x30)[0]
         )

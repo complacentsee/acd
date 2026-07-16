@@ -10,7 +10,14 @@ from kaitaistruct import KaitaiStream
 from acd.generated.comps.fafa_comps import FafaComps
 from acd.generated.comps.fdfd_comps import FdfdComps
 from acd.generated.comps.short_comps import ShortComps
-from acd.record._aes import AES
+# The source-protection marker, key table and CBC helper are shared with the
+# comments text tail and the SbRegion rung buffer, so they live in the module
+# that owns the format. Re-exported here: this module is the historical import
+# site for them.
+from acd.record.source_protection import (  # noqa: F401
+    _SP_AES_CACHE, _SP_CT_OFFSET, _SP_KEY_HINT, _SP_KEYS, _SP_MARKER,
+    _sp_aes, _sp_cbc,
+)
 
 # Comps record identifiers (little-endian u16).
 _FAFA_IDENTIFIER = 64250  # 0xFAFA primary records
@@ -23,50 +30,19 @@ _FDFD_IDENTIFIER = 65021  # 0xFDFD secondary / sub records
 _RECORD_ATTRS_CACHE: "weakref.WeakKeyDictionary[Cursor, dict]" = weakref.WeakKeyDictionary()
 _DEAD_OIDS_CACHE: "weakref.WeakKeyDictionary[Cursor, frozenset]" = weakref.WeakKeyDictionary()
 
-# --- Source-protection-at-rest (V24 "source-protected" projects) -------------
+# --- Source-protection-at-rest (comps ext-attr tail) -------------------------
 # A source-protected project keeps each comps record's main_record PLAINTEXT but
 # AES-256-CBC encrypts the extended-attribute tail (which carries the value
 # backing's 0x66 design value). The encrypted tail replaces the plaintext
 # len_record/count_record at body+78 with a fixed marker + 14-byte framing; the
-# ciphertext starts at marker+18 and is a whole number of 16-byte blocks. The
-# decrypted plaintext is the ordinary ext-attr table: u32 attr-count then
-# (u32 attribute_id, u32 len_value, len_value bytes) records.
+# ciphertext starts at marker + _SP_CT_OFFSET and is a whole number of 16-byte
+# blocks. The decrypted plaintext is the ordinary ext-attr table: u32 attr-count
+# then (u32 attribute_id, u32 len_value, len_value bytes) records.
 #
-# IV = 16 zero bytes; KEY = SHA256(keymatl_N) for the public Rockwell source-
-# protection key material (configs from skdatmonster/DecryptSourceProtection).
-# The config is project-wide, so the first key that validates is cached and tried
-# first thereafter. Tried in the order configs are seen in practice.
-_SP_MARKER = b"\xaa\x96\xaa\x0a"
-_SP_CT_OFFSET = 18  # ciphertext starts marker_index + 18
-# (config_number, AES-256 key = SHA256(keymatl_config)).
-_SP_KEYS = [
-    (7, bytes.fromhex("1bac9fc4fe56e90b3467ade286dc75e35e1bd7520887ebd68ca6861c4dde8966")),
-    (5, bytes.fromhex("42b572526846f3ed853c8428dad960c7c9c6827d4818f8ff8ea9d24af0ed2b58")),
-    (3, bytes.fromhex("a082ef440f1659d637bce1e0181a86e05b9bf7561bdc0d0f726c48b4e75c5ddc")),
-    (6, bytes.fromhex("08de99aef6d12ed4b92be37f042a237add19d8d7e15ce2eae88d645288e97cb2")),
-    (8, bytes.fromhex("19927a3e5b1eff2c11dd6e7cee9b0c889e3258a339a2c63c5e0b2835402588c7")),
-]
-_SP_AES_CACHE: dict = {}          # config -> AES instance (lazy key expansion)
-_SP_KEY_HINT: list = [None]       # winning config for this process, tried first
-
-
-def _sp_aes(config: int, key: bytes) -> AES:
-    aes = _SP_AES_CACHE.get(config)
-    if aes is None:
-        aes = AES(key)
-        _SP_AES_CACHE[config] = aes
-    return aes
-
-
-def _sp_cbc(ciphertext: bytes, aes: AES, nblocks: int) -> bytes:
-    """Decrypt the first ``nblocks`` CBC blocks (IV=0) of ``ciphertext``."""
-    out = bytearray()
-    prev = b"\x00" * 16
-    for i in range(nblocks):
-        blk = ciphertext[i * 16:i * 16 + 16]
-        out += bytes(x ^ y for x, y in zip(aes.decrypt_block(blk), prev))
-        prev = blk
-    return bytes(out)
+# This tail carries no config byte, so the key is found by search: the config is
+# project-wide, so the first key that validates is cached in _SP_KEY_HINT and
+# tried first thereafter. (The SbRegion rung tail DOES carry its config on the
+# wire -- see acd.record.source_protection -- so it never searches.)
 
 
 def _sp_walk(pt: bytes, max_count: int = 255) -> Optional[dict]:
