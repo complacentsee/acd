@@ -16,14 +16,14 @@ from acd.record.comps import CompsRecord
 
 
 # Flag bits this builder actually reproduces in a rendered <AlarmCondition>:
-# flagA bit1 = present-marker, bit2 = AckRequired; flagB bit0 = Used,
-# bit1 = AlarmSetOperIncluded, bit2 = AlarmSetRollupIncluded. Any bit outside
-# these (e.g. flagA bit3 = Latched, the OperReset/ProgEnable definition-alarm
-# bits, and the <HMIGroup> sub-element that co-occurs with them) is content
-# this builder does not emit -- used to fail-closed-gate a reordered
-# duplicate-Name block below.
-_ALARM_FLAGA_RENDERED = 0x02 | 0x04
+# flagA bit1 = present-marker, bit2 = AckRequired, bit3 = Latched, bit7 =
+# OperReset; flagB bit0 = Used, bit1 = AlarmSetOperIncluded, bit2 =
+# AlarmSetRollupIncluded; flagC bit1 = ProgEnable. Any bit outside these is
+# content this builder does not emit -- used to fail-closed-gate a reordered
+# duplicate-Name block below (the <HMIGroup> sub-element rides the CAG comment).
+_ALARM_FLAGA_RENDERED = 0x02 | 0x04 | 0x08 | 0x80
 _ALARM_FLAGB_RENDERED = 0x01 | 0x02 | 0x04
+_ALARM_FLAGC_RENDERED = 0x02
 
 
 # Boolean <AlarmCondition> attributes the reference always emits "false" (none of
@@ -190,11 +190,12 @@ def _build_alarm_conditions(cur, short_header):
             if owner_oid is None or expr is None or not name:
                 ok = False
             flagA = struct.unpack_from("<H", rec, 0x196)[0]
+            flagC = struct.unpack_from("<H", rec, 0x198)[0]
             flagB = struct.unpack_from("<H", rec, 0x19a)[0]
             suf = re.match(r"_CA[0-9A-Fa-f]{8}_(.+)$", cname)
             acd = suf.group(1) if (suf and suf.group(1) in def_suffixes) else None
             jk = struct.unpack_from("<I", rec, 0x0a)[0]
-            cam = cac = None
+            cam = cac = cag = None
             cur.execute(
                 "SELECT tag_reference, record_string FROM comments WHERE parent=? AND record_type=4",
                 (jk,))
@@ -203,6 +204,8 @@ def _build_alarm_conditions(cur, short_header):
                     cam = rs
                 elif tr == "CAC":
                     cac = rs
+                elif tr == "CAG":
+                    cag = rs
             cond = {
                 "Name": name, "AlarmConditionDefinition": acd, "Input": inp,
                 "ConditionType": ct,
@@ -211,9 +214,12 @@ def _build_alarm_conditions(cur, short_header):
                 "AlarmSetOperIncluded": "true" if flagB & 2 else "false",
                 "AlarmSetRollupIncluded": "true" if flagB & 4 else "false",
                 "AckRequired": "true" if flagA & 4 else "false",
+                "Latched": "true" if flagA & 8 else "false",
+                "OperReset": "true" if flagA & 0x80 else "false",
+                "ProgEnable": "true" if flagC & 2 else "false",
                 "EvaluationPeriod": "500 millisecond", "Expression": expr,
-                "AssocTag1": assoc, "_cam": cam, "_cac": cac,
-                "_flagA": flagA, "_flagB": flagB,
+                "AssocTag1": assoc, "_cam": cam, "_cac": cac, "_cag": cag,
+                "_flagA": flagA, "_flagB": flagB, "_flagC": flagC,
             }
         except Exception:
             owner_oid, cond, ok = None, None, False
@@ -238,7 +244,8 @@ def _build_alarm_conditions(cur, short_header):
             if len(inputs) != len(set(inputs)):
                 continue
             if any((c["_flagA"] & ~_ALARM_FLAGA_RENDERED)
-                   or (c["_flagB"] & ~_ALARM_FLAGB_RENDERED) for c in cs):
+                   or (c["_flagB"] & ~_ALARM_FLAGB_RENDERED)
+                   or (c["_flagC"] & ~_ALARM_FLAGC_RENDERED) for c in cs):
                 continue
             cs = sorted(cs, key=lambda c: c["Input"])
         out[owner_oid] = _render_alarm_conditions(cs)
@@ -262,13 +269,14 @@ def _render_alarm_conditions(conds):
         a.append('InFault="false"')
         a.append(f'AckRequired="{c["AckRequired"]}"')
         for k in _ALARM_FALSE_BOOLS[1:]:  # skip InFault (already emitted)
-            a.append(f'{k}="false"')
+            v = c[k] if k in ("Latched", "OperReset", "ProgEnable") else "false"
+            a.append(f'{k}="{v}"')
         a.append(f'EvaluationPeriod="{c["EvaluationPeriod"]}"')
         a.append(f'Expression="{_esc(c["Expression"])}"')
         if c["AssocTag1"] is not None:
             a.append(f'AssocTag1="{_esc(c["AssocTag1"])}"')
-        cam, cac = c["_cam"], c["_cac"]
-        if cam is None and cac is None:
+        cam, cac, cag = c["_cam"], c["_cac"], c["_cag"]
+        if cam is None and cac is None and cag is None:
             cfg = "<AlarmConfig/>"
         else:
             cfg = "<AlarmConfig>"
@@ -277,6 +285,8 @@ def _render_alarm_conditions(conds):
                         f"<![CDATA[{cam}]]>\n</Text></Message></Messages>")
             if cac is not None:
                 cfg += f"<AlarmClass>\n<![CDATA[{cac}]]>\n</AlarmClass>"
+            if cag is not None:
+                cfg += f"<HMIGroup>\n<![CDATA[{cag}]]>\n</HMIGroup>"
             cfg += "</AlarmConfig>"
         parts.append(f'<AlarmCondition {" ".join(a)}>{cfg}</AlarmCondition>')
     parts.append("</AlarmConditions>")
