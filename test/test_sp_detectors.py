@@ -20,6 +20,13 @@ from acd.l5x.elements import (
     _AOI_NO_PROTECTION_HASH,
     _SP_MARKER,
 )
+from acd.l5x.encoded_data import (
+    source_key_unwraps,
+    _aes,
+    _WRAPPED_KEY_CONFIG,
+    _WRAPPED_KEY_LEN,
+    _WRAPPED_KEY_VERSION,
+)
 
 AOI_OFF = 272   # _AOI_KEYHASH_OFF
 RT_OFF = 202    # _RT_KEYHASH_OFF
@@ -171,3 +178,78 @@ def test_ext_attr01_walk():
     body = b"\x00" * 74 + struct.pack("<II", 0, 0) + struct.pack("<II", 1, len(a1)) + a1
     assert E._ext_attr01(body) == a1
     assert E._ext_attr01(b"\x00" * 74) is None
+
+
+# --------------------------------------------------------------------------- #
+# Filled-slot (wrapped-key) layout
+# --------------------------------------------------------------------------- #
+def _wrapped_slot_ct(tag=b"\xab\xcd"):
+    """A config-5 wrapped-key ciphertext whose plaintext passes the structural
+    self-check: a 2-byte tag repeated at 0/18/36 and at the plaintext's end."""
+    pt = bytearray(58)
+    pt[0:2] = tag
+    pt[18:20] = tag
+    pt[36:38] = tag
+    pt[56:58] = tag
+    pad = _WRAPPED_KEY_LEN - len(pt)
+    buf = bytes(pt) + bytes([pad]) * pad
+    aes = _aes(_WRAPPED_KEY_CONFIG)
+    out = bytearray()
+    prev = b"\x00" * 16
+    for i in range(0, len(buf), 16):
+        prev = aes.encrypt_block(bytes(x ^ y for x, y in zip(buf[i:i + 16], prev)))
+        out += prev
+    return bytes(out)
+
+
+def _filled_body(keyhash_off, slot_ct):
+    """A no-marker body whose ext-attr 0x1 is the filled (wrapped-key) form:
+    the version word 0x0005 then the 64-byte wrapped key at ``keyhash_off``."""
+    a1 = bytearray(keyhash_off + 2 + _WRAPPED_KEY_LEN + 4)
+    a1[keyhash_off:keyhash_off + 2] = _WRAPPED_KEY_VERSION
+    a1[keyhash_off + 2:keyhash_off + 2 + _WRAPPED_KEY_LEN] = slot_ct
+    tail = struct.pack("<II", 1, len(a1)) + bytes(a1)
+    return b"\x00" * 74 + struct.pack("<II", len(tail), 1) + tail
+
+
+def test_wrapped_key_unwraps_is_protected():
+    ct = _wrapped_slot_ct()
+    assert _routine_is_source_protected(_filled_body(RT_OFF, ct)) is True
+    assert _aoi_is_source_protected(_filled_body(AOI_OFF, ct)) is True
+
+
+def test_wrapped_key_that_does_not_unwrap_is_plaintext():
+    # The filled slot of a definition Studio ships as plaintext: same form, but
+    # its bytes are not a wrapped key we can unwrap (here a one-bit corruption of
+    # a valid one), so the definition is NOT suppressed.
+    ct = bytearray(_wrapped_slot_ct())
+    ct[-1] ^= 1
+    assert _routine_is_source_protected(_filled_body(RT_OFF, bytes(ct))) is False
+    assert _aoi_is_source_protected(_filled_body(AOI_OFF, bytes(ct))) is False
+
+
+def test_wrapped_key_structural_check_rejects_wrong_tag():
+    # Unwraps cleanly (valid PKCS7) but the repeated-tag self-check fails.
+    aes = _aes(_WRAPPED_KEY_CONFIG)
+    pt = bytes(58)                      # all-zero tags at 0/18/36 but not at end
+    buf = bytearray(pt) + bytes([6]) * 6
+    buf[56:58] = b"\x01\x02"            # break the trailing-tag equality
+    out = bytearray()
+    prev = b"\x00" * 16
+    for i in range(0, len(buf), 16):
+        prev = aes.encrypt_block(bytes(x ^ y for x, y in zip(buf[i:i + 16], prev)))
+        out += prev
+    assert source_key_unwraps(_ext01(_filled_body(RT_OFF, bytes(out))), RT_OFF) is False
+
+
+def _ext01(body):
+    return E._ext_attr01(body)
+
+
+def test_source_key_unwraps_fail_closed():
+    assert source_key_unwraps(None, RT_OFF) is False
+    assert source_key_unwraps(b"\x00" * 10, RT_OFF) is False          # too short
+    # right length, wrong version word -> not the wrapped-key form
+    a1 = bytearray(RT_OFF + 2 + _WRAPPED_KEY_LEN)
+    a1[RT_OFF:RT_OFF + 2] = b"\x4d\x53"
+    assert source_key_unwraps(bytes(a1), RT_OFF) is False

@@ -144,6 +144,60 @@ def keyhash_slot_readable(a1: bytes, keyhash_off: int) -> bool:
     return pad == b"\x00" * len(pad)
 
 
+# The filled-slot form is not a hash slot at all: it holds a per-definition
+# source key wrapped under the scheme's own config-5 material (a public key we
+# hold). Its leading two bytes are the scheme's version word; the 64 bytes after
+# are the wrapped key. A definition is source-protected iff that key unwraps --
+# the intrinsic per-definition bit, read from the record. Definitions Studio
+# ships as plaintext share this form but carry no valid wrapped key here, so they
+# fall through. This is what the security-descriptor detector reads instead of
+# the vacuous "not zero and not the sentinel" test, which flags every filled slot.
+_WRAPPED_KEY_VERSION = b"\x00\x05"
+_WRAPPED_KEY_LEN = 64
+_WRAPPED_KEY_CONFIG = 5
+
+
+def _pkcs7_unpad(buf: bytes) -> Optional[bytes]:
+    """Strip PKCS7 padding, or None when the trailer is not valid padding."""
+    if not buf:
+        return None
+    n = buf[-1]
+    if n < 1 or n > 16 or n > len(buf) or buf[-n:] != bytes([n]) * n:
+        return None
+    return buf[:-n]
+
+
+def source_key_unwraps(a1: Optional[bytes], keyhash_off: int) -> bool:
+    """True iff the descriptor's wrapped-key slot decrypts to a well-formed key.
+
+    Fail-closed: a slot that is absent, is not the wrapped-key form, holds no
+    key we can decrypt, or unwraps to a structurally invalid plaintext all
+    return False. The structural check is pure internal self-consistency -- a
+    2-byte item tag repeated at fixed positions and at the plaintext's end -- so
+    nothing here is keyed by catalog, type, plant or file.
+    """
+    end = keyhash_off + 2 + _WRAPPED_KEY_LEN
+    if a1 is None or len(a1) < end:
+        return False
+    if a1[keyhash_off:keyhash_off + 2] != _WRAPPED_KEY_VERSION:
+        return False
+    aes = _aes(_WRAPPED_KEY_CONFIG)
+    if aes is None:
+        return False
+    ct = a1[keyhash_off + 2:end]
+    out = bytearray()
+    prev = b"\x00" * 16
+    for i in range(0, len(ct), 16):
+        blk = ct[i:i + 16]
+        out += bytes(x ^ y for x, y in zip(aes.decrypt_block(blk), prev))
+        prev = blk
+    pt = _pkcs7_unpad(bytes(out))
+    if pt is None or len(pt) < 38:
+        return False
+    tag = pt[0:2]
+    return pt[18:20] == tag and pt[36:38] == tag and pt[-2:] == tag
+
+
 _AES_CACHE: dict = {}
 
 
