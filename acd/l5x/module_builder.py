@@ -957,6 +957,32 @@ class ModuleBuilder(L5xElementBuilder):
                 return m.group(1).decode("ascii", errors="replace") or None
         return None
 
+    def _mtk_from_data_collection(self, data_link: int):
+        """The matched-device identity tuple (Vendor, ProductType, ProductCode,
+        Major, Minor) from the linked RxDataCollection record's <MTK> tag, or None.
+
+        A matched-device module (e.g. a Stratix switch, a robot) exports THIS
+        identity as its primary <Module> identity, demoting its own fixed-offset
+        record identity to the UserDefined* attributes. The tag is in the raw
+        record on short-header projects and the decrypted ext-attr 0x66 image on
+        long-header ones (mirrors _udcn_from_data_collection)."""
+        if not data_link:
+            return None
+        for oid, raw in self._rxdata_by_cid.get(data_link & 0xFFFF, []):
+            m = re.search(rb"<MTK>([^<]*)</MTK>", raw)
+            if not m:
+                img = CompsRecord.record_attrs(
+                    self._cur, oid, self._short_header).get(0x66, b"")
+                m = re.search(rb"<MTK>([^<]*)</MTK>", img)
+            if m:
+                try:
+                    vals = [int(x) for x in m.group(1).split(b",")]
+                except ValueError:
+                    return None
+                if len(vals) == 5:
+                    return tuple(vals)
+        return None
+
     def _comm_method_from_data_link(self, data_link: int) -> "Union[str, None]":
         """Resolve CommMethod (<CF>) from the module's comment_id link.
 
@@ -1614,6 +1640,20 @@ class ModuleBuilder(L5xElementBuilder):
                 c["InputCxnPoint"] = dec["InputCxnPoint"]
                 c["OutputCxnPoint"] = dec["OutputCxnPoint"]
             connections.append(c)
+
+        # Matched-device modules (e.g. a Stratix switch, a robot) export their
+        # LINKED profile identity (the RxDataCollection <MTK>) as the primary
+        # <Module> identity and demote the fixed-offset record identity to the
+        # UserDefined* attributes. Swap them in before the catalog lookup so it
+        # keys on the matched identity. Fail-closed: skip when there is no <MTK>,
+        # when the identity already matches, or when the module already carries a
+        # UserDefined* identity (a drive peripheral, whose MTK is PT 0).
+        mtk = self._mtk_from_data_collection(data_link)
+        if (ud_vendor is None and mtk is not None and mtk[1] != 0
+                and (mtk[0], mtk[1], mtk[2]) != (vendor, product_type, product_code)):
+            ud_vendor, ud_product_type, ud_product_code, ud_major, ud_minor = (
+                vendor, product_type, product_code, major, minor)
+            vendor, product_type, product_code, major, minor = mtk
 
         # CatalogNumber: prefer the (V,PT,PC,Major) override for hardware-revision
         # ambiguous keys, then the (V,PT,PC) base table; finally fall back to any
