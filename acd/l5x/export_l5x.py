@@ -915,6 +915,7 @@ class ExportL5x:
                 _device_major=_dev_major,
                 _device_minor=_dev_minor,
                 _faithful=self.faithful,
+                _export_language=(getattr(self, "_export_language", "en-US") or "en-US"),
             ).build()
         return self._controller
 

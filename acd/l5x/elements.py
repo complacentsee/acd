@@ -22,6 +22,7 @@ from acd.l5x.alias import TagAliasResolver
 from acd.l5x.base import (
     L5xElement,
     L5xElementBuilder,
+    _LANG_DESC_OIDS,
     _parse_rec_and_exts,
     _parse_rec_tolerant,
     _rxgeneric_plaintext_main,
@@ -1704,6 +1705,15 @@ class Controller(L5xElement):
     compatibility_mode: Union[str, None] = field(default=None)
     ethernet_ip_mode: Union[str, None] = field(default=None)
     power_loss_program: Union[str, None] = field(default=None)
+    # Project language attributes, emitted only on a genuinely multilingual project
+    # (see ControllerBuilder._project_language_attrs); all None -> all omitted.
+    # ControllerLanguage is the ExtendedDevice record's locale; the current/default
+    # project languages are the export language (an export-environment property,
+    # like ExportDate). Placed AFTER the first defaulted field so the positional
+    # redundancy_enabled argument is undisturbed; passed by keyword.
+    controller_language: Union[str, None] = field(default=None)
+    current_project_language: Union[str, None] = field(default=None)
+    default_project_language: Union[str, None] = field(default=None)
     # RedundancyInfo pad percentages, read from the controller-properties blob
     # (ext-attr 0x001): IOMemoryPadPercentage = u16 @ offset 16, DataTablePadPercentage
     # = u16 @ offset 18. Both None on the 5x80 generation (which omits the attributes).
@@ -1868,6 +1878,9 @@ class RSLogix5000Content(L5xElement):
     contains_context: str
     export_date: str
     export_options: str
+    # Root display language on a multilingual project (== the controller's
+    # CurrentProjectLanguage); None on a single-language project -> omitted.
+    current_language: Union[str, None] = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -4930,6 +4943,54 @@ class ControllerBuilder(L5xElementBuilder):
     # omitted rather than recovered as plaintext. Default False = recover as much as
     # possible (emit the decoded plaintext AOI definition).
     _faithful: bool = field(default=False)
+    # The reference EXPORT language (a property of the export environment, like
+    # ExportDate -- NOT stored in the ACD). Names the current/default project
+    # language attributes on a multilingual project; see _project_language_attrs.
+    _export_language: str = field(default="en-US")
+
+    def _project_language_attrs(self):
+        """(ControllerLanguage, CurrentProjectLanguage, DefaultProjectLanguage) for
+        a genuinely multilingual project, else (None, None, None).
+
+        ControllerLanguage is READ from the controller's ExtendedDevice record --
+        a NUL-terminated locale string at a fixed offset, with a u16 length that is
+        the string's length or (on the V20 short-header form) zero. The current and
+        default project languages are the export language, an export-environment
+        value the reference stamps like ExportDate (provably absent from the ACD).
+
+        The attributes appear only on a multilingual project. Two families gate it:
+        a long-header project carries language-keyed description rows in the
+        comments table (a controller with a locale but no such rows -- source only
+        ever authored in one language -- must NOT emit them); a short-header
+        project is gated on the V20+ export epoch that introduced them. The short
+        form additionally omits DefaultProjectLanguage. Fail-closed: any unresolved
+        or malformed input yields all-None (the whole group is withheld).
+        """
+        try:
+            row = self._cur.execute(
+                "SELECT c.record FROM comps c JOIN comps p ON c.parent_id=p.object_id"
+                " WHERE c.comp_name='ExtendedDevice'"
+                " AND p.comp_name='RxControllerCollection' LIMIT 1").fetchone()
+            if not row or not row[0]:
+                return None, None, None
+            rec = bytes(row[0])
+            if len(rec) < 0x18B:
+                return None, None, None
+            ln = struct.unpack_from("<H", rec, 0x188)[0]
+            loc = rec[0x18A:0x18A + 16].split(b"\x00")[0].decode("ascii")
+            if not re.fullmatch(r"[a-z]{2,3}-[A-Z]{2}", loc) or ln not in (0, len(loc)):
+                return None, None, None
+            if self._short_header:
+                if self._acd_major < 20:
+                    return None, None, None
+                return loc, self._export_language, None
+            langs = {r[0] for r in self._cur.execute(
+                "SELECT DISTINCT object_id FROM comments")} & _LANG_DESC_OIDS
+            if not langs:
+                return None, None, None
+            return loc, self._export_language, self._export_language
+        except Exception:
+            return None, None, None
 
     def _pass_own_description(self, results, _comment_parent):
         # --- Controller own Description ---
@@ -6228,6 +6289,8 @@ class ControllerBuilder(L5xElementBuilder):
         (root_sig, ctrl_attr_sig, tag_map_sig, app_rollup_sig, safety_info_attrs,
          alarm_definitions, safety_tag_map) = self._pass_safety_info()
         trends_xml = self._pass_trends()
+        (controller_language, current_project_language,
+         default_project_language) = self._project_language_attrs()
 
         controller = Controller(
             controller_name,
@@ -6260,6 +6323,9 @@ class ControllerBuilder(L5xElementBuilder):
             tasks,
             aois,
             redundancy_enabled,
+            controller_language=controller_language,
+            current_project_language=current_project_language,
+            default_project_language=default_project_language,
             # <DataLogs> ships with the DataLog feature in v24; gate it on the
             # same v24+/5x80 signal as the project-download settings above.
             _emit_data_logs=_v24_plus,
@@ -6393,6 +6459,8 @@ class ProjectBuilder:
             contains_context,
             export_date,
             export_options,
+            current_language=getattr(
+                self.fallback_controller, "current_project_language", None),
         )
 
 
