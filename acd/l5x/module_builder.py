@@ -181,6 +181,10 @@ class Module(L5xElement):
     # ('true' or 'false') on these and omits it elsewhere. Drives (0x200/0x201)
     # are deliberately excluded -- OEM omits the attribute on most of them.
     _safety_enabled_gate: bool = field(default=False)
+    # 'true'/'false' from the module's diagnostics object; None omits
+    # @AutoDiagsEnabled (the attribute only exists on modules whose record
+    # carries the diagnostics-object link).
+    _auto_diags: Union[str, None] = field(default=None)
     # <ConfigData>/<ConfigScript> for a module with a config image but no controller
     # :C tag (mutually exclusive with the ConfigTag above). Each is (hex_data, size)
     # or None. The raw <Data> is masked by the comparator; the size attribute is the
@@ -250,6 +254,9 @@ class Module(L5xElement):
         # UserDefinedCatalogNumber is the last <Module> attribute in the reference.
         udcn_attr = (f' UserDefinedCatalogNumber="{html.escape(self._ud_catalog_number, quote=True)}"'
                      if self._ud_catalog_number else "")
+        # @AutoDiagsEnabled trails UserDefinedCatalogNumber in the reference.
+        autodiags_attr = (f' AutoDiagsEnabled="{self._auto_diags}"'
+                          if self._auto_diags else "")
         attrs = (
             f'{name_attr}'
             f'CatalogNumber="{self.catalog_number}" '
@@ -262,7 +269,7 @@ class Module(L5xElement):
             f'ParentModPortId="{self.parent_mod_port_id}" '
             f'Inhibited="{self.inhibited}" '
             f'MajorFault="{self.major_fault}"{shutdown_attr}{dxid_attr}'
-            f'{safety_attr}{udcn_attr}'
+            f'{safety_attr}{udcn_attr}{autodiags_attr}'
         )
 
         # Optional <Description>
@@ -1870,9 +1877,11 @@ class ModuleBuilder(L5xElementBuilder):
         drives_adc_enabled = drives_adc_mode = safety_network = None
         safety_signature = safety_signature_timestamp = None
         safety_enabled_gate = False
+        _mattrs: Dict[int, bytes] = {}
         try:
-            _fe1 = CompsRecord.record_attrs(
-                self._cur, self._object_id, self._short_header).get(0x001, b"")
+            _mattrs = CompsRecord.record_attrs(
+                self._cur, self._object_id, self._short_header)
+            _fe1 = _mattrs.get(0x001, b"")
             _fmi = ModuleIdentity.from_bytes(_fe1)
             # class_word 0x618 (safety I/O) and 0x702 (ethernet safety device)
             # are the classes OEM always writes SafetyEnabled on; verified
@@ -1895,6 +1904,26 @@ class ModuleBuilder(L5xElementBuilder):
                 safety_network = f"16#0000_{_be[0:4]}_{_be[4:8]}_{_be[8:12]}"
         except Exception:
             pass
+        # @AutoDiagsEnabled: ext-attr 405 on the module record is a u32 object-id
+        # link to the module's diagnostics object. That object's ext-attr 0x001
+        # holds a u32 presence gate at offset 0 and the enable flag at offset 4;
+        # a zero gate means the module has no diagnostics setting and OEM omits
+        # the attribute. Fail-closed at every hop -- a module without 405, a link
+        # that resolves to no record, and a short payload all omit.
+        auto_diags = None
+        try:
+            _raw405 = _mattrs.get(405)
+            if _raw405 is not None and len(_raw405) >= 4:
+                _diag = CompsRecord.record_attrs(
+                    self._cur, struct.unpack_from("<I", _raw405, 0)[0],
+                    self._short_header)
+                _de1 = _diag.get(0x001)
+                if (_de1 is not None and len(_de1) >= 8
+                        and struct.unpack_from("<I", _de1, 0)[0] != 0):
+                    auto_diags = ("true" if struct.unpack_from("<I", _de1, 4)[0]
+                                  else "false")
+        except Exception:
+            auto_diags = None
         # SafetySignature: join the GSS side table by the module's object type /
         # comment id; a signed controller's Local module carries the all-zero hash.
         try:
@@ -1980,6 +2009,7 @@ class ModuleBuilder(L5xElementBuilder):
             _rack_out_alias_inner=rack_out_alias_inner,
             _safety_enabled=safety_enabled,
             _safety_enabled_gate=safety_enabled_gate,
+            _auto_diags=auto_diags,
             _config_data=configdata,
             _config_script=configscript,
             _drives_adc_enabled=drives_adc_enabled,
