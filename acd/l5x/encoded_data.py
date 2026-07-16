@@ -120,6 +120,30 @@ _SPT_VIEWABLE_BIT = 0x1
 _SPT_VIEWABLE = "Viewable"
 _SPT_FULL = "Full Protection"
 
+
+def keyhash_slot_readable(a1: bytes, keyhash_off: int) -> bool:
+    """True unless the key slot is positively observed to be a filled one.
+
+    Two forms share the slot. The padded-key form leaves the tail of the slot
+    zero, so its leading bytes really are the protection key (and its hash).
+    The filled form carries a per-definition blob there instead and keeps no
+    key in the slot, so those leading bytes are not a key hash: neither
+    ``security_descriptor`` (which would emit the blob's bytes as a key) nor
+    the source-protection detector (whose "not zero and not the sentinel" test
+    is vacuously true against a blob) may read them.
+
+    Only an observed non-zero pad rejects: when ``a1`` ends before the pad the
+    form cannot be told apart here and the caller's own checks decide, so this
+    returns True. Descriptors declaring the shorter key length are exactly that
+    case, and a False here would suppress every one of them.
+    """
+    end = keyhash_off + _SD_SLOT_LEN
+    if len(a1) < end:
+        return True
+    pad = a1[keyhash_off + _SCHEME_KEY_LEN:end]
+    return pad == b"\x00" * len(pad)
+
+
 _AES_CACHE: dict = {}
 
 
@@ -162,7 +186,7 @@ def security_descriptor(a1: Optional[bytes], keyhash_off: int) -> Optional[Tuple
     slot = a1[keyhash_off:keyhash_off + _SD_SLOT_LEN]
     # Our scheme zero-pads its key out to the slot; the newer form fills the slot
     # and keeps its real key elsewhere, so reading one would emit a wrong key.
-    if slot[_SCHEME_KEY_LEN:] != b"\x00" * (_SD_SLOT_LEN - _SCHEME_KEY_LEN):
+    if not keyhash_slot_readable(a1, keyhash_off):
         return None
     flags = int.from_bytes(
         a1[keyhash_off + _SD_SLOT_LEN:keyhash_off + _SD_TOTAL], "little")
