@@ -4214,10 +4214,13 @@ def _safety_info_attr_string(cur, short_header):
     if sig:
         attrs["SafetySignature"] = sig
     # Lock/Unlock passwords: 40-byte blocks following each 0x28 0x00 marker, in
-    # record order. Two blocks (leading byte 0x0d) are a cp1252 string re-encoded
-    # UTF-16-LE then base64 (Lock then Unlock); a single block (leading byte 0x01)
-    # is base64'd verbatim (Unlock only). Validated 0-FP across the SafetyController
-    # files (no other file produces blocks).
+    # record order (first = Lock, second = Unlock; a single block = Unlock only).
+    # The encoding is keyed by the block's own leading format byte, NOT the count:
+    # 0x01 is the binary-hash form Studio exports verbatim base64; any other lead
+    # byte is the legacy 8-bit form Studio widens cp1252 -> UTF-16-LE before
+    # base64. (The count-keyed rule this replaces coincided with the content rule
+    # only on the legacy blocks and dropped every 0x01 block, since cp1252 raises
+    # on the binary bytes.)
     blocks = []
     pos = 0
     while True:
@@ -4229,21 +4232,26 @@ def _safety_info_attr_string(cur, short_header):
             blocks.append(blk)
         pos = j + 2
 
-    def _enc_cp1252(blk):
+    def _enc_block(blk):
+        # Fail closed: a legacy block that is not decodable cp1252 -> None.
+        if blk[0] == 0x01:
+            return base64.b64encode(blk).decode().rstrip("=")
         try:
             return base64.b64encode(
                 blk.decode("cp1252").encode("utf-16-le")).decode().rstrip("=")
         except Exception:
             return None
     if len(blocks) >= 2:
-        lock = _enc_cp1252(blocks[0])
-        unlock = _enc_cp1252(blocks[1])
+        lock = _enc_block(blocks[0])
+        unlock = _enc_block(blocks[1])
         if lock:
             attrs["SafetyLockPassword"] = lock
         if unlock:
             attrs["SafetyUnlockPassword"] = unlock
     elif len(blocks) == 1:
-        attrs["SafetyUnlockPassword"] = base64.b64encode(blocks[0]).decode().rstrip("=")
+        unlock = _enc_block(blocks[0])
+        if unlock:
+            attrs["SafetyUnlockPassword"] = unlock
     order = ("SafetySignature", "SafetyLocked", "SafetyLockPassword",
              "SafetyUnlockPassword", "SignatureRunModeProtect",
              "ConfigureSafetyIOAlways", "SafetyLevel")
