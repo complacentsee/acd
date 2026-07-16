@@ -1811,7 +1811,13 @@ class Controller(L5xElement):
             open_tag
             + inner
             + redundancy_info
-            + '<Security Code="0" ChangesToDetect="16#ffff_ffff_ffff_ffff"/>'
+            # The reference omits @ChangesToDetect on the pre-V20 save format and
+            # emits the fixed all-ones mask from V20 on. Gate on our own MajorRev;
+            # strip only when it is CONFIDENTLY pre-V20, else keep the attribute
+            # (fail-closed: an unknown version keeps today's output).
+            + ('<Security Code="0"/>'
+               if str(self.major_rev).isdigit() and int(self.major_rev) < 20
+               else '<Security Code="0" ChangesToDetect="16#ffff_ffff_ffff_ffff"/>')
             + self._safety_info_xml()
             + self._alarm_definitions
             + self._comm_ports_xml
