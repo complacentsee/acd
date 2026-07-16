@@ -975,6 +975,7 @@ class Tag(L5xElement):
             or ":" in self.name
             or self.name.startswith("__SL")
             or self.name.startswith("__l")
+            or self.name.startswith("__SHADOW")
             or self.name.startswith("__CLONE")
         )
 
@@ -1342,7 +1343,7 @@ class LocalTag(L5xElement):
             or not (self.name[0].isalpha() or self.name[0] == "_")
             or ":" in self.name
             or self.name.startswith("__SL")
-            or self.name.startswith("__l0")
+            or self.name.startswith("__l")
             or self.name.startswith("__CLONE")
         )
 
@@ -1411,7 +1412,7 @@ class Parameter(L5xElement):
             not self.name
             or not (self.name[0].isalpha() or self.name[0] == "_")
             or self.name.startswith("__SL")
-            or self.name.startswith("__l0")
+            or self.name.startswith("__l")
             or self.name.startswith("__CLONE")
         )
 
@@ -3851,18 +3852,13 @@ class AoiBuilder(L5xElementBuilder):
         if tag_coll_row:
             tag_coll_oid = tag_coll_row[0]
             self._cur.execute(
-                "SELECT object_id, record, record_type, comp_name FROM comps WHERE parent_id="
+                "SELECT object_id, record FROM comps WHERE parent_id="
                 + str(tag_coll_oid)
                 + " AND record_type != 512"
                 + " ORDER BY seq_number"
             )
-            for child_oid, child_rec, child_rt, child_name in self._cur.fetchall():
+            for child_oid, child_rec in self._cur.fetchall():
                 if child_oid in dead:
-                    continue
-                # Hidden/internal scratch local tags (__l<hex> address placeholders)
-                # carry the record_type 0x8 bit and a "__" name; Studio never
-                # exports them. Both conditions guard the skip (never drop a real tag).
-                if child_rt & 0x8 and (child_name or "").startswith("__"):
                     continue
                 child_rec = bytes(child_rec)
                 # Determine whether this is a parameter or a local tag from the
@@ -4454,11 +4450,6 @@ class ProgramBuilder(L5xElementBuilder):
             )
             for result in self._cur.fetchall():
                 if result[1] in dead:  # dead-relic (FDFD-only) tag -> skip (P6.9)
-                    continue
-                # Hidden/internal scratch tags (__SHADOW_/__DEFVAL_/__Map...) carry
-                # the record_type 0x8 bit and a "__" name; Studio never exports them.
-                # Both conditions guard the skip so a real tag is never dropped.
-                if result[3] & 0x8 and (result[0] or "").startswith("__"):
                     continue
                 _tb = TagBuilder(self._cur, result[1], _short_header=self._short_header,
                                  _acd_major=self._acd_major, _program_cid=_prog_cid,
