@@ -6071,39 +6071,59 @@ class ControllerBuilder(L5xElementBuilder):
             pass
 
     def _pass_motion_sync(self, tags, programs, modules):
-        # CIP Motion: a 2094-family integrated-motion drive (ProductType 37) that
-        # has no axis assigned to it exports its MotionSync connection with RPI 0
-        # (the connection is present but unscheduled). The axis->module association
-        # is the module's modid at offset 250 of the AXIS_CIP_DRIVE tag's data-table
-        # record (the long-header drive layout). Only act when EVERY axis resolves to
-        # a known module modid -- that confirms the offset/layout for this project, so
-        # a drive that actually owns an axis is never zeroed. Long-header only.
+        # CIP Motion: a 2094-family integrated-motion drive (ProductType 37) exports
+        # its MotionSync connection with RPI 0 when the drive is UNSCHEDULED -- when
+        # it owns no axis, OR its axis is not assigned to a motion group. A scheduled
+        # drive keeps the connection blob's RPI (the group's coarse update period).
+        # Two record fields decide it, both on the AXIS_CIP_DRIVE tag's data-table
+        # record: the drive modid (u32 at full-payload offset 250 = body 102 on the
+        # long header) links the axis to its module, and the axis' group assignment
+        # (u16 at offset 8 of the record's ext-attr 0x1 value image) names its motion
+        # group -- 0, or a cid no MOTION_GROUP tag carries, means unassigned. Only act
+        # when EVERY axis' modid resolves to a known module (that confirms the layout
+        # for this project); an unreadable group image counts the axis as scheduled,
+        # so a drive that really is grouped is never wrongly zeroed. Long-header only.
         try:
             if not self._short_header:
                 _axis_tags = [t for t in tags if (t.data_type or "") == "AXIS_CIP_DRIVE"]
+                _grp_tags = [t for t in tags
+                             if (t.data_type or "").upper() == "MOTION_GROUP"]
                 for _prog in programs:
                     _axis_tags += [t for t in _prog.tags
                                    if (t.data_type or "") == "AXIS_CIP_DRIVE"]
+                    _grp_tags += [t for t in _prog.tags
+                                  if (t.data_type or "").upper() == "MOTION_GROUP"]
+                _grp_cids = set()
+                for _gt in _grp_tags:
+                    _gr = self._cur.execute(
+                        "SELECT record FROM comps WHERE object_id=?",
+                        (_gt._data_table_instance,)).fetchone()
+                    if _gr and _gr[0] is not None and len(bytes(_gr[0])) >= 14:
+                        _grp_cids.add(struct.unpack_from("<H", bytes(_gr[0]), 12)[0])
                 _known = {m._modid for m in modules if m._modid}
-                _resolved = set()
+                _scheduled = set()
                 _complete = bool(_axis_tags)
                 for _at in _axis_tags:
                     _arow = self._cur.execute(
                         "SELECT record FROM comps WHERE object_id=?",
                         (_at._data_table_instance,)).fetchone()
                     _buf = bytes(_arow[0]) if _arow and _arow[0] else b""
-                    # Body-relative rebase of the full-payload offset 250:
-                    # guarded `not short_header`, so the long header (148) is
-                    # the only offset in play -- 250-148 = 102.
                     _cand = (struct.unpack_from("<I", _buf, 102)[0]
                              if len(_buf) >= 106 else None)
-                    if _cand in _known:
-                        _resolved.add(_cand)
-                    else:
+                    if _cand not in _known:
                         _complete = False
+                        continue
+                    _vb = CompsRecord.read_value_attrs(
+                        _buf, self._short_header, full=True,
+                        body_mode=True).get(0x01)
+                    # Fail toward scheduled (keep the blob RPI) on an unreadable
+                    # image -- never emit a wrong 0.
+                    if (_vb is None or len(_vb) < 10
+                            or struct.unpack_from("<H", _vb, 8)[0] in _grp_cids):
+                        _scheduled.add(_cand)
                 if _complete:
                     for _m in modules:
-                        if _m._product_type == 37 and _m._modid and _m._modid not in _resolved:
+                        if _m._product_type == 37 and _m._modid and _m._modid not in _scheduled:
                             for _c in _m._connections:
                                 if _c.get("type") == "MotionSync":
                                     _c["rpi"] = "0"
