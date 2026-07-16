@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from os import PathLike
 from pathlib import Path
-from typing import List, Tuple, Dict, Union
+from typing import List, Tuple, Dict, Union, Optional
 
 from acd.generated.comps.module_identity import ModuleIdentity
 from acd.generated.comps.rx_generic import RxGeneric
@@ -82,6 +82,8 @@ from acd.l5x.module_builder import (
 from acd.l5x import tag_value as _tag_value
 from acd.l5x.axis_cip import render_axis_cip_drive as _render_axis_cip_drive
 from acd.l5x.axis_cip import render_motion_group as _render_motion_group
+from acd.l5x.coordinate_system import (
+    render_coordinate_system as _render_coordinate_system)
 from acd.l5x.trends import build_trends
 from acd.record.blobs import ControllerProps
 from acd.record.comps import CompsRecord, _SP_MARKER, decrypt_sp_nameless
@@ -202,6 +204,13 @@ _SKIP_DECORATED: set = {
     "ALARM_DIGITAL", "MESSAGE",
     "AXIS_SERVO", "AXIS_SERVO_DRIVE", "AXIS_CIP_DRIVE", "AXIS_VIRTUAL",
     "AXIS_GENERIC", "AXIS_CONSUMED", "MOTION_GROUP",
+    # COORDINATE_SYSTEM is written by the reference as a dedicated
+    # <Data Format="CoordinateSystem"><CoordinateSystemParameters> block, never
+    # as a Decorated <Structure>, so the generic Decorated tree is a fabrication.
+    # The real block is resolved by ControllerBuilder (see coordinate_system.py);
+    # when it fails closed the tag degrades to no-<Data> (element_missing), the
+    # same net cost as today's wrong Decorated structure -- never worse.
+    "COORDINATE_SYSTEM",
 }
 # PID_ENHANCED is NOT skipped: OEM renders it like any predefined struct, a value
 # block (L5K / raw-hex) plus a Decorated <Structure> of its members.
@@ -918,6 +927,10 @@ class Tag(L5xElement):
     # Pre-rendered <Data Format="Axis"> block for an AXIS_VIRTUAL tag, resolved by
     # ControllerBuilder once every MOTION_GROUP tag is known. None -> no <Data>.
     _axis_data_xml: Union[str, None] = field(default=None)
+    # Pre-rendered <Data Format="CoordinateSystem"> block for a COORDINATE_SYSTEM
+    # tag, resolved by ControllerBuilder once MOTION_GROUP/AXIS names are known.
+    # None -> keep today's no-<Data> (element_missing, never worse).
+    _coord_data_xml: Union[str, None] = field(default=None)
     # A rack chassis-image alias (structure target) carries no Radix, unlike the
     # atomic per-point alias which OEM always writes Radix="Binary" on.
     _alias_no_radix: bool = False
@@ -1235,6 +1248,14 @@ class Tag(L5xElement):
         # known. None -> keep today's no-<Data> (element_missing, never worse).
         if not data_xml and not self._no_data and self._axis_data_xml:
             data_xml = self._axis_data_xml
+
+        # --- COORDINATE_SYSTEM tag <Data Format="CoordinateSystem"> block ---
+        # COORDINATE_SYSTEM is in _SKIP_DECORATED; its <CoordinateSystemParameters>
+        # image is attr 0x01 of the data-table backing, resolved by the controller
+        # builder once MotionGroup/Axis names are known. None -> keep today's
+        # no-<Data> (element_missing, never worse).
+        if not data_xml and not self._no_data and self._coord_data_xml:
+            data_xml = self._coord_data_xml
 
         # --- ConsumeInfo child (Consumed tags) ---
         # OEM emits <ConsumeInfo> as the FIRST child of a Consumed tag, before
@@ -6090,6 +6111,42 @@ class ControllerBuilder(L5xElementBuilder):
                     # needed but unresolved.
                     _at._axis_data_xml = _render_axis_cip_drive(
                         _blob, _gname, _modid_name, _adt)
+
+            # --- COORDINATE_SYSTEM <Data Format="CoordinateSystem"> blocks ---
+            # A coordinate system's <CoordinateSystemParameters> references its
+            # MotionGroup (u32@0 of the config image -> the group backing's
+            # u16@12, resolved via _grp_by_cid above) and its member axes
+            # (u16@14 stride 4 -> each AXIS backing's u16@12). Build that axis
+            # cid map here; a cid claimed by two axes maps to None so the
+            # renderer fails closed on it rather than emit an ambiguous name.
+            _axis_by_cid: Dict[int, Optional[str]] = {}
+            for _axt in _ax_tags:
+                if (_axt.data_type or "").upper() not in (
+                        "AXIS_VIRTUAL", "AXIS_CIP_DRIVE", "AXIS_SERVO_DRIVE"):
+                    continue
+                _axr = self._cur.execute(
+                    "SELECT record FROM comps WHERE object_id=?",
+                    (_axt._data_table_instance,)).fetchone()
+                if _axr and _axr[0] is not None and len(bytes(_axr[0])) >= 14:
+                    _acid = struct.unpack_from("<H", bytes(_axr[0]), 12)[0]
+                    _axis_by_cid[_acid] = (
+                        None if _acid in _axis_by_cid else _axt.name)
+            for _cst in _ax_tags:
+                if ((_cst.data_type or "").upper() != "COORDINATE_SYSTEM"
+                        or _cst.tag_type == "Alias"):
+                    continue
+                _csr = self._cur.execute(
+                    "SELECT record FROM comps WHERE object_id=?",
+                    (_cst._data_table_instance,)).fetchone()
+                if not _csr or _csr[0] is None:
+                    continue
+                _csblob = CompsRecord.read_value_attrs(
+                    bytes(_csr[0]), self._short_header, full=True,
+                    body_mode=True).get(0x01)
+                if not _csblob or len(_csblob) < 14:
+                    continue
+                _cst._coord_data_xml = _render_coordinate_system(
+                    _csblob, _grp_by_cid, _axis_by_cid)
         except Exception:
             pass
 
