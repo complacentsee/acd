@@ -16,6 +16,7 @@ Body layout produced by the builders below, from ``CompsRecord.body_offset``:
 import struct
 
 from acd.record import comps as C
+from acd.record._aes import AES
 from acd.record.comps import CompsRecord
 
 LONG_OFF = 148   # CompsRecord._LONG_BODY_OFF
@@ -131,7 +132,7 @@ def _cbc_encrypt(plaintext: bytes, key: bytes) -> bytes:
     """AES-256-CBC encrypt (IV=0) using the library's own block cipher, so the
     round-trip exercises exactly the primitive the decrypt path uses."""
     assert len(plaintext) % 16 == 0
-    aes = C.AES(key)
+    aes = AES(key)
     prev = b"\x00" * 16
     out = bytearray()
     for i in range(0, len(plaintext), 16):

@@ -20,6 +20,7 @@ class FafaSbregions(KaitaiStruct):
         self.header = FafaSbregions.Header(self._io, self, self._root)
         self.len_record_buffer = self._io.read_u4le()
         self.record_buffer = self._io.read_bytes(self.len_record_buffer)
+        self.trailing = self._io.read_bytes_full()
 
 
     def _fetch_instances(self):

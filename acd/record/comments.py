@@ -566,8 +566,15 @@ class CommentsRecord:
     @staticmethod
     def parse(dat_record: DatRecord, short_header: bool = False) -> Optional[tuple]:
         result = CommentsRecord._parse_core(dat_record, short_header)
+        sp_recovered = False
         if result is None:
-            return None
+            # _parse_core dropped the record whole. On a source-protected rt-1/2
+            # record that is a decode artefact, not a real rejection, so recover
+            # it by hand -- see _parse_sp_ascii_record.
+            result = CommentsRecord._parse_sp_ascii_record(dat_record, short_header)
+            if result is None:
+                return None
+            sp_recovered = True
         # Source-protected DESCRIPTION records carry the text AES-encrypted
         # after the comps marker; the parsers above recover the lookup keys
         # (from the plaintext header) but a garbage text. Swap in the decrypted
@@ -578,7 +585,7 @@ class CommentsRecord:
         # swap would corrupt them).
         try:
             raw_full = bytes(dat_record.record.record_buffer)
-            if _SP_MARKER in raw_full and not result[6]:
+            if not sp_recovered and _SP_MARKER in raw_full and not result[6]:
                 text = _decrypt_sp_comment_text(raw_full)
                 if text is not None:
                     result = result[:3] + (text,) + result[4:]
@@ -600,6 +607,56 @@ class CommentsRecord:
         except Exception:
             revision = 0
         return result + (revision,)
+
+    @staticmethod
+    def _parse_sp_ascii_record(
+        dat_record: DatRecord, short_header: bool = False
+    ) -> Optional[tuple]:
+        """Recover a source-protected rt-1/2 description record _parse_core drops.
+
+        The kaitai AsciiRecord grammar decodes the body's trailing text field as
+        UTF-8 EAGERLY. Under source protection that field is ciphertext, so
+        whenever it happens not to be valid UTF-8 the whole record parse raises
+        and _parse_core returns None -- dropping the record's keys along with its
+        text, even though every key is in the PLAINTEXT header (source protection
+        replaces only the text tail).
+
+        So hand-walk the header at the AsciiRecord offsets -- body starts at
+        raw[14]: member_ref u32@14, rung_content u32@18, object_id u32@27, text
+        raw[44:]; header: seq u16@4, record_type u16@6, sub_record_length u16@8,
+        parent u32@10 -- and take the text from the shared SP decryptor.
+
+        Pure fallback: fires only for a long-header rt-1/2 record that carries the
+        marker, is currently dropped whole, AND whose decrypt validates. It
+        therefore cannot regress a record that parses today.
+        """
+        if short_header or dat_record.identifier != 64250:
+            return None
+        try:
+            raw = bytes(dat_record.record.record_buffer)
+        except Exception:
+            return None
+        if len(raw) < 44 or _SP_MARKER not in raw:
+            return None
+        record_type = struct.unpack_from("<H", raw, 6)[0]
+        if record_type not in (0x01, 0x02):
+            return None
+        text = _decrypt_sp_comment_text(raw)
+        if text is None:
+            return None
+        member_ref = struct.unpack_from("<I", raw, 14)[0]
+        return (
+            struct.unpack_from("<H", raw, 4)[0],    # seq_number
+            struct.unpack_from("<H", raw, 8)[0],    # sub_record_length
+            struct.unpack_from("<I", raw, 27)[0],   # object_id
+            text,                                   # record_string
+            record_type,
+            struct.unpack_from("<I", raw, 10)[0],   # parent
+            "",                                     # tag_reference (rt-1/2: none)
+            struct.unpack_from("<I", raw, 18)[0],   # rung_content
+            member_ref,
+            member_ref,                             # owner_ref (same slot on rt-1/2)
+        )
 
     @staticmethod
     def _parse_core(dat_record: DatRecord, short_header: bool = False) -> Optional[tuple]:

@@ -8,10 +8,22 @@ from acd.database.dbextract import DatRecord
 
 from acd.generated.sbregion.fafa_sbregions import FafaSbregions
 from acd.record.source_protection import (
-    decode_rung as v21_decode_rung,
-    is_v21_version,
+    decode_rung as sp_decode_rung,
     looks_like_source_protected_rung,
 )
+
+
+def _rung_buffer(r: FafaSbregions) -> bytes:
+    """The WHOLE rung buffer, including any bytes past ``len_record_buffer``.
+
+    On a source-protected rung ``len_record_buffer`` records the PLAINTEXT length,
+    so the grammar's ``record_buffer`` stops short of the end of the stored
+    ciphertext and the remainder lands in ``trailing``. Reading only
+    ``record_buffer`` truncates the ciphertext (and makes short rungs look like a
+    cipher-less 14-byte NOP header). On an unprotected rung ``trailing`` is empty,
+    so this is the plaintext buffer unchanged.
+    """
+    return r.record_buffer + r.trailing
 
 
 @dataclass
@@ -26,14 +38,17 @@ class SbRegionRecord:
             return
 
         if r.header.language_type == "Rung NT" or r.header.language_type == "REGION NT":
-            if looks_like_source_protected_rung(r.record_buffer):
-                # V21 source-protection (EncryptionConfig 5): the rung buffer is
-                # AES-encrypted neutral text, not the V30+ plaintext UTF-16.
-                # Decrypt it and resolve @HEX@ ids to names via the comps table.
-                self.text = v21_decode_rung(
-                    r.record_buffer,
-                    name_lookup=self._db_name_lookup,
-                )
+            rbuf = _rung_buffer(r)
+            if looks_like_source_protected_rung(rbuf):
+                # Source-protected: the rung buffer is AES-encrypted neutral
+                # text, not plaintext UTF-16. Decrypt it and resolve @HEX@ ids to
+                # names via the comps table. Fail closed -- an undecodable rung
+                # (e.g. a framing with no key material) is left out of the table
+                # entirely rather than inserted as garbage text.
+                text = sp_decode_rung(rbuf, name_lookup=self._db_name_lookup)
+                if text is None:
+                    return
+                self.text = text
             else:
                 text = r.record_buffer.decode("utf-16-le").rstrip("\x00")
                 self.text = self.replace_tag_references(text)
@@ -73,7 +88,6 @@ class SbRegionRecord:
     def parse(
         dat_record: DatRecord,
         name_lookup: Dict[int, str],
-        version: Optional[str] = None,
     ) -> Optional[tuple]:
         if dat_record.identifier != 64250:
             return None
@@ -81,13 +95,16 @@ class SbRegionRecord:
         if r.header.language_type not in ("Rung NT", "REGION NT"):
             return None
 
-        # V21 stores the rung as AES-encrypted neutral text (source protection),
-        # not the plaintext UTF-16 '@HEX@' text used by V30+.  Decoding it as
-        # UTF-16 yields CJK garbage, so branch to the V21 decryption path.
-        # Detect V21 by ACD version when known, falling back to the V21 header
-        # signature (so the V30+ path is only ever taken for genuine plaintext).
-        if is_v21_version(version) or looks_like_source_protected_rung(r.record_buffer):
-            text = v21_decode_rung(r.record_buffer, name_lookup=name_lookup.get)
+        # A source-protected project stores the rung as AES-encrypted neutral
+        # text, not plaintext UTF-16 '@HEX@' text; decoding that as UTF-16 yields
+        # CJK garbage. Protection is a per-project setting rather than a version,
+        # so branch on the header signature alone -- the plaintext path is only
+        # ever taken for genuine plaintext. Fail closed on an undecodable rung.
+        rbuf = _rung_buffer(r)
+        if looks_like_source_protected_rung(rbuf):
+            text = sp_decode_rung(rbuf, name_lookup=name_lookup.get)
+            if text is None:
+                return None
             return (r.header.identifier, text, "")
 
         text = r.record_buffer.decode("utf-16-le").rstrip("\x00")
