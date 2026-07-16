@@ -1724,6 +1724,7 @@ class ModuleBuilder(L5xElementBuilder):
         # ConfigTag was found for this module (config_inner is None).
         configdata = None   # (hex_data, ConfigSize)
         configscript = None  # (hex_data, Size)
+        configscript_img = None  # raw holder image, for the script-type gate below
         if config_inner is None and (self._cfg_by_mr28 or self._cfg_pool):
             # ConfigData holder: long-header via e1[0x20:0x24] -> holder main_record@0x28;
             # short-header via the 16-byte trailer before the identity marker (object id
@@ -1759,6 +1760,7 @@ class ModuleBuilder(L5xElementBuilder):
                     img = _config_holder_image(self._cur, cs_oid, self._short_header)
                     if img is not None and 0 < len(img) <= _CONFIG_IMG_MAX:
                         configscript = (_tag_value.render_hex(img), len(img))
+                        configscript_img = img
 
         # Fallbacks for residual modules the pointer rules above miss. ConfigData: the
         # module's ext-attr 0x13e (surfaced only by read_value_attrs on the full record)
@@ -1814,7 +1816,21 @@ class ModuleBuilder(L5xElementBuilder):
                             img = _config_holder_image(self._cur, oid, self._short_header)
                             if img is not None and 0 < len(img) <= _CONFIG_IMG_MAX:
                                 configscript = (_tag_value.render_hex(img), len(img))
+                                configscript_img = img
                                 break
+
+        # A genuine ConfigScript/SafetyScript holder image self-identifies via its
+        # header: u32 payload_len | u32 type | u64 0, where type 4 = config
+        # (parameter-download) script and 5 = safety script. The `20 6a` comment-id
+        # link can also reach non-script RxDataCollection payloads (other type
+        # tags), which the reference never renders as a script element. Fail
+        # closed: an image too short to carry the type tag, or one carrying any
+        # other type, is not a script. Purely subtractive -- runs after the slot
+        # is resolved so it can only withhold, never redirect the resolution.
+        if configscript is not None and (
+                configscript_img is None or len(configscript_img) < 8
+                or struct.unpack_from("<I", configscript_img, 4)[0] not in (4, 5)):
+            configscript = None
 
         # Project-level OPC UA access (see ExportL5x.project_flags); same
         # pattern as TagBuilder. When the project's OPC UA server is on,
