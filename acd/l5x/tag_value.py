@@ -660,8 +660,87 @@ def _unpack_bit(image: bytes, off: int, i: int) -> Optional[int]:
     return (image[byte] >> (i & 7)) & 1
 
 
+# --------------------------------------------------------------------------- #
+# Installed-force rendering (@ForceValue).
+#
+# The walker threads two OPTIONAL images alongside the value image: the force
+# MASK (1 = this bit is forced) and the force VALUE. Both are sliced at exactly
+# the same offsets as the value image, so a member's force is read with the
+# member's own offset -- there is no second offset model to drift out of sync.
+# When either is None the nodes carry no force and every emitter renders
+# precisely what it renders today.
+#
+# Spelling is NOT the member's display radix: @ForceValue is always the raw bit
+# pattern, base-2, underscore every 4 bits, as many bits as the datatype is
+# wide, with '.' for each unforced bit (a DINT member whose Radix is Decimal
+# still forces as 2#...._...._...._...._...._..00_...._.0.0). The sole
+# exception is BOOL, which is one bit and renders bare 0/1 with no 2# prefix.
+# This is why @ForceValue cannot reuse _decorated_value/_radix_for.
+# --------------------------------------------------------------------------- #
+
+
+def _force_str(mask: bytes, val: bytes) -> Optional[str]:
+    """Render one member's force slice as ``2#....``, or None when unforced.
+
+    ``mask``/``val`` are the member's little-endian byte slices out of the two
+    force thirds. Bits are spelled MSB..LSB, grouped in 4s. Returns None when
+    the member owns no set mask bit -- the caller then omits @ForceValue
+    entirely (an all-'.' string is never written by Logix).
+    """
+    if not mask or len(mask) != len(val) or not any(mask):
+        return None
+    chars = []
+    for i in range(len(mask) * 8 - 1, -1, -1):
+        byte, bit = i >> 3, i & 7
+        if (mask[byte] >> bit) & 1:
+            chars.append("1" if (val[byte] >> bit) & 1 else "0")
+        else:
+            chars.append(".")
+    return "2#" + "_".join("".join(chars[i:i + 4])
+                           for i in range(0, len(chars), 4))
+
+
+def _force_bit_str(fmask: Optional[bytes], fval: Optional[bytes],
+                   off: int, i: int) -> Optional[str]:
+    """Force spelling of a single BOOL at packed bit ``i`` based at ``off``.
+
+    BOOL is the one carrier that is NOT rendered in 2# form: a forced BOOL
+    emits a bare '0'/'1'. Returns None when unforced or out of image.
+    """
+    if fmask is None or fval is None:
+        return None
+    m = _unpack_bit(fmask, off, i)
+    v = _unpack_bit(fval, off, i)
+    if not m or v is None:
+        return None
+    return str(v)
+
+
+def _force_slice(fmask: Optional[bytes], fval: Optional[bytes],
+                 off: int, width: int) -> Optional[str]:
+    """Force spelling of the ``width``-byte member based at ``off``."""
+    if fmask is None or fval is None or off < 0:
+        return None
+    if off + width > len(fmask) or off + width > len(fval):
+        return None
+    return _force_str(fmask[off:off + width], fval[off:off + width])
+
+
+def _force_sub(f: Optional[bytes], lo: int, hi: int) -> Optional[bytes]:
+    """Slice a force third for a nested walk, mirroring the value slice.
+
+    Returns None (force simply drops for that subtree -- fail closed) rather
+    than a short slice when the range is not fully inside the third.
+    """
+    if f is None or lo < 0 or hi > len(f):
+        return None
+    return f[lo:hi]
+
+
 def _walk_struct(dt_name: str, image: bytes, layout_map: Dict,
-                 data_types_map: Dict, depth: int):
+                 data_types_map: Dict, depth: int,
+                 fmask: Optional[bytes] = None,
+                 fval: Optional[bytes] = None):
     """Decode one struct image into a value-tree node.
 
     Contract: never raises on any layout_map/image input — every
@@ -669,6 +748,11 @@ def _walk_struct(dt_name: str, image: bytes, layout_map: Dict,
     cyclic type, depth cap) becomes an ("err",) node for the emitters to
     judge. The walker decodes policy-skipped members too (hidden /
     bit-alias); their flags are applied at emit time.
+
+    ``fmask``/``fval`` are the optional installed-force mask/value images,
+    aligned byte-for-byte with ``image``; they are sliced wherever ``image``
+    is sliced. Both default to None, in which case every node's force field is
+    None and the emitters' output is unchanged.
     """
     if depth > 24:
         return ("err",)
@@ -697,13 +781,15 @@ def _walk_struct(dt_name: str, image: bytes, layout_map: Dict,
     for (name, mdt, off, bit, hidden, dims, def_radix) in layout:
         bit_alias = mdt in ("BOOL", "BIT") and not dims and off in covered
         node = _walk_member(mdt, off, bit, dims, def_radix, image,
-                            layout_map, data_types_map, depth)
+                            layout_map, data_types_map, depth, fmask, fval)
         members.append((name, mdt, hidden, bit_alias, node))
     return ("struct", dt_name, members)
 
 
 def _walk_member(mdt: str, off: int, bit, dims, def_radix, image: bytes,
-                 layout_map: Dict, data_types_map: Dict, depth: int):
+                 layout_map: Dict, data_types_map: Dict, depth: int,
+                 fmask: Optional[bytes] = None,
+                 fval: Optional[bytes] = None):
     """Decode one member (scalar, array, or nested struct) into a node."""
     if dims:
         total = 1
@@ -712,6 +798,7 @@ def _walk_member(mdt: str, off: int, bit, dims, def_radix, image: bytes,
         if mdt in _ATOMIC:
             width, fmt = _ATOMIC[mdt]
             vals = []
+            fvals: List[Optional[str]] = []
             if mdt in ("BOOL", "BIT"):
                 # packed BOOL array: 1 bit per element from the base offset
                 for i in range(total):
@@ -719,13 +806,17 @@ def _walk_member(mdt: str, off: int, bit, dims, def_radix, image: bytes,
                     if v is None:
                         return ("err",)
                     vals.append(v)
+                    # A BOOL array element is one bit, so it takes the bare
+                    # BOOL spelling like a scalar BOOL (no 2# prefix).
+                    fvals.append(_force_bit_str(fmask, fval, off, i))
             else:
                 for i in range(total):
                     eoff = off + i * width
                     if eoff < 0 or eoff + width > len(image):
                         return ("err",)
                     vals.append(struct.unpack_from(fmt, image, eoff)[0])
-            return ("aarr", mdt, dims, vals, def_radix)
+                    fvals.append(_force_slice(fmask, fval, eoff, width))
+            return ("aarr", mdt, dims, vals, def_radix, fvals)
         # array of nested struct. Elements are walked LAZILY via walk_elem(i)
         # so a consumer that skips this member (Decorated on hidden) or bails
         # at its first failing element (both, like the old walkers) never
@@ -740,31 +831,38 @@ def _walk_member(mdt: str, off: int, bit, dims, def_radix, image: bytes,
         layout_ok = _resolve_layout(mdt, layout_map, data_types_map) is not None
 
         def walk_elem(i, _mdt=mdt, _off=off, _stride=stride, _depth=depth):
+            lo, hi = _off + i * _stride, _off + (i + 1) * _stride
+            # The force thirds are sliced at exactly the value image's bounds,
+            # so the element's members read their force at their own offsets.
             return _walk_struct(
-                _mdt, image[_off + i * _stride: _off + (i + 1) * _stride],
-                layout_map, data_types_map, _depth + 1)
+                _mdt, image[lo:hi], layout_map, data_types_map, _depth + 1,
+                _force_sub(fmask, lo, hi), _force_sub(fval, lo, hi))
 
         return ("sarr", mdt, dims, walk_elem, total, layout_ok)
 
     if mdt in ("BOOL", "BIT"):
-        v = _unpack_bit(image, off, bit if bit is not None else 0)
+        b = bit if bit is not None else 0
+        v = _unpack_bit(image, off, b)
         if v is None:
             return ("err",)
-        return ("bool", v, bit is not None)
+        return ("bool", v, bit is not None,
+                _force_bit_str(fmask, fval, off, b))
 
     if mdt in _ATOMIC:
         width, fmt = _ATOMIC[mdt]
         if off < 0 or off + width > len(image):
             return ("err",)
         return ("atomic", mdt, struct.unpack_from(fmt, image, off)[0],
-                width, def_radix)
+                width, def_radix, _force_slice(fmask, fval, off, width))
 
     # nested struct member
     stride = _struct_stride(mdt, layout_map, data_types_map)
     if stride is None:
         return ("err",)
     return _walk_struct(mdt, image[off: off + stride], layout_map,
-                        data_types_map, depth + 1)
+                        data_types_map, depth + 1,
+                        _force_sub(fmask, off, off + stride),
+                        _force_sub(fval, off, off + stride))
 
 
 def _emit_l5k(node) -> Optional[str]:
@@ -795,7 +893,9 @@ def _emit_l5k(node) -> Optional[str]:
     if kind == "bool":
         return str(node[1])
     if kind == "aarr":
-        _kind, mdt, _dims, vals, _radix = node
+        # Storage form: installed forces are a runtime overlay, never part of
+        # the L5K design-value image, so the node's force field is dropped here.
+        _kind, mdt, _dims, vals, _radix, _fvals = node
         return "[" + ",".join(_l5k_value(mdt, v) for v in vals) + "]"
     if kind == "sarr":
         _kind, _mdt, _dims, walk_elem, total, _layout_ok = node
@@ -1212,6 +1312,15 @@ def _emit_decorated_inner(node) -> Optional[str]:
     return "".join(parts)
 
 
+def _force_attr(fv: Optional[str]) -> str:
+    """`` ForceValue="..."`` for a forced member, else "".
+
+    Logix writes @ForceValue last, immediately after @Value, and only on the
+    members that actually own a set force-mask bit.
+    """
+    return f' ForceValue="{fv}"' if fv else ""
+
+
 def _emit_decorated_member(name: str, mdt: str, node) -> Optional[str]:
     """Serialise one member: DataValueMember/ArrayMember/StructureMember."""
     kind = node[0]
@@ -1224,32 +1333,35 @@ def _emit_decorated_member(name: str, mdt: str, node) -> Optional[str]:
         # packed into a backing byte (an explicit bit index) carries no Radix.
         ra = "" if node[2] else ' Radix="Decimal"'
         return (f'<DataValueMember Name="{name}" DataType="BOOL"{ra} '
-                f'Value="{node[1]}"/>')
+                f'Value="{node[1]}"{_force_attr(node[3])}/>')
 
     # ---- atomic scalar member -------------------------------------------- #
     if kind == "atomic":
-        _kind, _mdt, val, width, def_radix = node
+        _kind, _mdt, val, width, def_radix, fv = node
         radix = _radix_for(mdt, def_radix)
         vt = _decorated_value(mdt, val, width, radix)
         ra = f' Radix="{radix}"' if radix else ""
-        return f'<DataValueMember Name="{name}" DataType="{mdt}"{ra} Value="{vt}"/>'
+        return (f'<DataValueMember Name="{name}" DataType="{mdt}"{ra} '
+                f'Value="{vt}"{_force_attr(fv)}/>')
 
     # ---- atomic array member ---------------------------------------------- #
     if kind == "aarr":
-        _kind, _mdt, dims, vals, def_radix = node
+        _kind, _mdt, dims, vals, def_radix, fvals = node
         dim_str = ",".join(str(d) for d in dims)
         # BOOL/BIT scalar members carry no Radix, but a BOOL *array* member
         # is emitted with Radix="Decimal" by Logix.
         if mdt in ("BOOL", "BIT"):
             radix = "Decimal"
-            elems = [f'<Element Index="{_index_str(i, dims)}" Value="{v}"/>'
+            elems = [f'<Element Index="{_index_str(i, dims)}" '
+                     f'Value="{v}"{_force_attr(fvals[i])}/>'
                      for i, v in enumerate(vals)]
         else:
             radix = _radix_for(mdt, def_radix)
             width = _ATOMIC[mdt][0]
             elems = [
                 f'<Element Index="{_index_str(i, dims)}" '
-                f'Value="{_decorated_value(mdt, v, width, radix)}"/>'
+                f'Value="{_decorated_value(mdt, v, width, radix)}"'
+                f'{_force_attr(fvals[i])}/>'
                 for i, v in enumerate(vals)
             ]
         ra = f' Radix="{radix}"' if radix else ""
@@ -1324,7 +1436,9 @@ def _struct_stride(dt_name: str, layout_map: Dict, data_types_map: Dict,
 
 def render_decorated_layout(dt_base: str, dimensions: Optional[str], image: bytes,
                             layout_map: Dict, data_types_map: Dict,
-                            radix: Optional[str] = None) -> Optional[str]:
+                            radix: Optional[str] = None,
+                            fmask: Optional[bytes] = None,
+                            fval: Optional[bytes] = None) -> Optional[str]:
     """Layout-driven Decorated rendering (Step 6d). Returns inner XML or None.
 
     Falls back (returns None) for anything it cannot decode so the caller keeps
@@ -1332,6 +1446,10 @@ def render_decorated_layout(dt_base: str, dimensions: Optional[str], image: byte
     array-of-struct using the TagInfo byte-offset map for full member fidelity.
     ``radix`` is the tag's declared Radix, threaded to the atomic delegation so a
     top-level Binary/Hex/ASCII array honours it (struct members carry their own).
+
+    ``fmask``/``fval`` are the installed-force mask/value images (each the same
+    length as ``image``); members whose mask bits are set gain an @ForceValue.
+    Omitted -> no @ForceValue is emitted anywhere and the output is unchanged.
     """
     if not layout_map:
         return None
@@ -1348,7 +1466,8 @@ def render_decorated_layout(dt_base: str, dimensions: Optional[str], image: byte
 
     if total == 0:
         inner = _emit_decorated_inner(
-            _walk_struct(dt_base, image, layout_map, data_types_map, 0))
+            _walk_struct(dt_base, image, layout_map, data_types_map, 0,
+                         fmask, fval))
         if inner is None:
             return None
         return f'<Structure DataType="{dt_base}">{inner}</Structure>'
@@ -1360,9 +1479,11 @@ def render_decorated_layout(dt_base: str, dimensions: Optional[str], image: byte
     dim_str = ",".join(str(d) for d in dim_parts)
     elems = []
     for i in range(total):
-        sub = image[i * stride:(i + 1) * stride]
+        lo, hi = i * stride, (i + 1) * stride
+        sub = image[lo:hi]
         inner = _emit_decorated_inner(
-            _walk_struct(dt_base, sub, layout_map, data_types_map, 1))
+            _walk_struct(dt_base, sub, layout_map, data_types_map, 1,
+                         _force_sub(fmask, lo, hi), _force_sub(fval, lo, hi)))
         if inner is None:
             return None
         # OEM wraps each array-of-struct element's members in <Structure>.
