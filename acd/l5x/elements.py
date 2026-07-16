@@ -41,7 +41,11 @@ from acd.l5x.base import (
     safety_signature_row,
     short_own_description,
 )
-from acd.l5x.encoded_data import encoded_routine, source_protection_config
+from acd.l5x.encoded_data import (
+    encoded_routine,
+    keyhash_slot_readable,
+    source_protection_config,
+)
 from acd.l5x.connections import (
     _DESC_BLOCK_RE,
     _build_config_holders,
@@ -3968,18 +3972,44 @@ class AoiBuilder(L5xElementBuilder):
 #     re-decrypts and exports as plaintext (00 00 00 07 ..) -- the
 #     the plaintext-at-rest look-alike projects, never suppressed.
 #   * Plaintext key-bearing layout: a security-descriptor block inside ext-attr
-#     0x1 carries a 16-byte protection-key hash -- a real per-license hash when
-#     protected, the fixed no-protection sentinel when source-protection is
-#     enabled-but-off, and all-zero (or absent, on a definition layout without
-#     source-protection support) otherwise. The block sits at a fixed offset
-#     within attr 0x1 regardless of the attribute's order in the record.
+#     0x1, at a fixed offset regardless of the attribute's order in the record.
+#     Two forms share its key slot, and only one of them is key-bearing:
+#       - padded key: the key is followed by zero padding out to the slot's
+#         end, and the slot's leading 16 bytes are a protection-key hash -- a
+#         real per-license hash when protected, the fixed no-protection
+#         sentinel when source-protection is enabled-but-off, all-zero (or the
+#         attribute is short, or absent on a definition layout without
+#         source-protection support) otherwise.
+#       - filled slot: the padding region is instead occupied by a
+#         per-definition blob, and the slot holds no key at all. Its leading
+#         bytes are not a hash, so the "not zero and not the sentinel" test is
+#         vacuously true for every such definition -- it flags the whole file.
+#         keyhash_slot_readable() is the gate: an OBSERVED non-zero pad, and
+#         only that, rejects the read. The same gate keeps
+#         encoded_data.security_descriptor() from emitting the blob's bytes as
+#         a key; the two sharing one predicate is what stops the reader and
+#         this detector from drifting apart again, which is how the bug arose.
 #
-# Validated 0-FP/0-FN pool-wide by differential execution against the previous
-# length-keyed detectors over all 588 AOI + 6,680 routine definition records, on
-# both the truncated comps buffer and the untruncated comps.record body (1,074
-# protected; zero verdict differences either way). A few Rockwell library seals
-# (PackMLv3) are byte-identical to unprotected definitions and are NOT detectable
-# -- a known floor.
+# Not exact in either direction, and deliberately un-numbered: the only
+# pool-wide truth available is keyed by definition NAME, which collapses
+# duplicates, so independent sweeps of the residual disagree and no count of it
+# belongs in a comment. Qualitatively -- the gate removes far more false
+# positives than the false negatives it costs, and the marker branch carries a
+# residual both ways. The false negatives are definitions the reference hides
+# whose descriptor is the filled form: a sweep of every byte of the full
+# payload found nothing separating them from an unprotected definition, so
+# their state is not in the record -- a floor, not a bug to chase. A few
+# Rockwell library seals (PackMLv3) are likewise byte-identical to unprotected
+# definitions and are NOT detectable.
+#
+# What IS cheaply re-measurable, and what a change here must not break: a
+# record sweep (needs no reference) over both pools' definition records,
+# asserting the gate flips a verdict ONLY where the pad is present and observed
+# non-zero. The short-key family's attr 0x1 ends before the pad, so
+# keyhash_slot_readable() returning True on a short attribute is load-bearing:
+# a False there silently suppresses that whole family of genuinely protected
+# routines, most of them in version-skewed files the gauntlet scores 0 on and
+# cannot see. Verify that with the sweep, never with the gauntlet.
 _AOI_NO_PROTECTION_HASH = bytes.fromhex("4d53d3ff6f158fc1cbf49bcdc8d2f9a7")
 _SP_MARKER_OFF = 78                                # SP-at-rest marker at body+78
 _SP_PROTECTED_FLAG = bytes.fromhex("000001001000")  # marker+14..+20 -> protected
@@ -4013,6 +4043,8 @@ def _definition_is_source_protected(rec: bytes, keyhash_off: int) -> bool:
         return rec[_SP_MARKER_OFF + 14:_SP_MARKER_OFF + 20] == _SP_PROTECTED_FLAG
     a1 = _ext_attr01(rec)
     if a1 is None or len(a1) < keyhash_off + 16:
+        return False
+    if not keyhash_slot_readable(a1, keyhash_off):
         return False
     key_hash = a1[keyhash_off:keyhash_off + 16]
     return key_hash != _SP_ZERO_HASH and key_hash != _AOI_NO_PROTECTION_HASH
