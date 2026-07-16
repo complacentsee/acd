@@ -15,8 +15,8 @@ from acd.generated.comps.short_comps import ShortComps
 # that owns the format. Re-exported here: this module is the historical import
 # site for them.
 from acd.record.source_protection import (  # noqa: F401
-    _SP_AES_CACHE, _SP_CT_OFFSET, _SP_KEY_HINT, _SP_KEYS, _SP_MARKER,
-    _sp_aes, _sp_cbc,
+    _SP_AES_CACHE, _SP_CT_OFFSET, _SP_KEY_BY_CONFIG, _SP_KEY_HINT, _SP_KEYS,
+    _SP_MARKER, _sp_aes, _sp_cbc,
 )
 
 # Comps record identifiers (little-endian u16).

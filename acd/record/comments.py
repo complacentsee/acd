@@ -6,7 +6,7 @@ from typing import Optional
 from acd.database.dbextract import DatRecord
 from acd.generated.comments.fafa_coments import FafaComents
 from acd.record.comps import (
-    _SP_KEYS, _SP_KEY_HINT, _SP_MARKER, _sp_aes, _sp_cbc,
+    _SP_KEYS, _SP_KEY_BY_CONFIG, _SP_KEY_HINT, _SP_MARKER, _sp_aes, _sp_cbc,
 )
 
 
@@ -25,55 +25,85 @@ _MINMAX_VALUE_FMT = {
 }
 
 
+def _sp_comment_framing(raw_full: bytes) -> Optional[tuple]:
+    """Locate a comment record's SOURCE-PROTECTED text tail, or None.
+
+    Returns ``(ct_offset, declared_len, config)``.
+
+    Every record of this family frames its text tail the same way whether or not
+    the project is protected: the marker ``aa 96 aa 0a``, then a 14-byte header
+    carrying a u32 DECLARED PLAINTEXT LENGTH at marker+12 and the
+    source-protection config at marker+17, then the tail itself at marker+18.
+    The config is 0 on an unprotected project (the tail that follows is
+    plaintext) and a key id from ``_SP_KEYS`` when the tail is ciphertext, so the
+    marker's mere presence says nothing about protection and the config byte is
+    the discriminator. An unknown non-zero config (a key we do not have) also
+    returns None -- there is nothing to decrypt with.
+
+    The ciphertext is the declared length padded up to the AES block. PKCS7
+    ALWAYS appends 1..16 bytes, so a block-aligned declared length still carries
+    a whole extra pad block: the size is ``declared + 16 - declared % 16``, NOT
+    ``ceil(declared / 16) * 16``, which would drop that block. Sizing the tail
+    at all is what matters -- reading it to the end of the record instead runs
+    into the record's trailing slot-fill and breaks the pad check.
+    """
+    mi = raw_full.find(_SP_MARKER)
+    if mi < 0 or len(raw_full) < mi + 18:
+        return None
+    config = raw_full[mi + 17]
+    if config not in _SP_KEY_BY_CONFIG:
+        return None
+    declared = struct.unpack_from("<I", raw_full, mi + 12)[0]
+    # The body's fixed prelude is 12 bytes; a tail shorter than that cannot hold
+    # one, let alone any text after it.
+    if declared < 12:
+        return None
+    ct_len = declared + 16 - declared % 16
+    if mi + 18 + ct_len > len(raw_full):
+        return None
+    return mi + 18, declared, config
+
+
 def _decrypt_sp_comment_text(raw_full: bytes) -> Optional[str]:
     """Recover the plaintext text of a source-protected comment record, or None.
 
     A source-protected project AES-256-CBC encrypts the comment record's text
-    tail with the SAME project key used for the comps ext-attr tails (the marker
-    ``aa 96 aa 0a`` then the ciphertext at marker+18, IV = 16 zero bytes). The
-    decrypted body mirrors the plaintext AsciiRecord body --
-    ``[member_ref u32][rung_content u32][object_id u32][UTF-8 text][NUL][PKCS7]``
-    -- so the text begins 12 bytes in. The record's lookup keys (record_type,
-    parent, member_ref) are already correct in the parsed record (they live in the
+    tail with the SAME project key used for the comps ext-attr tails (IV = 16
+    zero bytes), framed as ``_sp_comment_framing`` describes. The decrypted body
+    mirrors the plaintext AsciiRecord body --
+    ``[member_ref u32][rung_content u32][object_id u32][UTF-8 text][NUL]`` -- so
+    the text begins 12 bytes in. The record's lookup keys (record_type, parent,
+    member_ref) are already correct in the parsed record (they live in the
     plaintext header, which the kaitai parser reads); only the text tail is
     encrypted, so the caller keeps its parsed keys and swaps in this text.
 
-    The project config is shared with the comps decryptor, so the cached
-    ``_SP_KEY_HINT`` config is tried first; a candidate is accepted when its
-    plaintext ends in valid PKCS7 padding and the text region is valid UTF-8.
+    The config is on the wire, so this never searches keys. Accepted only when
+    the plaintext ends in exactly the PKCS7 padding the declared length implies
+    AND the text region is valid UTF-8 -- two independent gates, so a record that
+    frames as protected but does not decode yields None and the caller emits
+    nothing rather than the framing bytes the kaitai mistook for text.
     """
-    mi = raw_full.find(_SP_MARKER)
-    if mi < 0:
+    framing = _sp_comment_framing(raw_full)
+    if framing is None:
         return None
-    ct = raw_full[mi + 18:]
-    nblocks = len(ct) // 16
-    if nblocks < 1:
+    ct_offset, declared, config = framing
+    ct_len = declared + 16 - declared % 16
+    ct = raw_full[ct_offset:ct_offset + ct_len]
+    pt = _sp_cbc(ct, _sp_aes(config, _SP_KEY_BY_CONFIG[config]), ct_len // 16)
+    pad = ct_len - declared
+    if len(pt) != ct_len or pt[-pad:] != bytes([pad]) * pad:
         return None
-    order = list(_SP_KEYS)
-    hint = _SP_KEY_HINT[0]
-    if hint is not None:
-        order.sort(key=lambda kv: 0 if kv[0] == hint else 1)
-    for config, key in order:
-        aes = _sp_aes(config, key)
-        pt = _sp_cbc(ct, aes, nblocks)
-        if len(pt) < 13:
-            continue
-        pad = pt[-1]
-        if not (1 <= pad <= 16) or pt[-pad:] != bytes([pad]) * pad:
-            continue
-        body = pt[12:-pad]
-        seg = body.split(b"\x00", 1)[0]
-        try:
-            text = seg.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-        # A correct key yields a printable description; reject random plaintext
-        # from a wrong key (it would fail UTF-8 above, but also guard short noise).
-        if not text or sum(c.isprintable() or c in "\r\n\t" for c in text) < len(text) * 0.8:
-            continue
-        _SP_KEY_HINT[0] = config
-        return text
-    return None
+    seg = pt[12:declared].split(b"\x00", 1)[0]
+    try:
+        text = seg.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    # A correct decode yields a printable description; guard against a record
+    # whose framing validates by chance.
+    if not text or sum(c.isprintable() or c in "\r\n\t" for c in text) < len(text) * 0.8:
+        return None
+    _SP_KEY_HINT[0] = config
+    return text
 
 
 @dataclass
@@ -609,18 +639,28 @@ class CommentsRecord:
             sp_recovered = True
         # Source-protected DESCRIPTION records carry the text AES-encrypted
         # after the comps marker; the parsers above recover the lookup keys
-        # (from the plaintext header) but a garbage text. Swap in the decrypted
-        # text when the marker is present so the recovered keys map to the real
-        # Description. Gated to rows WITHOUT an operand (tag_reference == ''):
-        # SP operand rows are decoded whole by _parse_sp_operand_body (their
-        # text does not sit at the description layout's offset 12, so this
-        # swap would corrupt them).
+        # (from the plaintext header) but a garbage text -- the kaitai reads its
+        # text field out of the tail's framing header, so what it returns is the
+        # declared length's low byte, not text. Swap in the decrypted text so the
+        # recovered keys map to the real Description. Gated to rows WITHOUT an
+        # operand (tag_reference == ''): SP operand rows are decoded whole by
+        # _parse_sp_operand_body (their text does not sit at the description
+        # layout's offset 12, so this swap would corrupt them).
         try:
             raw_full = bytes(dat_record.record.record_buffer)
-            if not sp_recovered and _SP_MARKER in raw_full and not result[6]:
+            if (not sp_recovered and not result[6]
+                    and _sp_comment_framing(raw_full) is not None):
                 text = _decrypt_sp_comment_text(raw_full)
-                if text is not None:
-                    result = result[:3] + (text,) + result[4:]
+                if text is None:
+                    # FAIL CLOSED. The tail's framing says this record IS
+                    # protected, so the only text on hand is the framing bytes
+                    # the kaitai mistook for text. Drop the record rather than
+                    # emit those: a wrong block is worse than a missing one, and
+                    # a text_mismatch and an element_missing cost the same.
+                    # Records whose framing does NOT validate are untouched, so
+                    # an unprotected record keeps its plaintext text.
+                    return None
+                result = result[:3] + (text,) + result[4:]
         except Exception:
             pass
         # Operand-comment revision: Studio keeps prior edits of an operand comment
