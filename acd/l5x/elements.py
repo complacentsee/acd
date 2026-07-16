@@ -376,13 +376,19 @@ def _render_axis_virtual(blob: bytes, group_name: str) -> "Union[str, None]":
 
 def _zero_member_node(mdt: str, mdim: int,
                       data_types_map: Dict[str, "DataType"], depth: int):
-    """Zero-valued tag_value node for one member (scalar or 1-D array)."""
+    """Zero-valued tag_value node for one member (scalar or 1-D array).
+
+    Node tuples must match the arity tag_value's walker builds, since the same
+    emitters consume both. The trailing force field is always None/[None]: a
+    zero default is generated in the absence of any value image, so it can
+    carry no installed force and never renders an @ForceValue.
+    """
     if mdim > 0:
         if mdt in ("BOOL", "BIT"):
-            return ("aarr", "BOOL", [mdim], [0] * mdim, None)
+            return ("aarr", "BOOL", [mdim], [0] * mdim, None, [None] * mdim)
         if mdt in _PRIMITIVE_RADIX:
             zero = 0.0 if mdt in ("REAL", "LREAL") else 0
-            return ("aarr", mdt, [mdim], [zero] * mdim, None)
+            return ("aarr", mdt, [mdim], [zero] * mdim, None, [None] * mdim)
         sub = _zero_value_node(mdt, data_types_map, depth + 1)
         if sub is None:
             return None
@@ -391,10 +397,11 @@ def _zero_member_node(mdt: str, mdim: int,
         # explicit_bit=True suppresses the Radix attribute: a zero-default
         # BOOL member never carries one (unlike the value-image walker's
         # byte-aligned BOOLs).
-        return ("bool", 0, True)
+        return ("bool", 0, True, None)
     if mdt in _PRIMITIVE_RADIX:
         val = 0.0 if mdt in ("REAL", "LREAL") else 0
-        return ("atomic", mdt, val, _PRIMITIVE_BYTE_WIDTH.get(mdt, 4), None)
+        return ("atomic", mdt, val, _PRIMITIVE_BYTE_WIDTH.get(mdt, 4), None,
+                None)
     return _zero_value_node(mdt, data_types_map, depth + 1)
 
 
@@ -527,7 +534,9 @@ def _render_value_blocks(element: str,
                          raw_hex_first: bool,
                          string_array_as_string: bool,
                          require_pair: bool,
-                         force_xml: str = "") -> str:
+                         force_xml: str = "",
+                         fmask: Union[bytes, None] = None,
+                         fval: Union[bytes, None] = None) -> str:
     """Render a tag's design-value image as its flat + Decorated block pair.
 
     Shared by Tag.to_xml (element="Data") and _build_default_data
@@ -548,6 +557,10 @@ def _render_value_blocks(element: str,
       force_xml               optional <ForceData> block inserted between the
                               first block and the Decorated tree (never
                               emitted for STRING, matching Logix).
+      fmask / fval            the installed-force mask and value images (each
+                              the same length as value_bytes), which give the
+                              Decorated members their @ForceValue. Both None
+                              -> no @ForceValue anywhere.
 
     Returns "" when nothing rendered. Exceptions propagate to the caller's
     degrade-to-"" wrapper, except where a narrower internal fallback preserves
@@ -610,7 +623,8 @@ def _render_value_blocks(element: str,
         try:
             decorated_inner = _tag_value.render_decorated_layout(
                 dt_decorated, dimensions, value_bytes,
-                taginfo_layout, data_types_map, radix=radix
+                taginfo_layout, data_types_map, radix=radix,
+                fmask=fmask, fval=fval
             )
         except Exception:
             decorated_inner = None
@@ -1033,6 +1047,38 @@ class Tag(L5xElement):
             return ""
         return f"<{section}>" + "".join(parts) + f"</{section}>"
 
+    def _force_images(self) -> Tuple[Union[bytes, None], Union[bytes, None]]:
+        """Split ``_force_data`` into its force MASK and force VALUE images.
+
+        The stored blob is three equal thirds of the tag's data image:
+
+            [0:n]    the force SNAPSHOT (the live value Logix last observed; it
+                     drifts from the design value on analog/output points, so
+                     it is deliberately NOT used here)
+            [n:2n]   the force MASK   (1 = this bit is forced)
+            [2n:3n]  the force VALUE
+
+        Returns (None, None) unless a third is exactly as long as the design
+        value image. That guard is not a tautology: the two _force_data
+        producers gate on different things. The second (source-protected
+        backing) path validates the blob against the HOLDER's own declared data
+        size, because the tag's value there is a relocated sentinel rather than
+        the real image -- so it can legitimately yield a blob whose third does
+        not match len(_value_bytes). Slicing members out of such a blob with
+        offsets taken from the value image would mis-read EVERY member, so this
+        renderer refuses it and emits no @ForceValue at all (fail closed).
+        """
+        if not self._force_data or not self._value_bytes:
+            return (None, None)
+        try:
+            blob = bytes.fromhex(self._force_data.replace(" ", ""))
+        except ValueError:
+            return (None, None)
+        n = len(self._value_bytes)
+        if len(blob) != 3 * n:
+            return (None, None)
+        return (blob[n:2 * n], blob[2 * n:3 * n])
+
     def to_xml(self) -> str:
         # Operand-comment blocks are needed by BOTH the alias-IO early return
         # below (OEM attaches the per-point <Comments> to the alias tag) and
@@ -1135,6 +1181,7 @@ class Tag(L5xElement):
                 # uses).
                 force_xml = (f'<ForceData>{self._force_data}</ForceData>'
                              if self._force_data else '')
+                _fmask, _fval = self._force_images()
                 data_xml = _render_value_blocks(
                     "Data", self.data_type, self.dimensions, self._value_bytes,
                     self._data_types_map, self._taginfo_layout, self.radix,
@@ -1142,6 +1189,7 @@ class Tag(L5xElement):
                     string_array_as_string=self._short_header,
                     require_pair=True,
                     force_xml=force_xml,
+                    fmask=_fmask, fval=_fval,
                 )
             except Exception:
                 data_xml = ""
