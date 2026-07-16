@@ -5955,7 +5955,13 @@ class ControllerBuilder(L5xElementBuilder):
         pass_through = "EnabledWithAppend" if _v24_plus else None
         download_docs = "true" if _v24_plus else None
         download_custom = "true" if _v28_plus else None
-        report_minor_overflow = "false" if _v28_plus else None
+        # ReportMinorOverflow is a per-controller bit: byte 70 (bit 0) of the
+        # ControllerProps blob -- the first byte after the 8-byte 0xFF landmark,
+        # mirroring the AutoDiags byte-135 read below. Fail-closed: a short or
+        # source-protected blob keeps today's "false" default.
+        report_minor_overflow = (
+            ("true" if (len(_ctlblob) > 70 and (_ctlblob[70] & 1)) else "false")
+            if _v28_plus else None)
         # AutoDiags/WebServer hinge on the 5x80 generation, which we read from
         # the catalog number. When the root catalog can't be resolved
         # (processor_type is None) we can't tell the generation, so fall back to
@@ -6355,7 +6361,9 @@ class ControllerBuilder(L5xElementBuilder):
             project_sn,
             "false",        # MatchProjectToController
             "false",        # CanUseRPIFromProducer
-            "0",            # InhibitAutomaticFirmwareUpdate
+            # InhibitAutomaticFirmwareUpdate: byte 27 (bit 0) of the ControllerProps
+            # blob (ext-attr 0x1); fail-closed to "0" on a short/protected blob.
+            ("1" if (len(_ctlblob) > 27 and (_ctlblob[27] & 1)) else "0"),
             pass_through,   # PassThroughConfiguration
             download_docs,  # DownloadProjectDocumentationAndExtendedProperties
             download_custom,  # DownloadProjectCustomProperties
