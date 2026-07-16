@@ -189,10 +189,17 @@ def _build_consume_map(cur, short_header: bool) -> Dict[int, dict]:
             if not blob:
                 continue
             cp = ConnectionParams.from_bytes(blob)
-            # transport present reproduces the old len > 323 completeness gate.
-            if cp.transport is None or cp.fmt != _CONSUME_CONN_FMT:
+            # Admit the legacy short consumed blob: Producer/RemoteTag/RPI recover
+            # from the head, and the u8@323 transport byte is simply absent -- an
+            # absent transport means multicast, so Unicast renders "false" below.
+            # Still reject the unknown 343..785 layout, which lacks the trailing
+            # transport byte only because it is a different, untrusted structure.
+            if cp.fmt != _CONSUME_CONN_FMT:
                 continue
-            if not (1 <= cp.remote_len <= 60) or cp.remote_tag_bytes is None:
+            if cp.transport is None and len(blob) > _PRODUCE_SHORT_BLOB_MAX:
+                continue
+            if (cp.remote_len is None or not (1 <= cp.remote_len <= 60)
+                    or cp.remote_tag_bytes is None):
                 continue
             try:
                 remote_tag = cp.remote_tag_bytes.decode("ascii")
