@@ -1006,7 +1006,7 @@ class Tag(L5xElement):
             if ch in ("\t", "\n", "\r") or (0x20 <= cp <= 0xD7FF) or (0xE000 <= cp <= 0xFFFD):
                 parts.append(ch)
             else:
-                parts.append(f"&#x{cp:04X};")
+                parts.append(f"&#x{cp:06X};" if cp > 0xFFFF else f"&#x{cp:04X};")
         return "".join(parts)
 
     def _build_comments_xml(self) -> str:
@@ -1499,7 +1499,10 @@ class Routine(L5xElement):
                     continue
                 comment_xml = ""
                 if i in self._rung_comments:
-                    comment_text = self._rung_comments[i]
+                    # Route through the shared escaper so astral/illegal chars
+                    # become XML character references inside the CDATA exactly as
+                    # Logix Designer writes them (e.g. an emoji -> &#x01F600;).
+                    comment_text = Tag._sanitize_xml_text(self._rung_comments[i])
                     comment_xml = f'<Comment><![CDATA[{comment_text}]]></Comment>'
                 rung_xmls.append(
                     f'<Rung Number="{i}" Type="N">'
