@@ -84,6 +84,7 @@ from acd.l5x.axis_cip import render_axis_cip_drive as _render_axis_cip_drive
 from acd.l5x.axis_cip import render_motion_group as _render_motion_group
 from acd.l5x.coordinate_system import (
     render_coordinate_system as _render_coordinate_system)
+from acd.l5x.sfc_content import decode_sfc as _decode_sfc
 from acd.l5x.trends import build_trends
 from acd.record.blobs import ControllerProps
 from acd.record.comps import CompsRecord, _SP_MARKER, decrypt_sp_nameless
@@ -1476,6 +1477,10 @@ class Routine(L5xElement):
     # ST routine source lines decoded from the nameless subtree; None emits no
     # <STContent> (fail-closed -- see _st_content_lines).
     _st_lines: Union[List[str], None] = field(default=None)
+    # Pre-rendered <SFCContent> block for an SFC routine, resolved by
+    # RoutineBuilder from the nameless subtree. None -> keep the prior empty
+    # <Routine> (element_missing, never worse). See acd.l5x.sfc_content.
+    _sfc_content: Union[str, None] = field(default=None)
     # Pre-rendered routine-own <CustomProperties> block ("" if none) and per-rung
     # blocks keyed by rung Number ({} if none). Both from the custom_properties
     # table; the routine-own block is the first child of <Routine>, a rung block
@@ -1517,6 +1522,8 @@ class Routine(L5xElement):
             rll_content = "<STContent>" + "".join(
                 f'<Line Number="{i}">\n<![CDATA[{t}]]>\n</Line>'
                 for i, t in enumerate(self._st_lines)) + "</STContent>"
+        if self.type == "SFC" and self._sfc_content is not None:
+            rll_content = self._sfc_content
         # A routine's own Description is the first child, before RLLContent.
         desc_xml = (
             f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
@@ -3510,10 +3517,12 @@ class RoutineBuilder(L5xElementBuilder):
 
         st_lines = (_st_content_lines(self._cur, self._object_id)
                     if routine_type == "ST" else None)
+        sfc_content = (_decode_sfc(self._cur, self._object_id)
+                       if routine_type == "SFC" else None)
         return Routine(name, name, routine_type, rungs, rung_ids, rung_comments,
                        description, _safety_signature=safety_sig,
                        _safety_signature_timestamp=safety_sig_ts,
-                       _st_lines=st_lines,
+                       _st_lines=st_lines, _sfc_content=sfc_content,
                        _custom_properties=routine_cp,
                        _rung_custom_properties=rung_cp)
 
