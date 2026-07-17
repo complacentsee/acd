@@ -85,6 +85,8 @@ from acd.l5x.axis_cip import render_motion_group as _render_motion_group
 from acd.l5x.coordinate_system import (
     render_coordinate_system as _render_coordinate_system)
 from acd.l5x.sfc_content import decode_sfc as _decode_sfc
+from acd.l5x.fbd_content import decode_fbd as _decode_fbd
+from acd.l5x.sheet_layout import sheet_size_of as _sheet_size_of
 from acd.l5x.trends import build_trends
 from acd.record.blobs import ControllerProps
 from acd.record.comps import CompsRecord, _SP_MARKER, decrypt_sp_nameless
@@ -1481,6 +1483,9 @@ class Routine(L5xElement):
     # RoutineBuilder from the nameless subtree. None -> keep the prior empty
     # <Routine> (element_missing, never worse). See acd.l5x.sfc_content.
     _sfc_content: Union[str, None] = field(default=None)
+    # Pre-rendered <FBDContent> block for an FBD routine (fail-closed: None keeps
+    # the empty <Routine>). See acd.l5x.fbd_content.
+    _fbd_content: Union[str, None] = field(default=None)
     # Pre-rendered routine-own <CustomProperties> block ("" if none) and per-rung
     # blocks keyed by rung Number ({} if none). Both from the custom_properties
     # table; the routine-own block is the first child of <Routine>, a rung block
@@ -1524,6 +1529,8 @@ class Routine(L5xElement):
                 for i, t in enumerate(self._st_lines)) + "</STContent>"
         if self.type == "SFC" and self._sfc_content is not None:
             rll_content = self._sfc_content
+        if self.type == "FBD" and self._fbd_content is not None:
+            rll_content = self._fbd_content
         # A routine's own Description is the first child, before RLLContent.
         desc_xml = (
             f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
@@ -3519,10 +3526,21 @@ class RoutineBuilder(L5xElementBuilder):
                     if routine_type == "ST" else None)
         sfc_content = (_decode_sfc(self._cur, self._object_id)
                        if routine_type == "SFC" else None)
+        # The sheet size/orientation come from the SHEETSIZE/SHEETLAYOUT
+        # attribute records (sheet_layout table); without them decode_fbd fails
+        # closed, so a pre-V31 routine (no records) keeps its empty <Routine>.
+        fbd_content = None
+        if routine_type == "FBD":
+            _sheet = _sheet_size_of(self._cur, r.comment_id, bytes(record))
+            if _sheet is not None:
+                fbd_content = _decode_fbd(
+                    self._cur, self._object_id, self._short_header,
+                    sheet_size=_sheet[0], sheet_orientation=_sheet[1])
         return Routine(name, name, routine_type, rungs, rung_ids, rung_comments,
                        description, _safety_signature=safety_sig,
                        _safety_signature_timestamp=safety_sig_ts,
                        _st_lines=st_lines, _sfc_content=sfc_content,
+                       _fbd_content=fbd_content,
                        _custom_properties=routine_cp,
                        _rung_custom_properties=rung_cp)
 

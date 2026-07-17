@@ -14,6 +14,7 @@ from acd.zip.unzip import Unzip
 from loguru import logger as log
 
 from acd.l5x.base import external_access_enum, language_desc_oid
+from acd.l5x.sheet_layout import build_sheet_layout_rows
 from acd.l5x.elements import (
     Controller,
     ControllerBuilder,
@@ -625,6 +626,26 @@ class ExportL5x:
         # output.)
         self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?,?,?)", comment_tuples)
         self._db.commit()
+
+        # A graphical routine's sheet size + orientation are stored (V31+) as
+        # SHEETSIZE/SHEETLAYOUT attribute records the comment parser drops (they
+        # carry no text). Harvest them into a side table keyed by (program id,
+        # per-routine id); RoutineBuilder joins it to give decode_fbd/_sfc the
+        # real sheet. Older files carry no such records -> empty table -> the
+        # decoders fall back to fail-closed. See acd.l5x.sheet_layout.
+        self._cur.execute(
+            "CREATE TABLE sheet_layout(prog int, rkey int, size_index int, orient int)"
+        )
+        try:
+            with open(os.path.join(self._temp_dir, "Comments.Dat"), "rb") as _cf:
+                _sl_rows = build_sheet_layout_rows(_cf.read())
+            self._cur.executemany(
+                "INSERT INTO sheet_layout VALUES (?,?,?,?)", _sl_rows)
+            self._cur.execute(
+                "CREATE INDEX idx_sheet_layout ON sheet_layout(prog, rkey)")
+            self._db.commit()
+        except Exception:  # noqa: BLE001
+            pass
 
         # Generated-Safety-Signature records (record_type 0x10) are dropped by the
         # comment parser; pull the per-object 256-bit signature hash and timestamp
