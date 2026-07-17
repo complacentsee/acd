@@ -3376,11 +3376,14 @@ class RoutineBuilder(L5xElementBuilder):
                 # the identical 23-bit join key: the live record is object_id==1
                 # (revision 0); a shadow carries an older body (e.g. an operand
                 # token that was later renamed still embedded in the text). The
-                # join cannot tell them apart, so PREFER the object_id==1 row when
-                # the group has one -- as a preference, never a filter. Short-
-                # header rung comments store object_id==0, and long-header groups
-                # with no object_id==1 candidate keep whichever row the base query
-                # returns first (byte-identical to prior output: fail-safe).
+                # join cannot tell them apart, so pick deterministically:
+                #   1. the object_id==1 (live) row when the group has one;
+                #   2. otherwise the HIGHEST object_id -- on groups that never had
+                #      a live (==1) record the reference keeps the newest-saved
+                #      copy, which carries the largest object_id.
+                # Rule 1 short-circuits (_cur_oid==1) so a shadow never overrides a
+                # live row. Short-header rung comments all store object_id==0, so
+                # rule 2 is a tie there (highest of equal = no change): fail-safe.
                 _rc_oid: Dict[int, int] = {}
                 for rung_oid, rec_str, _oid in self._cur.fetchall():
                     number = oid_to_number.get(rung_oid)
@@ -3389,7 +3392,11 @@ class RoutineBuilder(L5xElementBuilder):
                     if number not in rung_comments:
                         rung_comments[number] = rec_str
                         _rc_oid[number] = _oid
-                    elif _oid == 1 and _rc_oid.get(number) != 1:
+                        continue
+                    _cur_oid = _rc_oid[number]
+                    if _cur_oid == 1:
+                        continue
+                    if _oid == 1 or _oid > _cur_oid:
                         rung_comments[number] = rec_str
                         _rc_oid[number] = _oid
         except Exception:
