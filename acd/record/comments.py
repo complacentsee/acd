@@ -212,7 +212,12 @@ class CommentsRecord:
         _program_form = (
             scope_cip in (0x68, 0x338) and owner_cip == 0x6B and owner_ord != 0
             and body[2:6] == b"\x00\x00\x00\x00")
-        if (not _controller_form and not _program_form) or body[12] != 0:
+        if not _controller_form and not _program_form:
+            return None
+        # body[12] is normally a zero pad. Legacy PLC-5/SLC-style controller-scope
+        # data-table tags stamp it 0x01; admit those (the operand still decodes
+        # from body[13]). The program-scope form keeps the strict ==0 gate.
+        if body[12] != 0 and not (_controller_form and body[12] == 1):
             return None
         member_key = struct.unpack_from("<H", body, 6)[0]
         object_id = struct.unpack_from("<I", body, 8)[0]
