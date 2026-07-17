@@ -3345,7 +3345,8 @@ class RoutineBuilder(L5xElementBuilder):
                         if len(record) >= 18 else -1
                     )
                     self._cur.execute(
-                        "SELECT rl.rung_oid, c.record_string FROM regn_link rl "
+                        "SELECT rl.rung_oid, c.record_string, c.object_id "
+                        "FROM regn_link rl "
                         "JOIN comments c ON c.rung_content = rl.rc_hi "
                         "WHERE c.record_type=1 AND c.rung_content!=0 "
                         "  AND rl.group_id=? AND c.parent=? "
@@ -3359,7 +3360,8 @@ class RoutineBuilder(L5xElementBuilder):
                         if len(record) >= 18 else -1
                     )
                     self._cur.execute(
-                        "SELECT rl.rung_oid, c.record_string FROM regn_link rl "
+                        "SELECT rl.rung_oid, c.record_string, c.object_id "
+                        "FROM regn_link rl "
                         "JOIN comments c "
                         "  ON (c.rung_content >> 16) = rl.rc_hi "
                         " AND (c.rung_content & 127) = rl.rc_lo7 "
@@ -3367,10 +3369,26 @@ class RoutineBuilder(L5xElementBuilder):
                         "  AND rl.group_id=? AND c.parent=? AND c.member_ref=?",
                         (self._object_id, parent_key, member_ref_key),
                     )
-                for rung_oid, rec_str in self._cur.fetchall():
+                # A rung comment can collide with STALE "shadow" copies sharing
+                # the identical 23-bit join key: the live record is object_id==1
+                # (revision 0); a shadow carries an older body (e.g. an operand
+                # token that was later renamed still embedded in the text). The
+                # join cannot tell them apart, so PREFER the object_id==1 row when
+                # the group has one -- as a preference, never a filter. Short-
+                # header rung comments store object_id==0, and long-header groups
+                # with no object_id==1 candidate keep whichever row the base query
+                # returns first (byte-identical to prior output: fail-safe).
+                _rc_oid: Dict[int, int] = {}
+                for rung_oid, rec_str, _oid in self._cur.fetchall():
                     number = oid_to_number.get(rung_oid)
-                    if number is not None and rec_str and number not in rung_comments:
+                    if number is None or not rec_str:
+                        continue
+                    if number not in rung_comments:
                         rung_comments[number] = rec_str
+                        _rc_oid[number] = _oid
+                    elif _oid == 1 and _rc_oid.get(number) != 1:
+                        rung_comments[number] = rec_str
+                        _rc_oid[number] = _oid
         except Exception:
             pass
 
