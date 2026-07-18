@@ -2693,6 +2693,14 @@ def _aoi_tag_usage(ext01: bytes, short_header: bool = False) -> Tuple[Union[str,
             usage = "InOut" if (ext01[0x20E] & 0x80) else "Output"
         elif nibble == 6:
             usage = "Local"
+        elif nibble == 1:
+            # Alias parameter: the direction is not in the nibble, and the alias
+            # bit (ext01[0x20E] & 0x02) that ParameterBuilder keys the
+            # TagType="Alias" emission on is set. These are Output alias params
+            # (corpus-uniform: 6/6 short-header alias params are Usage="Output");
+            # returning a usage other than None is what routes them to
+            # ParameterBuilder instead of being misfiled as local tags.
+            usage = "Output"
         else:
             usage = None
         flags = ext01[0x105] if len(ext01) > 0x105 else 0
