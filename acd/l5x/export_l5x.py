@@ -21,6 +21,7 @@ from acd.l5x.elements import (
     ControllerBuilder,
     ProjectBuilder,
     RSLogix5000Content,
+    build_aoi_pin_rows,
 )
 from acd.record.comments import CommentsRecord
 from acd.record.comps import CompsRecord, record_uses_short_header
@@ -884,6 +885,21 @@ class ExportL5x:
             "name text, hidden int)")
         self._cur.execute(
             "CREATE TABLE tag_datatype(tagname text, datatype text)")
+        # aoi_pins: each AOI definition's parameters in authored order with
+        # their Visible flag -- the FBD on-sheet AOI-call pin source. Best
+        # effort like the tables below; an empty table just fails those
+        # decoders closed.
+        self._cur.execute(
+            "CREATE TABLE aoi_pins(aoi text, ordinal int, name text, "
+            "visible int)")
+        try:
+            self._cur.executemany(
+                "INSERT INTO aoi_pins VALUES (?,?,?,?)",
+                build_aoi_pin_rows(self._cur, self._comps_short_header))
+            self._cur.execute(
+                "CREATE INDEX idx_aoi_pins ON aoi_pins(aoi, ordinal)")
+        except Exception as exc:  # noqa: BLE001 - never block export
+            log.warning("aoi_pins table skipped: {}", exc)
         try:
             rows = []
             for dt, members in self._taginfo_layout.items():

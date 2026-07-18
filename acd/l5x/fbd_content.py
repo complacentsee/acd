@@ -18,6 +18,10 @@ import re
 from xml.sax.saxutils import quoteattr
 
 IREF, OREF, TEXTBOX, WIRE, ATTACH = 0x0e, 0x0d, 0x81, 0x11, 0x88
+# On-sheet AOI call, wire connectors and the connector-name record they point at
+AOICALL, ICON, OCON, CONNNAME = 0x8a, 0x0f, 0x10, 0x71
+# The AOI call's optional empty property child
+AOIPROP = 0x9c7
 SHEET, ELEMGROUP, WIREGROUP, TBGROUP, ATGROUP = 0x03, 0x07, 0x09, 0x83, 0x87
 
 KIND2TYPE = {
@@ -129,7 +133,8 @@ WIRE_PARAM = {
 # param names are derived from the block's datatype pinmap (a wire index is a
 # pin bit), the same source as VisiblePins. See _wparam in _decode.
 
-TYPE_RANK = {'IRef': 0, 'ORef': 1, 'Block': 2, 'TextBox': 3}
+TYPE_RANK = {'IRef': 0, 'ORef': 1, 'ICon': 2, 'OCon': 3, 'Block': 4,
+             'AddOnInstruction': 5, 'TextBox': 6}
 _TOK = re.compile(r"@([0-9a-fA-F]+)@")
 _AMP = re.compile(r"^&([0-9a-fA-F]+)(.*)$")
 
@@ -477,7 +482,8 @@ def _decode(cur, oid, sh, size, orient, tbtext):
     # that shape). Non-Block elements contribute '' so their order is
     # unchanged. IDs run through the whole routine in sheet order.
     def _idkey(e):
-        return (TYPE_RANK[e[1]], e[6] if e[1] == 'Block' else '',
+        return (TYPE_RANK[e[1]],
+                e[6] if e[1] in ('Block', 'AddOnInstruction') else '',
                 e[4] if e[4] is not None else '', e[2], e[3])
 
     def _wparam(bt, idx, pinmap):
@@ -486,6 +492,12 @@ def _decode(cur, oid, sh, size, orient, tbtext):
         # index is its VISIBLE_PIN_BITS bit minus 8 (minus 0 for SSUM, whose
         # mask is already low-based) -- every instance-diffed WIRE_PARAM pair
         # is a subset of this relation. Fail closed on an unknown index.
+        if isinstance(pinmap, frozenset):
+            # AOI call: the wire index is the parameter's comp object id.
+            row = cur.execute(
+                "SELECT comp_name FROM comps WHERE object_id=?",
+                (idx,)).fetchone()
+            return row[0] if row and row[0] in pinmap else None
         if pinmap is not None:
             en = pinmap.get(idx)
             return None if en is None or en[1] else en[0]
@@ -530,6 +542,79 @@ def _decode(cur, oid, sh, size, orient, tbtext):
                     x = struct.unpack_from("<I", er, base)[0]
                     y = struct.unpack_from("<I", er, base + 4)[0]
                     elems.append([eo, 'IRef' if k == IREF else 'ORef', x, y, op, None, None])
+                elif k in (ICON, OCON):
+                    # Wire connector: X/Y at base, then the oid of a kind-0x71
+                    # connector-name record holding the Name string.
+                    if _has_children(cur, eo) or len(er) < base + 12:
+                        return None
+                    x = struct.unpack_from("<I", er, base)[0]
+                    y = struct.unpack_from("<I", er, base + 4)[0]
+                    nref = struct.unpack_from("<I", er, base + 8)[0]
+                    nrow = cur.execute(
+                        "SELECT record FROM nameless WHERE object_id=?",
+                        (nref,)).fetchone()
+                    if not nrow:
+                        return None
+                    nrec = bytes(nrow[0])
+                    nm = _rawtext(nrec) if _kind(nrec) == CONNNAME else None
+                    if not nm or "@" in nm:
+                        return None
+                    elems.append([eo, 'ICon' if k == ICON else 'OCon',
+                                  x, y, nm, None, None])
+                elif k == AOICALL:
+                    # On-sheet AOI call: X/Y at the standard base offsets;
+                    # after the operand string a u16 count of visibility
+                    # toggles, each [param comp oid][flag==1]. VisiblePins =
+                    # the definition's parameters in authored order where
+                    # Visible or toggled (aoi_pins staging table).
+                    for ko, kr in _rows(cur, eo):
+                        if _kind(kr) != AOIPROP or _rows(cur, ko):
+                            return None
+                    if len(er) < base + 8:
+                        return None
+                    x = struct.unpack_from("<I", er, base)[0]
+                    y = struct.unpack_from("<I", er, base + 4)[0]
+                    j = er.find(b'\xff\xfe\xff')
+                    if j < 0:
+                        return None
+                    op_txt, nxt = _read_str(er, j)
+                    if not op_txt:
+                        return None
+                    op = _resolve_text(cur, op_txt)
+                    if not op:
+                        return None
+                    aoi_name = _block_datatype(cur, _operand_oid(er), op)
+                    if aoi_name is None:
+                        return None
+                    prows = cur.execute(
+                        "SELECT name, visible FROM aoi_pins WHERE aoi=? "
+                        "ORDER BY ordinal", (aoi_name,)).fetchall()
+                    if not prows:
+                        return None
+                    pset = {nm for nm, _ in prows}
+                    if nxt + 2 > len(er):
+                        return None
+                    tcount = struct.unpack_from("<H", er, nxt)[0]
+                    q = nxt + 2
+                    toggled = set()
+                    for _i in range(tcount):
+                        if q + 8 > len(er):
+                            return None
+                        toid = struct.unpack_from("<I", er, q)[0]
+                        tflag = struct.unpack_from("<I", er, q + 4)[0]
+                        if tflag != 1:
+                            return None
+                        trow = cur.execute(
+                            "SELECT comp_name FROM comps WHERE object_id=?",
+                            (toid,)).fetchone()
+                        if not trow or trow[0] not in pset:
+                            return None
+                        toggled.add(trow[0])
+                        q += 8
+                    pins_str = " ".join(
+                        nm for nm, vis in prows if vis or nm in toggled)
+                    elems.append([eo, 'AddOnInstruction', x, y, op, pins_str,
+                                  aoi_name, None, frozenset(pset), None])
                 elif k in KIND2TYPE:
                     bt = KIND2TYPE[k]
                     if bt in FAM_OK and fam not in FAM_OK[bt]:
@@ -638,6 +723,13 @@ def _decode(cur, oid, sh, size, orient, tbtext):
             if typ in ('IRef', 'ORef'):
                 el_xml.append('<%s ID="%d" X="%d" Y="%d" Operand=%s HideDesc="false"/>'
                               % (typ, i, e[2], e[3], quoteattr(e[4])))
+            elif typ in ('ICon', 'OCon'):
+                el_xml.append('<%s ID="%d" X="%d" Y="%d" Name=%s/>'
+                              % (typ, i, e[2], e[3], quoteattr(e[4])))
+            elif typ == 'AddOnInstruction':
+                el_xml.append('<AddOnInstruction Name=%s ID="%d" X="%d" Y="%d" Operand=%s VisiblePins=%s/>'
+                              % (quoteattr(e[6]), i, e[2], e[3],
+                                 quoteattr(e[4]), quoteattr(e[5])))
             elif typ == 'Block':
                 at = ' AutotuneTag=%s' % quoteattr(e[7]) \
                     if len(e) > 7 and e[7] else ''
@@ -676,12 +768,12 @@ def _decode(cur, oid, sh, size, orient, tbtext):
             fname = tname = ""
             ft, fbt = etype[fo]
             tt, tbt = etype[to]
-            if ft == 'Block':
+            if ft in ('Block', 'AddOnInstruction'):
                 fname = _wparam(fbt, fp, epin.get(fo))
                 if fname is None:
                     return None
                 fattr = ' FromParam="%s"' % fname
-            if tt == 'Block':
+            if tt in ('Block', 'AddOnInstruction'):
                 tname = _wparam(tbt, tp, epin.get(to))
                 if tname is None:
                     return None

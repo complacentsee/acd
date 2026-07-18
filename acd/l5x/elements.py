@@ -3723,6 +3723,59 @@ def _aoi_param_order(cur, aoi_oid: int, param_oids):
     return None
 
 
+def build_aoi_pin_rows(cur, short_header):
+    """[(aoi_name, ordinal, param_name, visible)] for every AOI definition.
+
+    The FBD on-sheet AOI-call decoder's pin source: the definition's
+    parameters (usage Input/Output/InOut, scratch tags excluded) in the
+    AUTHORED order, each with its Visible flag. An AOI whose authored order
+    cannot be established (or whose param flags do not decode) contributes
+    no rows, so the FBD decoder fails closed for its calls.
+    """
+    rows = []
+    for (coll,) in cur.execute(
+            "SELECT object_id FROM comps WHERE "
+            "comp_name='RxUDIDefinitionCollection'").fetchall():
+        for aoi_name, aoi_oid in cur.execute(
+                "SELECT comp_name, object_id FROM comps WHERE parent_id=? "
+                "AND record_type=256", (coll,)).fetchall():
+            tc = cur.execute(
+                "SELECT object_id FROM comps WHERE parent_id=? AND "
+                "comp_name='RxTagCollection'", (aoi_oid,)).fetchone()
+            if not tc or not aoi_name:
+                continue
+            params = []
+            decode_failed = False
+            for child_name, child_oid, child_rec in cur.execute(
+                    "SELECT comp_name, object_id, record FROM comps WHERE "
+                    "parent_id=? AND record_type=260", (tc[0],)).fetchall():
+                if not child_name or child_name.startswith(
+                        ("__SL", "__l", "__SHADOW", "__CLONE")):
+                    continue
+                try:
+                    _r, exts, sp = _parse_rec_and_exts(bytes(child_rec))
+                    e01 = (exts or {}).get(0x01, b"")
+                    usage, _req, vis = _aoi_tag_usage(
+                        e01, short_header=False if sp else short_header)
+                except Exception:  # noqa: BLE001
+                    decode_failed = True
+                    break
+                if usage is None:
+                    decode_failed = True
+                    break
+                if usage in ("Input", "Output", "InOut"):
+                    params.append((child_oid, child_name, vis))
+            if decode_failed or not params:
+                continue
+            order = _aoi_param_order(cur, aoi_oid, [o for o, _, _ in params])
+            if order is None or set(order) != {o for o, _, _ in params}:
+                continue
+            rank = {o: i for i, o in enumerate(order)}
+            for o, nm, vis in sorted(params, key=lambda t: rank[t[0]]):
+                rows.append((aoi_name, rank[o], nm, 1 if vis else 0))
+    return rows
+
+
 @dataclass
 class AoiBuilder(L5xElementBuilder):
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
