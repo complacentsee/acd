@@ -13,7 +13,11 @@ from acd.database.dbextract import DbExtract
 from acd.zip.unzip import Unzip
 from loguru import logger as log
 
-from acd.l5x.base import external_access_enum, language_desc_oid
+from acd.l5x.base import (
+    external_access_enum,
+    language_desc_oid,
+    load_member_limits,
+)
 from acd.l5x.sheet_layout import build_sheet_layout_rows, build_v21_sheet_rows
 from acd.l5x.textbox_text import build_textbox_text_rows
 from acd.l5x.elements import (
@@ -868,6 +872,14 @@ class ExportL5x:
             log.warning("TagInfo layout parse failed, skipping value decode: {}", exc)
             self._taginfo_layout = {}
         self._load_datatype_tables()
+        # Engineering Min/Max limits ride on instance operand comments, not on the
+        # definition; recover them keyed by (datatype, member) for the Parameter /
+        # Member builders. Best-effort; {} on failure keeps prior behaviour. Must
+        # follow _load_datatype_tables() (it needs the tag_datatype table).
+        try:
+            self._member_limits = load_member_limits(self._cur)
+        except Exception:  # noqa: BLE001 - never block export
+            self._member_limits = {}
 
     def _load_datatype_tables(self):
         """Populate two side tables the FBD pin-name derivation reads:
@@ -1044,6 +1056,7 @@ class ExportL5x:
                 self._cur,
                 _short_header=self._comps_short_header,
                 _taginfo_layout=getattr(self, "_taginfo_layout", {}),
+                _member_limits=getattr(self, "_member_limits", {}),
                 _acd_major=_major,
                 _device_major=_dev_major,
                 _device_minor=_dev_minor,

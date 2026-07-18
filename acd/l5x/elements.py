@@ -1426,6 +1426,12 @@ class Parameter(L5xElement):
     _value_bytes: Union[bytes, None] = None
     _short_header: bool = False
     _raw_hex_data: bool = False
+    # Engineering Min/Max limit attributes (None omits them). Public so the
+    # generic serializer renders @Max/@Min; declared last so existing positional
+    # Parameter() constructions are unaffected. Recovered by AoiBuilder from the
+    # project's instance operand comments (base.load_member_limits).
+    max: Union[str, None] = None
+    min: Union[str, None] = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -3792,6 +3798,9 @@ class AoiBuilder(L5xElementBuilder):
     _taginfo_layout: Dict[str, object] = field(default_factory=dict)
     _short_routine_desc: Dict[int, str] = field(default_factory=dict)
     _acd_major: int = field(default=0)
+    # {(DATATYPE_UPPER, MEMBER_UPPER): (min, max)} engineering limits recovered
+    # from instance operand comments; applied to this AOI's parameters below.
+    _member_limits: Dict = field(default_factory=dict)
 
     def build(self) -> AOI:
         self._cur.execute(
@@ -4158,6 +4167,10 @@ class AoiBuilder(L5xElementBuilder):
                             sl = _member_slice(p.name, p.data_type)
                             if sl is not None:
                                 p._value_bytes = sl
+                            _lim = self._member_limits.get(
+                                (name.upper(), p.name.upper()))
+                            if _lim is not None:
+                                p.min, p.max = _lim
                         except Exception:
                             pass
                         parameters.append(p)
@@ -5276,6 +5289,10 @@ class ControllerBuilder(L5xElementBuilder):
     # decode tag value images into the Decorated <Data> tree. Empty -> the
     # zero-generator fallback is used (no behaviour change).
     _taginfo_layout: Dict[str, object] = field(default_factory=dict)
+    # {(DATATYPE_UPPER, MEMBER_UPPER): (min, max)} engineering limits recovered
+    # from instance operand comments (base.load_member_limits), applied to AOI
+    # Parameters and UDT Members. Empty -> no @Min/@Max emitted (prior behaviour).
+    _member_limits: Dict = field(default_factory=dict)
     # ACD save-version major (e.g. 21, 36). 0 if unknown. Used to gate
     # version-specific attribute emission (e.g. Program/@UseAsFolder).
     _acd_major: int = field(default=0)
@@ -5600,7 +5617,8 @@ class ControllerBuilder(L5xElementBuilder):
             if _data_type_object_id in dead:
                 continue
             dt = DataTypeBuilder(
-                self._cur, _data_type_object_id, _short_header=self._short_header
+                self._cur, _data_type_object_id, _short_header=self._short_header,
+                _member_limits=self._member_limits,
             ).build()
             all_data_types_map[dt.name.upper()] = dt
             if self._short_header:
@@ -6051,6 +6069,7 @@ class ControllerBuilder(L5xElementBuilder):
                 _taginfo_layout=self._taginfo_layout,
                 _short_routine_desc=short_routine_desc,
                 _acd_major=self._acd_major,
+                _member_limits=self._member_limits,
             ).build()
             if self._faithful:
                 # A source-protected AOI is exported by Studio as an <EncodedData>

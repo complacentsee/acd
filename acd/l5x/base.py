@@ -10,7 +10,7 @@ import re
 import struct
 from dataclasses import dataclass
 from sqlite3 import Cursor
-from typing import List, Union
+from typing import Dict, List, Tuple, Union
 
 
 def _desc_oid_for_langid(langid: int) -> int:
@@ -432,6 +432,72 @@ def resolve_hex_operand(cur: Cursor, operand: str) -> Union[str, None]:
     # A leftover '!' means a malformed token the regex did not cover; never
     # emit it.
     return out if "!" not in out else None
+
+
+def load_member_limits(cur: Cursor) -> Dict[Tuple[str, str], Tuple[str, str]]:
+    """Map ``(DATATYPE, MEMBER)`` -> ``(min, max)`` for every member that carries
+    an engineering Min/Max limit, keyed and valued upper-cased / verbatim; ``{}``
+    when none do.
+
+    A member's @Min/@Max is not stored on the DEFINITION: an AOI parameter's limit
+    rides inside the source-protected blob, and a UDT member's is absent from the
+    member record. It IS stored in plaintext on every INSTANCE of the type -- as
+    operand comments (kind 0x02 = Min, 0x03 = Max) under the instance tag's comment
+    scope. This recovers the definition limit by propagating from those instances,
+    associating by the instance's declared DataType (== the definition name) and the
+    resolved operand member. It is the same store that already feeds the instance
+    <Mins>/<Maxes> operand blocks, re-projected onto the definition.
+
+    Fail-closed: a pair is emitted only when BOTH bounds are present and every
+    instance carrying them agrees; a conflicting or half-specified pair is dropped.
+    Nested operands (a member of a member) and comment scopes that resolve to more
+    than one DataType (ambiguous) are skipped. No value is keyed by catalog, type,
+    plant or file -- the limit is read from the project's own instances.
+    """
+    rows = cur.execute(
+        "SELECT parent, tag_reference, record_string, member_ref, revision "
+        "FROM comments WHERE member_ref IN (2, 3) "
+        "AND record_string != '' AND tag_reference != ''").fetchall()
+    if not rows:
+        return {}
+    needed = {r[0] for r in rows}
+    tag_dt = dict(cur.execute(
+        "SELECT tagname, datatype FROM tag_datatype").fetchall())
+    # Resolve each needed comment scope (comment_id << 16 | cip_type) to its owning
+    # tag's DataType. The scope is comment_id (u16 @ record+12) with cip_type
+    # (u16 @ +10); a scope resolving to more than one distinct DataType is dropped.
+    scope_dts: Dict[int, set] = {}
+    for name, rec in cur.execute("SELECT comp_name, record FROM comps").fetchall():
+        if rec is None or len(rec) < 14 or name not in tag_dt:
+            continue
+        rb = bytes(rec)
+        key = ((int.from_bytes(rb[12:14], "little") << 16)
+               | int.from_bytes(rb[10:12], "little"))
+        if key in needed:
+            scope_dts.setdefault(key, set()).add(tag_dt[name])
+    scope_dt = {k: next(iter(v)) for k, v in scope_dts.items() if len(v) == 1}
+    # Keep the latest-revision value per (scope, operand, kind): Studio retains
+    # prior edits and the reference emits only the newest.
+    best: Dict[Tuple[int, str, str, int], Tuple[int, str]] = {}
+    for parent, op, val, kind, rev in rows:
+        dt = scope_dt.get(parent)
+        if dt is None:
+            continue
+        if ".!" in op:
+            op = resolve_hex_operand(cur, op)
+            if op is None:
+                continue
+        member = op.lstrip(".")
+        if not member or "." in member:   # top-level members only
+            continue
+        k = (parent, dt.upper(), member.upper(), kind)
+        if k not in best or (rev or 0) > best[k][0]:
+            best[k] = (rev or 0, val)
+    agg: Dict[Tuple[str, str], Dict[int, set]] = {}
+    for (parent, dt, member, kind), (rev, val) in best.items():
+        agg.setdefault((dt, member), {2: set(), 3: set()})[kind].add(val)
+    return {k: (next(iter(d[2])), next(iter(d[3])))
+            for k, d in agg.items() if len(d[2]) == 1 and len(d[3]) == 1}
 
 
 def short_own_description(cur: Cursor, comment_id: int, cip_type: int,

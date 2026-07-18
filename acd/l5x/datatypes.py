@@ -39,8 +39,16 @@ class Member(L5xElement):
     bit_number: Union[int, None]  # BIT members only; None omits the attribute
     external_access: str
     _description: Union[str, None] = field(default=None)
+    # Engineering Min/Max limit attributes (None omits them). Public so the
+    # generic serializer renders @Max/@Min; declared after _description so
+    # existing positional Member() constructions are unaffected. Recovered by
+    # DataTypeBuilder from the project's instance operand comments.
+    max: Union[str, None] = field(default=None)
+    min: Union[str, None] = field(default=None)
 
     def to_xml(self) -> str:
+        # ``base`` already carries any @Max/@Min (public fields rendered by the
+        # generic serializer); only the <Description> child needs injecting here.
         base = super().to_xml()
         if self._description is None:
             return base
@@ -431,6 +439,10 @@ class DataTypeBuilder(L5xElementBuilder):
     # short-header ControllerBuilder path; defaults False -> identical V24+
     # behaviour.
     _short_header: bool = field(default=False)
+    # {(DATATYPE_UPPER, MEMBER_UPPER): (min, max)} engineering limits recovered
+    # from instance operand comments (base.load_member_limits), applied to this
+    # datatype's members below. Empty -> no @Min/@Max (prior behaviour).
+    _member_limits: Dict = field(default_factory=dict)
 
     def build(self) -> DataType:
         # Export-schema major, passed to each MemberBuilder for the rule-A
@@ -715,6 +727,15 @@ class DataTypeBuilder(L5xElementBuilder):
                 custom_props = render_custom_properties(cp_rows)
         except Exception:
             custom_props = None
+
+        # Engineering Min/Max limits are not on the member record; recover them
+        # from the project's instance operand comments, keyed by (datatype, member).
+        if self._member_limits:
+            for _m in children:
+                _lim = self._member_limits.get(
+                    (name.upper(), (_m.name or "").upper()))
+                if _lim is not None:
+                    _m.min, _m.max = _lim
 
         dt = DataType(name, name, string_family, class_type, children, description,
                       _custom_properties=custom_props)
