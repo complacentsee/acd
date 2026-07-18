@@ -1671,6 +1671,8 @@ class Task(L5xElement):
     watchdog: str
     disable_update_outputs: str
     inhibit_task: str
+    # V37 5x80 projects carry this attribute on every task; None omits it.
+    synchronize_redundancy_data_disabled: Union[str, None]
     event_info: Union[EventInfo, None]  # None for non-EVENT tasks
     scheduled_programs: List[ScheduledProgram]
     # Safety task signature/timestamp (None omits the attributes).
@@ -4529,16 +4531,24 @@ class ProgramBuilder(L5xElementBuilder):
         _rxok = r is not None
 
         # routine object_id -> name for this program (children of its
-        # RxRoutineCollection) -- the namespace MainRoutine/FaultRoutine reference.
+        # RxRoutineCollection) -- the namespace MainRoutine/FaultRoutine
+        # reference. _rout_by_id16 keys each routine by the u32 at its record
+        # offset 16 (long header), the id space the V37 main-routine reference
+        # uses.
         routs: Dict[int, str] = {}
+        _rout_by_id16: Dict[int, List[str]] = {}
         _rcoll = self._cur.execute(
             "SELECT object_id FROM comps WHERE parent_id=? AND "
             "comp_name='RxRoutineCollection' LIMIT 1", (self._object_id,)).fetchone()
         if _rcoll:
-            for _rn, _ro in self._cur.execute(
-                    "SELECT comp_name, object_id FROM comps WHERE parent_id=?",
-                    (_rcoll[0],)).fetchall():
+            for _rn, _ro, _rr in self._cur.execute(
+                    "SELECT comp_name, object_id, record FROM comps "
+                    "WHERE parent_id=?", (_rcoll[0],)).fetchall():
                 routs[_ro] = _rn
+                if not self._short_header and _rr is not None and len(_rr) >= 20:
+                    _rout_by_id16.setdefault(
+                        struct.unpack_from("<I", bytes(_rr), 16)[0],
+                        []).append(_rn)
 
         # --- MainRoutineName / FaultRoutineName ---
         # MainRoutine object_id is ext[0x12D] (long header / decrypted SP) or, when
@@ -4559,6 +4569,21 @@ class ProgramBuilder(L5xElementBuilder):
             _mo = struct.unpack_from("<I", prog_record, 0x1C6)[0]
             if _mo in routs:
                 main_routine_name = routs[_mo]
+        if main_routine_name is None and not self._short_header:
+            # V37 long layout: the program ext-0x01 blob grew +8 bytes and the
+            # appended u32 references the main routine by the id at its record
+            # offset 16. The blob occupies the record tail, so when RxGeneric
+            # drops ext 0x01 (the inline form) the same field is the record's
+            # last-8 dword. Fail-closed: only a nonzero id matching exactly one
+            # routine resolves (pre-V37 blobs read 0 there). Validated
+            # corpus-wide with scripts/val_main_routine.py.
+            _e01p = exts.get(0x01, b"")
+            _src = _e01p if len(_e01p) >= 8 else prog_record
+            if len(_src) >= 8:
+                _ref = struct.unpack_from("<I", _src, len(_src) - 8)[0]
+                _hit = _rout_by_id16.get(_ref)
+                if _ref and _hit and len(_hit) == 1:
+                    main_routine_name = _hit[0]
         if main_routine_name is None:
             _cand = [n for n in routs.values() if n.lower() == "main"]
             if len(_cand) == 1:
@@ -4746,6 +4771,28 @@ class ProgramBuilder(L5xElementBuilder):
 _TASK_TYPE_MAP = {1: "EVENT", 2: "PERIODIC", 4: "CONTINUOUS"}
 
 
+def _task_tail_shift(e01: bytes) -> int:
+    """How far the config tail sits from its classic end-anchored offsets.
+
+    The u32 0xFFFFFFFF sentinel closing the config tail reads at len-0x34 in
+    every layout through V36 (including the V24 variant whose longer middle
+    section moves the whole tail block), and at len-0x35 on V37, which appended
+    one byte after the sentinel. The inline (ref-list key 1) payload sometimes
+    stores the sentinel word zeroed/overwritten; the only +1 layout observed
+    there is the 0x1115 V37 long blob. Validated 504/504 tasks corpus-wide
+    against the reference exports (scripts/val_task_cfg.py).
+    """
+    L = len(e01)
+    if L < 0x68:
+        return 0
+    if struct.unpack_from("<I", e01, L - 0x34)[0] == 0xFFFFFFFF:
+        return 0
+    if (struct.unpack_from("<I", e01, L - 0x35)[0] == 0xFFFFFFFF
+            and e01[L - 0x31] == 0):
+        return 1
+    return 1 if L == 0x1115 else 0
+
+
 def _read_task_config(e01: bytes):
     """Recover (type, rate, priority, watchdog, disable, inhibit) from a task's
     ext-attr 0x01 blob, or None if the blob is absent / an unrecognised layout.
@@ -4754,7 +4801,8 @@ def _read_task_config(e01: bytes):
     layout at 0x28C, a long one at 0x109C); Watchdog/DisableUpdateOutputs/
     InhibitTask sit at fixed offsets from the END (a variable middle section moves
     them within the record, but the tail is constant: Watchdog u32 at len-0x64,
-    the two flag bits at len-0x40 / len-0x3C). Rate/Watchdog are microseconds; a
+    the two flag bits at len-0x40 / len-0x3C -- all further shifted by
+    _task_tail_shift on the V37 layout). Rate/Watchdog are microseconds; a
     sub-millisecond value is rendered with three decimals to match the reference.
     The Type word must read as a valid enum or the layout is unrecognised -> None
     (caller falls back) so a wrong layout never emits garbage config.
@@ -4777,11 +4825,12 @@ def _read_task_config(e01: bytes):
     rate = None
     if task_type != "CONTINUOUS" and r_off + 4 <= L:
         rate = _ms(struct.unpack_from("<I", e01, r_off)[0])
+    sh = _task_tail_shift(e01)
     # Watchdog is normally at the fixed tail offset len-0x64; a rare inline-payload
     # length variant shifts the tail so that lands on filler (an implausibly large
     # microsecond value) -- fall back to the fixed position relative to the type
     # word in that case.
-    watchdog_us = struct.unpack_from("<I", e01, L - 0x64)[0]
+    watchdog_us = struct.unpack_from("<I", e01, L - 0x64 - sh)[0]
     if watchdog_us > 600_000_000 and t_off + 0x18 <= L:
         watchdog_us = struct.unpack_from("<I", e01, t_off + 0x14)[0]
     return {
@@ -4789,8 +4838,8 @@ def _read_task_config(e01: bytes):
         "rate": rate,
         "priority": priority,
         "watchdog": _ms(watchdog_us),
-        "disable": "true" if (e01[L - 0x40] & 1) else "false",
-        "inhibit": "true" if (e01[L - 0x3C] & 1) else "false",
+        "disable": "true" if (e01[L - 0x40 - sh] & 1) else "false",
+        "inhibit": "true" if (e01[L - 0x3C - sh] & 1) else "false",
     }
 
 
@@ -4829,6 +4878,11 @@ def _task_ref_list(record: bytes) -> Dict[int, bytes]:
 @dataclass
 class TaskBuilder(L5xElementBuilder):
     _short_header: bool = False
+    # True when the controller is the 5x80 class (ControllerProps classic_marker
+    # == 0, the same discriminator that omits the RedundancyInfo pad
+    # percentages): those projects emit SynchronizeRedundancyDataDisabled on
+    # every task once the V37 task layout is present.
+    _sync_red_capable: bool = False
 
     def _build_event_info(self, e01: bytes, record: bytes,
                           exts: Union[Dict[int, bytes], None] = None
@@ -4852,9 +4906,10 @@ class TaskBuilder(L5xElementBuilder):
         L = len(e01)
         if L < 0x64:
             return None
+        _sh = _task_tail_shift(e01)
         v68 = (exts or {}).get(0x68)
         if v68 is not None and len(v68) == 4:
-            enable_timeout = "true" if (e01[L - 0x44] & 1) else "false"
+            enable_timeout = "true" if (e01[L - 0x44 - _sh] & 1) else "false"
             if v68 == b"\xff\xff\xff\xff":
                 return EventInfo("EventInfo", "EVENT Instruction Only",
                                  None, enable_timeout)
@@ -4898,7 +4953,7 @@ class TaskBuilder(L5xElementBuilder):
         trigger = _EVENT_TRIGGER_MAP.get(trig)
         if trigger is None:
             return None
-        enable_timeout = "true" if (e01[L - 0x44] & 1) else "false"
+        enable_timeout = "true" if (e01[L - 0x44 - _sh] & 1) else "false"
         event_tag: Union[str, None] = None
         if trig == 1:
             # Motion Group Execution: the motion-group tag (the record_type=256 comp
@@ -4968,12 +5023,15 @@ class TaskBuilder(L5xElementBuilder):
             e01 = _task_ref_list(record).get(0x01, b"")
 
         # Class: a safety controller marks each task Safety/Standard with a byte at
-        # ext[0x01] offset len-0x38 (6 = Safety); standard controllers omit @Class.
+        # ext[0x01] offset len-0x38 (6 = Safety, V37 tail shift applies);
+        # standard controllers omit @Class.
         task_cls: Union[str, None] = None
         if self._cur.execute(
                 "SELECT 1 FROM comps WHERE comp_name='SafetyController' "
                 "AND record_type=256 LIMIT 1").fetchone():
-            task_cls = ("Safety" if (len(e01) >= 0x38 and e01[len(e01) - 0x38] == 6)
+            _sh = _task_tail_shift(e01)
+            task_cls = ("Safety" if (len(e01) >= 0x38 + _sh
+                                     and e01[len(e01) - 0x38 - _sh] == 6)
                         else "Standard")
 
         # Safety signature: a signed safety task joins the side table by its object
@@ -5041,6 +5099,16 @@ class TaskBuilder(L5xElementBuilder):
         if task_type == "EVENT":
             event_info = self._build_event_info(e01, record, _task_exts)
 
+        # SynchronizeRedundancyDataDisabled: emitted by the reference on every
+        # task of a 5x80-class V37 project (the classic-marker==0 controllers;
+        # a classic-blob V37 project does not carry it). The value bit is read
+        # from the byte after the tail sentinel -- the slot the V37 layout
+        # appended (all reference-attested values are "false"; a nonzero byte
+        # here would surface as "true" rather than being fabricated).
+        sync_red: Union[str, None] = None
+        if self._sync_red_capable and e01 and _task_tail_shift(e01) == 1:
+            sync_red = "true" if (e01[len(e01) - 0x31] & 1) else "false"
+
         # A task's own Description is stored under the same own-description key
         # scheme as tags/routines/programs (long: comment_id*0x10000 + cip_type,
         # object_id==1; short: bare comment_id filtered by owner cip). Verified
@@ -5068,6 +5136,7 @@ class TaskBuilder(L5xElementBuilder):
             watchdog_str,
             disable_str,
             inhibit_str,
+            sync_red,
             event_info,
             scheduled_programs,
             safety_signature=task_sig,
@@ -5852,6 +5921,20 @@ class ControllerBuilder(L5xElementBuilder):
         task_coll_results = self._cur.fetchall()
         tasks: List[Task] = []
         if task_coll_results:
+            # 5x80-class controller (classic_marker == 0 in the controller
+            # ext-0x01 blob -- the same discriminator that drops the
+            # RedundancyInfo pad percentages): its V37 tasks carry
+            # SynchronizeRedundancyDataDisabled.
+            _sync_cap = False
+            try:
+                _cb = CompsRecord.record_attrs(
+                    self._cur, self._object_id,
+                    self._short_header).get(0x001, b"")
+                _cp = ControllerProps.from_bytes(_cb)
+                _sync_cap = (_cp.share_flags is not None
+                             and _cp.classic_marker == 0)
+            except Exception:
+                _sync_cap = False
             _task_collection_object_id = task_coll_results[0][1]
             self._cur.execute(
                 "SELECT comp_name, object_id FROM comps WHERE parent_id="
@@ -5864,7 +5947,8 @@ class ControllerBuilder(L5xElementBuilder):
                     continue
                 tasks.append(TaskBuilder(
                     self._cur, task_result[1],
-                    _short_header=self._short_header).build(comment_id_to_program))
+                    _short_header=self._short_header,
+                    _sync_red_capable=_sync_cap).build(comment_id_to_program))
         return tasks
 
     def _pass_aois(self, data_types_map, short_routine_desc):
