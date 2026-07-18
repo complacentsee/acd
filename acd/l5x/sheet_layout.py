@@ -20,6 +20,15 @@ id). Matching on the pair is required -- ``rkey`` alone collides across programs
 Older files (V16..V30) predate this mechanism and carry no such records; the
 lookup returns None for them and the caller falls back to fail-closed behaviour.
 
+Pre-V31 files (V16..V30 witnessed on V16/V20/V24) store the sheet through a
+hidden per-routine TAG instead: the routine's ``disc`` field (u16 @ body 0x10,
+the same per-routine id V31+ echoes into its SHEETSIZE record) names a
+program-scoped tag ``__SL<disc>`` whose main_record[0x24] data_table_instance
+points at a cip-0x6a ``$hash$`` backing; that backing's ext attr 0x66 value is
+``index u32 | orient u32``. ``_sl_chain_lookup`` follows the chain with the
+standard attr-table walk (``CompsRecord.read_value_attrs``), so a coincidental
+attr-id byte pattern inside element data can never be misread as the size.
+
 V21 uses a different mechanism: it AES-encrypts the whole comps database with the
 standard config-5 key (transparent, not user source protection), and stores each
 FBD routine's sheet in a per-program ``RxDataCollection`` record whose decrypted
@@ -28,12 +37,15 @@ v21_sheet_rows`` decrypts and harvests those, keyed by the record's program id
 (comps ``kind`` == program ``comment_id``). Because that key is the program, not
 the routine, the size is applied only when a program maps to exactly ONE such
 record (one FBD routine) -- a program with several FBD routines is ambiguous and
-falls back to fail-closed.
+falls back to fail-closed. (A V21 routine DOES have a plaintext-named
+``__SL<disc>`` tag, but its data_table_instance is the 0xFFFFFFFF sentinel --
+the chain returns None there and defers to the V21 table.)
 """
 import struct
 from typing import Dict, Optional, Tuple
 
-from acd.record.comps import _SP_KEY_BY_CONFIG, _sp_aes, _sp_cbc
+from acd.record.comps import (CompsRecord, _SP_KEY_BY_CONFIG, _sp_aes,
+                              _sp_cbc)
 
 _FAFA = b"\xfa\xfa"
 _UNSET = 0xFFFFFFFF
@@ -155,15 +167,67 @@ def build_v21_sheet_rows(cur):
     return rows
 
 
+def _sl_chain_lookup(cur, comment_id: int,
+                     disc: int) -> Optional[Tuple[int, int]]:
+    """Pre-V31 (size_index, orient) via the hidden ``__SL<disc>`` tag, or None.
+
+    The tag is matched on its exact name AND its owning program's comment_id
+    (u16 @ body 0x0c) -- the name alone can collide across programs. Exactly one
+    live candidate is required; its main_record[0x24] data_table_instance names
+    the cip-0x6a backing whose attr-0x66 value is ``index u32 | orient u32``.
+    Any break in the chain returns None (fail closed). Deleted-relic rows
+    (no FAFA-family record) are excluded so a stale tag from a removed routine
+    can never shadow the live one.
+    """
+    try:
+        rows = cur.execute(
+            "SELECT object_id, record FROM comps WHERE comp_name=?",
+            ("__SL%d" % disc,)).fetchall()
+    except Exception:  # noqa: BLE001
+        return None
+    if not rows:
+        return None
+    try:
+        dead = CompsRecord.dead_oids(cur, True)
+    except Exception:  # noqa: BLE001
+        dead = frozenset()
+    cands = []
+    for oid, rr in rows:
+        if rr is None or oid in dead:
+            continue
+        rec = bytes(rr)
+        if len(rec) < 74:
+            continue
+        if struct.unpack_from("<H", rec, 0x0c)[0] != comment_id & 0xFFFF:
+            continue
+        cands.append(rec)
+    if len(cands) != 1:
+        return None
+    dti = struct.unpack_from("<I", cands[0], 14 + 0x24)[0]
+    if dti in (0, 0xFFFFFFFF):
+        return None
+    brow = cur.execute(
+        "SELECT record FROM comps WHERE object_id=?", (dti,)).fetchone()
+    if brow is None or brow[0] is None:
+        return None
+    attrs = CompsRecord.read_value_attrs(bytes(brow[0]), True, body_mode=True)
+    val = attrs.get(0x66)
+    if val is None or len(val) < 8:
+        return None
+    return (struct.unpack_from("<I", val, 0)[0],
+            struct.unpack_from("<I", val, 4)[0])
+
+
 def sheet_size_of(cur, comment_id: int,
                   routine_record: bytes) -> Optional[Tuple[str, str]]:
     """Resolve (size, orientation) strings for one routine from the DB, or None.
 
     Tries the V31+ ``sheet_layout`` table (keyed by program+routine id), then the
-    V21 ``sheet_layout_v21`` table (keyed by program id, applied only when that
-    program owns exactly one sheet record). None -- no record, an ambiguous
-    program, or an index outside the known table -- fails closed, so the caller
-    emits nothing rather than a guessed sheet.
+    pre-V31 ``__SL<disc>`` hidden-tag chain, then the V21 ``sheet_layout_v21``
+    table (keyed by program id, applied only when that program owns exactly one
+    sheet record). None -- no record, an ambiguous program, or an index outside
+    the known table -- fails closed, so the caller emits nothing rather than a
+    guessed sheet.
     """
     if len(routine_record) < _ROUTINE_KEY_OFF + 2:
         return None
@@ -171,6 +235,8 @@ def sheet_size_of(cur, comment_id: int,
     row = cur.execute(
         "SELECT size_index, orient FROM sheet_layout WHERE prog=? AND rkey=?",
         (comment_id & 0xFFFF, rkey)).fetchone()
+    if row is None:
+        row = _sl_chain_lookup(cur, comment_id, rkey)
     if row is None:
         v21 = cur.execute(
             "SELECT size_index, orient FROM sheet_layout_v21 WHERE cid=?",
