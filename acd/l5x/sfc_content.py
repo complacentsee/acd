@@ -44,7 +44,7 @@ _STEP_MASK = 0x33
 _SHEET = ('Letter - 8.5 x 11 in', 'Landscape')
 
 
-def decode_sfc(cur, routine_oid, _prove_sheet=None):
+def decode_sfc(cur, routine_oid, _prove_sheet=None, textbox_text=None):
     try:
         def kids(oid):
             return [o for (o,) in cur.execute(
@@ -339,9 +339,10 @@ def decode_sfc(cur, routine_oid, _prove_sheet=None):
         def parse_textbox(r):
             if len(r) != 32:
                 return None
+            md = u32(r, 20 + d)
             X = u32(r, 24 + d)
             Y = u32(r, 28 + d)
-            return dict(hash=bytes(selfhash(r)), X=X, Y=Y)
+            return dict(hash=bytes(selfhash(r)), X=X, Y=Y, md=md)
 
         def parse_attachment(r):
             if len(r) < 32 + d:
@@ -525,7 +526,14 @@ def decode_sfc(cur, routine_oid, _prove_sheet=None):
         for fr, to, show in links:
             out.append('<DirectedLink FromID="%d" ToID="%d" Show="%s"/>' % (fr, to, show))
         for t in TB:
-            out.append('<TextBox ID="%d" X="%d" Y="%d" Width="0"/>' % (t["id"], t["X"], t["Y"]))
+            txt = (textbox_text or {}).get(t["md"])
+            if txt is None:
+                out.append('<TextBox ID="%d" X="%d" Y="%d" Width="0"/>'
+                           % (t["id"], t["X"], t["Y"]))
+            else:
+                out.append('<TextBox ID="%d" X="%d" Y="%d" Width="0">'
+                           '<Text><![CDATA[%s]]></Text></TextBox>'
+                           % (t["id"], t["X"], t["Y"], txt))
         for fr, to in atts:
             out.append('<Attachment FromID="%d" ToID="%d"/>' % (fr, to))
         out.append('</SFCContent>')

@@ -15,6 +15,7 @@ from loguru import logger as log
 
 from acd.l5x.base import external_access_enum, language_desc_oid
 from acd.l5x.sheet_layout import build_sheet_layout_rows, build_v21_sheet_rows
+from acd.l5x.textbox_text import build_textbox_text_rows
 from acd.l5x.elements import (
     Controller,
     ControllerBuilder,
@@ -659,6 +660,22 @@ class ExportL5x:
                 "INSERT INTO sheet_layout_v21 VALUES (?,?,?)", _v21)
             self._cur.execute(
                 "CREATE INDEX idx_sheet_layout_v21 ON sheet_layout_v21(cid)")
+            self._db.commit()
+        except Exception:  # noqa: BLE001
+            pass
+
+        # FBD/SFC TextBox text lives in Comments.Dat MD_<n> records the comment
+        # parser drops; harvest (comment_id, md-index -> text) so RoutineBuilder
+        # can render each TextBox's <Text>. See acd.l5x.textbox_text.
+        self._cur.execute(
+            "CREATE TABLE textbox_text(cid int, md int, text text)")
+        try:
+            with open(os.path.join(self._temp_dir, "Comments.Dat"), "rb") as _cf:
+                _tb_rows = build_textbox_text_rows(_cf.read())
+            self._cur.executemany(
+                "INSERT INTO textbox_text VALUES (?,?,?)", _tb_rows)
+            self._cur.execute(
+                "CREATE INDEX idx_textbox_text ON textbox_text(cid)")
             self._db.commit()
         except Exception:  # noqa: BLE001
             pass

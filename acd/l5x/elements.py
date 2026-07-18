@@ -87,6 +87,7 @@ from acd.l5x.coordinate_system import (
 from acd.l5x.sfc_content import decode_sfc as _decode_sfc
 from acd.l5x.fbd_content import decode_fbd as _decode_fbd
 from acd.l5x.sheet_layout import sheet_size_of as _sheet_size_of
+from acd.l5x.textbox_text import textbox_texts_for as _textbox_texts_for
 from acd.l5x.trends import build_trends
 from acd.record.blobs import ControllerProps
 from acd.record.comps import CompsRecord, _SP_MARKER, decrypt_sp_nameless
@@ -3524,18 +3525,25 @@ class RoutineBuilder(L5xElementBuilder):
 
         st_lines = (_st_content_lines(self._cur, self._object_id)
                     if routine_type == "ST" else None)
-        sfc_content = (_decode_sfc(self._cur, self._object_id)
-                       if routine_type == "SFC" else None)
-        # The sheet size/orientation come from the SHEETSIZE/SHEETLAYOUT
-        # attribute records (sheet_layout table); without them decode_fbd fails
-        # closed, so a pre-V31 routine (no records) keeps its empty <Routine>.
+        # FBD/SFC sheet size + orientation come from the sheet_layout tables; the
+        # per-routine TextBox text from the textbox_text table (keyed by md id).
+        # Without a resolved sheet both decoders fail closed (empty <Routine>).
+        _mdtext = (_textbox_texts_for(self._cur, r.comment_id)
+                   if routine_type in ("FBD", "SFC") else {})
+        sfc_content = None
+        if routine_type == "SFC":
+            _sheet = _sheet_size_of(self._cur, r.comment_id, bytes(record))
+            sfc_content = _decode_sfc(self._cur, self._object_id,
+                                      _prove_sheet=_sheet, textbox_text=_mdtext)
         fbd_content = None
         if routine_type == "FBD":
             _sheet = _sheet_size_of(self._cur, r.comment_id, bytes(record))
             if _sheet is not None:
+                _tb = {"MD%d" % n: t for n, t in _mdtext.items()}
                 fbd_content = _decode_fbd(
                     self._cur, self._object_id, self._short_header,
-                    sheet_size=_sheet[0], sheet_orientation=_sheet[1])
+                    sheet_size=_sheet[0], sheet_orientation=_sheet[1],
+                    textbox_text=_tb)
         return Routine(name, name, routine_type, rungs, rung_ids, rung_comments,
                        description, _safety_signature=safety_sig,
                        _safety_signature_timestamp=safety_sig_ts,
