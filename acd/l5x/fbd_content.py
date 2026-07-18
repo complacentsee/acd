@@ -29,8 +29,15 @@ KIND2TYPE = {
     0x63: 'NEQ',
     # pin-space types: wide datatype-derived mask, not the VISIBLE_PIN_BITS u32
     0x0b: 'TOT', 0x1b: 'PIDE', 0x29: 'PI', 0x58: 'CTUD',
+    0x18: 'FGEN', 0x1a: 'MAVE',
 }
 PIDE_KIND = 0x1b
+# Array-parameter block types: the block owns one kind-0x77 group of kind-0x75
+# array records ([operand fffeff][name fffeff] each), rendered as <Array>
+# children. Each array parameter also occupies one pin slot after the output
+# collector, so the datatype pinmap shifts by the instance's array count.
+ARRAY_TYPES = {'FGEN', 'MAVE'}
+ARRAY_GROUP, ARRAY_ELEM = 0x77, 0x75
 
 # Pin-space FBD block types: their VisiblePins mask is a WIDE little-endian bit
 # array (base+9, or the PIDE prelude-keyed offset below), not the u32 at base+8
@@ -38,11 +45,11 @@ PIDE_KIND = 0x1b
 # NOT tabled -- they are DERIVED from the block's own datatype member list in the
 # ACD (TagInfo/Comps), so the ~40-pin PIDE vocabulary and the PI/CTUD/TOT maps
 # come straight from the project. See _pins_from_mask / _datatype_pinmap.
-PINSPACE_TYPES = {'CTUD', 'PI', 'PIDE', 'TOT'}
+PINSPACE_TYPES = {'CTUD', 'PI', 'PIDE', 'TOT', 'FGEN', 'MAVE'}
 # Read-window bytes for the wide mask -- a generous upper bound. Trailing bytes
 # past the real mask are zero, and a set bit with no datatype member fails
 # closed, so an over-wide window only adds safety.
-PIN_MASK_BYTES = {'CTUD': 8, 'PI': 8, 'TOT': 8, 'PIDE': 24}
+PIN_MASK_BYTES = {'CTUD': 8, 'PI': 8, 'TOT': 8, 'PIDE': 24, 'FGEN': 8, 'MAVE': 8}
 # Hidden 'ulBoolInput<n>' input bit-collector members: the SECOND and later ones
 # each reserve one firmware pin slot ahead of the following pins (the only
 # structural "phantom" in the Logix FB pin numbering; the first collector and all
@@ -55,6 +62,10 @@ PIN_ULINPUT = re.compile(r"^ulBoolInput(\d+)$")
 # shape (prelude 76/80) at +9. Any other prelude is an unknown layout ->
 # fail closed.
 _PIDE_MASK_DELTA_BY_PRELUDE = {48: 12, 76: 9, 80: 9}
+# MAVE/FGEN use the same prelude-keyed scheme (relative to their effective
+# base, after MAVE's extra leading word); only the 76/80 shapes are corpus-
+# attested for them, so the V16 shape fails closed until evidenced.
+_ARRAY_MASK_DELTA_BY_PRELUDE = {76: 9, 80: 9}
 
 VISIBLE_PIN_BITS = {
     'ABS': {10: 'Source', 12: 'Dest'},
@@ -167,26 +178,46 @@ def _block_datatype(cur, operand_oid, operand_name):
     return None
 
 
-def _datatype_pinmap(cur, datatype):
+def _datatype_pinmap(cur, datatype, array_slots=()):
     """{pin_bit: (member_name, hidden)} for a datatype, or None (no members).
 
-    pin_bit(member@ordinal) = ordinal + 1 + reserved, where reserved counts the
-    hidden ulBoolInput<n>=2..> members before it (each such second+ input
-    bit-collector reserves one firmware pin slot). Names and order come entirely
-    from the datatype member list, so no per-type pin table is needed.
+    Without arrays: pin_bit(member@ordinal) = ordinal + 1 + reserved, where
+    reserved counts the hidden ulBoolInput<n>=2..> members before it (each
+    such second+ input bit-collector reserves one firmware pin slot). Names
+    and order come entirely from the datatype member list, so no per-type pin
+    table is needed.
+
+    ``array_slots``: the pin slots the block instance's array parameters
+    occupy (each 0x75 array record states its slot: MAVE StorageArray=9 /
+    WeightArray=10, FGEN X1=7 Y1=8 X2=9 Y2=10). Members then fill the FREE
+    slots in ordinal order -- except that the first hidden ``ulBoolOutput1``
+    fills AFTER the member that follows it (Brenton MAVE: EnableOut=11,
+    collector=12, Out=13; with no arrays the collector keeps its ordinal
+    slot, CTUD-attested).
     """
     rows = cur.execute(
         "SELECT name, hidden FROM datatype_members WHERE datatype=? "
         "ORDER BY ordinal", (datatype,)).fetchall()
     if not rows:
         return None
+    order = [(name, bool(hidden)) for name, hidden in rows]
+    if array_slots:
+        for i, (name, hidden) in enumerate(order):
+            if hidden and name == 'ulBoolOutput1':
+                if i + 1 < len(order):
+                    order[i], order[i + 1] = order[i + 1], order[i]
+                break
+    taken = set(array_slots)
     out = {}
-    reserved = 0
-    for i, (name, hidden) in enumerate(rows):
-        out[i + 1 + reserved] = (name, bool(hidden))
+    slot = 0
+    for name, hidden in order:
+        slot += 1
+        while slot in taken:
+            slot += 1
+        out[slot] = (name, hidden)
         mm = PIN_ULINPUT.match(name or "")
         if hidden and mm and int(mm.group(1)) >= 2:
-            reserved += 1
+            slot += 1
     return out
 
 
@@ -203,6 +234,13 @@ def _pins_from_mask(er, base, bt, pinmap):
         if j < 0:
             return None
         delta = _PIDE_MASK_DELTA_BY_PRELUDE.get(j - base)
+        if delta is None:
+            return None
+    elif bt in ARRAY_TYPES:
+        j = er.find(b'\xff\xfe\xff')
+        if j < 0:
+            return None
+        delta = _ARRAY_MASK_DELTA_BY_PRELUDE.get(j - base)
         if delta is None:
             return None
     nb = PIN_MASK_BYTES[bt]
@@ -297,10 +335,7 @@ def _deref(cur, oid, depth=0):
     return nm
 
 
-def _operand(cur, r):
-    txt = _rawtext(r)
-    if not txt:
-        return None
+def _resolve_text(cur, txt):
     out, last = [], 0
     for m in _TOK.finditer(txt):
         nm = _deref(cur, int(m.group(1), 16))
@@ -310,8 +345,77 @@ def _operand(cur, r):
         out.append(nm)
         last = m.end()
     out.append(txt[last:])
-    res = "".join(out)
+    return "".join(out)
+
+
+def _operand(cur, r):
+    txt = _rawtext(r)
+    if not txt:
+        return None
+    res = _resolve_text(cur, txt)
     return res if res else None
+
+
+def _read_str(r, j):
+    """(text, next_offset) for the fffeff string at offset j, or (None, 0)."""
+    if r[j:j + 3] != b'\xff\xfe\xff' or len(r) < j + 4:
+        return None, 0
+    n = r[j + 3]
+    p = j + 4
+    if n == 0xFF:
+        if len(r) < j + 6:
+            return None, 0
+        n = struct.unpack_from("<H", r, j + 4)[0]
+        p = j + 6
+    if len(r) < p + 2 * n:
+        return None, 0
+    return r[p:p + 2 * n].decode("utf-16-le", "replace"), p + 2 * n
+
+
+def _block_arrays(cur, eo):
+    """Resolve an array-parameter block's <Array> children, or fail.
+
+    The block owns exactly ONE kind-0x77 group; its children are kind-0x75
+    array records with no further children, each holding two consecutive
+    fffeff strings: the operand reference (empty => the parameter is unbound)
+    and the array parameter name. Returns (ok, [(name, operand_or_None), ...]);
+    any other shape, an unresolved operand or a duplicate name is unknown ->
+    (False, None).
+    """
+    kids = _rows(cur, eo)
+    if len(kids) != 1:
+        return False, None
+    go, gr = kids[0]
+    if _kind(gr) != ARRAY_GROUP:
+        return False, None
+    arrays = []
+    for ao, ar in _rows(cur, go):
+        if _kind(ar) != ARRAY_ELEM or _rows(cur, ao):
+            return False, None
+        if len(ar) < 28:
+            return False, None
+        slot = struct.unpack_from("<I", ar, 24)[0]
+        j = ar.find(b'\xff\xfe\xff')
+        if j < 0:
+            return False, None
+        op_txt, nxt = _read_str(ar, j)
+        if op_txt is None:
+            return False, None
+        name, _ = _read_str(ar, nxt)
+        if not name:
+            return False, None
+        operand = None
+        if op_txt:
+            operand = _resolve_text(cur, op_txt)
+            if not operand:
+                return False, None
+        arrays.append((name, operand, slot))
+    names = [a[0] for a in arrays]
+    slots = [a[2] for a in arrays]
+    if (not arrays or len(set(names)) != len(names)
+            or len(set(slots)) != len(slots) or 0 in slots):
+        return False, None
+    return True, sorted(arrays)
 
 
 def decode_fbd(cur, routine_oid, short_header, sheet_size=None,
@@ -346,197 +450,266 @@ def _decode(cur, oid, sh, size, orient, tbtext):
         return None
 
     sheets = [(o, r) for o, r in sub.items() if _kind(r) == SHEET]
-    if len(sheets) != 1:
+    if not sheets:
         return None
-    soid, srec = sheets[0]
-
-    sdesc = _rawtext(srec)
-    if sdesc is None or "@" in sdesc:
-        return None
-    desc_xml = []
-    if sdesc != "":
-        desc_xml.append("<Description>\n<![CDATA[%s]]>\n</Description>" % sdesc)
-
-    childgroups = _rows(cur, soid)
-    if any(_kind(r) not in (ELEMGROUP, WIREGROUP, TBGROUP, ATGROUP) for _, r in childgroups):
-        return None
-    egs = [o for o, r in childgroups if _kind(r) == ELEMGROUP]
-    wgs = [o for o, r in childgroups if _kind(r) == WIREGROUP]
-    tgs = [o for o, r in childgroups if _kind(r) == TBGROUP]
-    ags = [o for o, r in childgroups if _kind(r) == ATGROUP]
-
-    elems = []
-    for go in egs:
-        for eo, er in _rows(cur, go):
-            k = _kind(er)
-            if k in (IREF, OREF):
-                if _has_children(cur, eo):
-                    return None
-                op = _operand(cur, er)
-                if op is None:
-                    return None
-                x = struct.unpack_from("<I", er, base)[0]
-                y = struct.unpack_from("<I", er, base + 4)[0]
-                elems.append([eo, 'IRef' if k == IREF else 'ORef', x, y, op, None, None])
-            elif k in KIND2TYPE:
-                bt = KIND2TYPE[k]
-                if bt in FAM_OK and fam not in FAM_OK[bt]:
-                    return None
-                autotune = None
-                if bt == 'PIDE':
-                    ok, autotune = _pide_autotune(cur, eo)
-                    if not ok:
-                        return None
-                elif _has_children(cur, eo):
-                    return None
-                op = _operand(cur, er)
-                if op is None:
-                    return None
-                x = struct.unpack_from("<I", er, base)[0]
-                y = struct.unpack_from("<I", er, base + 4)[0]
-                pinmap = None
-                if bt in PINSPACE_TYPES:
-                    dt = _block_datatype(cur, _operand_oid(er), op)
-                    if dt is None:
-                        return None
-                    pinmap = _datatype_pinmap(cur, dt)
-                    if pinmap is None:
-                        return None
-                    pins_str = _pins_from_mask(er, base, bt, pinmap)
-                    if pins_str is None:
-                        return None
-                else:
-                    moff = base + MASK_DELTA.get(bt, 8)
-                    if len(er) < moff + 4:
-                        return None
-                    mask = struct.unpack_from("<I", er, moff)[0]
-                    tab = VISIBLE_PIN_BITS.get(bt)
-                    if tab is None:
-                        return None
-                    pins = []
-                    for b in range(32):
-                        if mask & (1 << b):
-                            if b not in tab:
-                                return None
-                            pins.append(tab[b])
-                    pins_str = " ".join(pins)
-                elems.append([eo, 'Block', x, y, op, pins_str, bt, autotune, pinmap])
-            else:
+    if len(sheets) == 1:
+        ordered = sheets
+    else:
+        # Each sheet record stores its display Number explicitly: the u32
+        # immediately before the description's fffeff marker (both header
+        # families, reference-verified). The numbers must be exactly 1..N or
+        # the layout is unknown -> fail closed.
+        nums = []
+        for _, r in sheets:
+            j = r.find(b'\xff\xfe\xff')
+            if j < 4:
                 return None
-
-    for go in tgs:
-        for eo, er in _rows(cur, go):
-            if _kind(er) != TEXTBOX or _has_children(cur, eo):
-                return None
-            md = struct.unpack_from("<I", er, 20)[0]
-            x = struct.unpack_from("<I", er, base)[0]
-            y = struct.unpack_from("<I", er, base + 4)[0]
-            txt = tbtext.get("MD%d" % md)
-            if txt is None:
-                return None
-            elems.append([eo, 'TextBox', x, y, None, None, txt])
-
-    if not elems:
-        if desc_xml:
+            nums.append(struct.unpack_from("<I", r, j - 4)[0])
+        if sorted(nums) != list(range(1, len(sheets) + 1)):
             return None
-        for go in wgs + ags + tgs:
-            if _rows(cur, go):
-                return None
-        return ('<FBDContent SheetSize=%s SheetOrientation=%s>\n<Sheet Number="1"/>\n</FBDContent>'
-                % (quoteattr(size), quoteattr(orient)))
+        ordered = [s2 for _, s2 in sorted(zip(nums, sheets),
+                                          key=lambda t: t[0])]
 
     # ID assignment order: type rank, then the Block TYPE name, then operand,
     # then position. The type-name component is load-bearing: OEM orders a
     # MUL before a PIDE even when the PIDE's operand sorts first (corpus:
     # 116/116 routines consistent; operand-only ordering broke on exactly
     # that shape). Non-Block elements contribute '' so their order is
-    # unchanged.
+    # unchanged. IDs run through the whole routine in sheet order.
     def _idkey(e):
         return (TYPE_RANK[e[1]], e[6] if e[1] == 'Block' else '',
                 e[4] if e[4] is not None else '', e[2], e[3])
-    es = sorted(elems, key=_idkey)
-    keys = set()
-    for e in es:
-        key = _idkey(e)
-        if key in keys:
-            return None
-        keys.add(key)
-    idmap = {e[0]: i for i, e in enumerate(es)}
-    etype = {e[0]: (e[1], e[6]) for e in es}
-    epin = {e[0]: (e[8] if len(e) > 8 else None) for e in es}
 
-    el_xml = []
-    for i, e in enumerate(es):
-        typ = e[1]
-        if typ in ('IRef', 'ORef'):
-            el_xml.append('<%s ID="%d" X="%d" Y="%d" Operand=%s HideDesc="false"/>'
-                          % (typ, i, e[2], e[3], quoteattr(e[4])))
-        elif typ == 'Block':
-            at = ' AutotuneTag=%s' % quoteattr(e[7]) \
-                if len(e) > 7 and e[7] else ''
-            el_xml.append('<Block Type="%s" ID="%d" X="%d" Y="%d" Operand=%s VisiblePins=%s HideDesc="false"%s/>'
-                          % (e[6], i, e[2], e[3], quoteattr(e[4]), quoteattr(e[5]), at))
-        elif typ == 'TextBox':
-            el_xml.append('<TextBox ID="%d" X="%d" Y="%d" Width="0"><Text><![CDATA[%s]]></Text></TextBox>'
-                          % (i, e[2], e[3], e[6]))
-
-    wires = []
-    for go in wgs:
-        for wo, wr in _rows(cur, go):
-            if _kind(wr) != WIRE or len(wr) < base + 16:
-                return None
-            fo = struct.unpack_from("<I", wr, base)[0]
-            fp = struct.unpack_from("<I", wr, base + 4)[0]
-            to = struct.unpack_from("<I", wr, base + 8)[0]
-            tp = struct.unpack_from("<I", wr, base + 12)[0]
-            if fo not in idmap or to not in idmap:
-                return None
-            wires.append((fo, fp, to, tp))
     def _wparam(bt, idx, pinmap):
         # A pin-space block's wire index is its pin bit -- resolve through the
-        # same datatype-derived pinmap as VisiblePins; other blocks use the
-        # tabled WIRE_PARAM. Fail closed on an unknown / hidden index.
+        # same datatype-derived pinmap as VisiblePins. A u32-mask block's wire
+        # index is its VISIBLE_PIN_BITS bit minus 8 (minus 0 for SSUM, whose
+        # mask is already low-based) -- every instance-diffed WIRE_PARAM pair
+        # is a subset of this relation. Fail closed on an unknown index.
         if pinmap is not None:
-            e = pinmap.get(idx)
-            return None if e is None or e[1] else e[0]
-        return WIRE_PARAM.get("%s:%s" % (bt, fam), {}).get(idx)
+            en = pinmap.get(idx)
+            return None if en is None or en[1] else en[0]
+        tab = VISIBLE_PIN_BITS.get(bt)
+        if tab is None:
+            return None
+        return tab.get(idx + (0 if bt == 'SSUM' else 8))
 
-    resolved = []
-    for fo, fp, to, tp in wires:
-        fattr = tattr = ""
-        fname = tname = ""
-        ft, fbt = etype[fo]
-        tt, tbt = etype[to]
-        if ft == 'Block':
-            fname = _wparam(fbt, fp, epin.get(fo))
-            if fname is None:
-                return None
-            fattr = ' FromParam="%s"' % fname
-        if tt == 'Block':
-            tname = _wparam(tbt, tp, epin.get(to))
-            if tname is None:
-                return None
-            tattr = ' ToParam="%s"' % tname
-        resolved.append((idmap[fo], idmap[to], fattr, tattr, fname, tname))
-    # Same-endpoint wire pairs (several wires between one element pair) are
-    # ordered ALPHABETICALLY by param name -- corpus: OEM lists DevDeadband,
-    # ProgAutoReq, ProgProgReq (names ordered; their pin indices 61, 67, 64
-    # are not), and DevHLimit before DevLLimit.
-    wire_xml = ['<Wire FromID="%d"%s ToID="%d"%s/>' % (w[0], w[2], w[1], w[3])
-                for w in sorted(resolved, key=lambda w: (w[0], w[1], w[4], w[5]))]
+    # ---- pass 1: parse + globally ID-assign every sheet's elements ----
+    idmap = {}
+    etype = {}
+    epin = {}
+    per_sheet = []          # (es_sorted, desc_xml, wgs, ags)
+    next_id = 0
+    for soid, srec in ordered:
+        sdesc = _rawtext(srec)
+        if sdesc is None or "@" in sdesc:
+            return None
+        desc_xml = []
+        if sdesc != "":
+            desc_xml.append("<Description>\n<![CDATA[%s]]>\n</Description>" % sdesc)
 
-    att = []
-    for go in ags:
-        for ao, ar in _rows(cur, go):
-            if _kind(ar) != ATTACH or len(ar) < base + 8:
-                return None
-            fo = struct.unpack_from("<I", ar, base)[0]
-            to = struct.unpack_from("<I", ar, base + 4)[0]
-            if fo not in idmap or to not in idmap:
-                return None
-            att.append((idmap[fo], idmap[to]))
-    att_xml = ['<Attachment FromID="%d" ToID="%d"/>' % (a, b) for a, b in sorted(att)]
+        childgroups = _rows(cur, soid)
+        if any(_kind(r) not in (ELEMGROUP, WIREGROUP, TBGROUP, ATGROUP)
+               for _, r in childgroups):
+            return None
+        egs = [o for o, r in childgroups if _kind(r) == ELEMGROUP]
+        wgs = [o for o, r in childgroups if _kind(r) == WIREGROUP]
+        tgs = [o for o, r in childgroups if _kind(r) == TBGROUP]
+        ags = [o for o, r in childgroups if _kind(r) == ATGROUP]
 
-    body = desc_xml + el_xml + wire_xml + att_xml
-    return ('<FBDContent SheetSize=%s SheetOrientation=%s>\n<Sheet Number="1">\n%s\n</Sheet>\n</FBDContent>'
-            % (quoteattr(size), quoteattr(orient), "\n".join(body)))
+        elems = []
+        for go in egs:
+            for eo, er in _rows(cur, go):
+                k = _kind(er)
+                if k in (IREF, OREF):
+                    if _has_children(cur, eo):
+                        return None
+                    op = _operand(cur, er)
+                    if op is None:
+                        return None
+                    x = struct.unpack_from("<I", er, base)[0]
+                    y = struct.unpack_from("<I", er, base + 4)[0]
+                    elems.append([eo, 'IRef' if k == IREF else 'ORef', x, y, op, None, None])
+                elif k in KIND2TYPE:
+                    bt = KIND2TYPE[k]
+                    if bt in FAM_OK and fam not in FAM_OK[bt]:
+                        return None
+                    autotune = None
+                    arrays = None
+                    if bt == 'PIDE':
+                        ok, autotune = _pide_autotune(cur, eo)
+                        if not ok:
+                            return None
+                    elif bt in ARRAY_TYPES:
+                        ok, arrays = _block_arrays(cur, eo)
+                        if not ok:
+                            return None
+                    elif _has_children(cur, eo):
+                        return None
+                    op = _operand(cur, er)
+                    if op is None:
+                        return None
+                    x = struct.unpack_from("<I", er, base)[0]
+                    y = struct.unpack_from("<I", er, base + 4)[0]
+                    pinmap = None
+                    if bt in PINSPACE_TYPES:
+                        dt = _block_datatype(cur, _operand_oid(er), op)
+                        if dt is None:
+                            return None
+                        pinmap = _datatype_pinmap(
+                            cur, dt,
+                            [a[2] for a in arrays] if arrays else ())
+                        if pinmap is None:
+                            return None
+                        pins_str = _pins_from_mask(er, base, bt, pinmap)
+                        if pins_str is None:
+                            return None
+                    else:
+                        moff = base + MASK_DELTA.get(bt, 8)
+                        if len(er) < moff + 4:
+                            return None
+                        mask = struct.unpack_from("<I", er, moff)[0]
+                        tab = VISIBLE_PIN_BITS.get(bt)
+                        if tab is None:
+                            return None
+                        pins = []
+                        for b in range(32):
+                            if mask & (1 << b):
+                                if b not in tab:
+                                    return None
+                                pins.append(tab[b])
+                        pins_str = " ".join(pins)
+                    elems.append([eo, 'Block', x, y, op, pins_str, bt, autotune,
+                                  pinmap, arrays])
+                else:
+                    return None
+
+        for go in tgs:
+            for eo, er in _rows(cur, go):
+                if _kind(er) != TEXTBOX or _has_children(cur, eo):
+                    return None
+                md = struct.unpack_from("<I", er, 20)[0]
+                x = struct.unpack_from("<I", er, base)[0]
+                y = struct.unpack_from("<I", er, base + 4)[0]
+                txt = tbtext.get("MD%d" % md)
+                if txt is None:
+                    return None
+                elems.append([eo, 'TextBox', x, y, None, None, txt])
+
+        if not elems:
+            # An empty sheet is legal; OEM keeps its Description (a desc-only
+            # <Sheet>) and self-closes an undescribed one. Stray wires or
+            # attachments on an empty sheet are an unknown shape.
+            for go in wgs + ags:
+                if _rows(cur, go):
+                    return None
+            per_sheet.append((None, desc_xml, None, None))
+            continue
+
+        es = sorted(elems, key=_idkey)
+        keys = set()
+        for e in es:
+            key = _idkey(e)
+            if key in keys:
+                return None
+            keys.add(key)
+        for e in es:
+            idmap[e[0]] = next_id
+            next_id += 1
+            etype[e[0]] = (e[1], e[6])
+            epin[e[0]] = e[8] if len(e) > 8 else None
+        per_sheet.append((es, desc_xml, wgs, ags))
+
+    # ---- pass 2: wires / attachments + XML per sheet ----
+    sheet_xml = []
+    for n, (es, desc_xml, wgs, ags) in enumerate(per_sheet):
+        if es is None:
+            if desc_xml:
+                sheet_xml.append('<Sheet Number="%d">\n%s\n</Sheet>'
+                                 % (n + 1, "\n".join(desc_xml)))
+            else:
+                sheet_xml.append('<Sheet Number="%d"/>' % (n + 1))
+            continue
+
+        el_xml = []
+        for e in es:
+            i = idmap[e[0]]
+            typ = e[1]
+            if typ in ('IRef', 'ORef'):
+                el_xml.append('<%s ID="%d" X="%d" Y="%d" Operand=%s HideDesc="false"/>'
+                              % (typ, i, e[2], e[3], quoteattr(e[4])))
+            elif typ == 'Block':
+                at = ' AutotuneTag=%s' % quoteattr(e[7]) \
+                    if len(e) > 7 and e[7] else ''
+                head = ('<Block Type="%s" ID="%d" X="%d" Y="%d" Operand=%s VisiblePins=%s HideDesc="false"%s'
+                        % (e[6], i, e[2], e[3], quoteattr(e[4]), quoteattr(e[5]), at))
+                arrays = e[9] if len(e) > 9 and e[9] else None
+                if arrays:
+                    inner = "\n".join(
+                        '<Array Name=%s%s/>' % (
+                            quoteattr(nm),
+                            (' Operand=%s' % quoteattr(opnd)) if opnd else '')
+                        for nm, opnd, _slot in arrays)
+                    el_xml.append('%s>\n%s\n</Block>' % (head, inner))
+                else:
+                    el_xml.append('%s/>' % head)
+            elif typ == 'TextBox':
+                el_xml.append('<TextBox ID="%d" X="%d" Y="%d" Width="0"><Text><![CDATA[%s]]></Text></TextBox>'
+                              % (i, e[2], e[3], e[6]))
+
+        wires = []
+        for go in wgs:
+            for wo, wr in _rows(cur, go):
+                if _kind(wr) != WIRE or len(wr) < base + 16:
+                    return None
+                fo = struct.unpack_from("<I", wr, base)[0]
+                fp = struct.unpack_from("<I", wr, base + 4)[0]
+                to = struct.unpack_from("<I", wr, base + 8)[0]
+                tp = struct.unpack_from("<I", wr, base + 12)[0]
+                if fo not in idmap or to not in idmap:
+                    return None
+                wires.append((fo, fp, to, tp))
+
+        resolved = []
+        for fo, fp, to, tp in wires:
+            fattr = tattr = ""
+            fname = tname = ""
+            ft, fbt = etype[fo]
+            tt, tbt = etype[to]
+            if ft == 'Block':
+                fname = _wparam(fbt, fp, epin.get(fo))
+                if fname is None:
+                    return None
+                fattr = ' FromParam="%s"' % fname
+            if tt == 'Block':
+                tname = _wparam(tbt, tp, epin.get(to))
+                if tname is None:
+                    return None
+                tattr = ' ToParam="%s"' % tname
+            resolved.append((idmap[fo], idmap[to], fattr, tattr, fname, tname))
+        # Same-endpoint wire pairs (several wires between one element pair) are
+        # ordered ALPHABETICALLY by param name -- corpus: OEM lists DevDeadband,
+        # ProgAutoReq, ProgProgReq (names ordered; their pin indices 61, 67, 64
+        # are not), and DevHLimit before DevLLimit.
+        wire_xml = ['<Wire FromID="%d"%s ToID="%d"%s/>' % (w[0], w[2], w[1], w[3])
+                    for w in sorted(resolved, key=lambda w: (w[0], w[1], w[4], w[5]))]
+
+        att = []
+        for go in ags:
+            for ao, ar in _rows(cur, go):
+                if _kind(ar) != ATTACH or len(ar) < base + 8:
+                    return None
+                fo = struct.unpack_from("<I", ar, base)[0]
+                to = struct.unpack_from("<I", ar, base + 4)[0]
+                if fo not in idmap or to not in idmap:
+                    return None
+                att.append((idmap[fo], idmap[to]))
+        att_xml = ['<Attachment FromID="%d" ToID="%d"/>' % (a, b)
+                   for a, b in sorted(att)]
+
+        body = desc_xml + el_xml + wire_xml + att_xml
+        sheet_xml.append('<Sheet Number="%d">\n%s\n</Sheet>'
+                         % (n + 1, "\n".join(body)))
+
+    return ('<FBDContent SheetSize=%s SheetOrientation=%s>\n%s\n</FBDContent>'
+            % (quoteattr(size), quoteattr(orient), "\n".join(sheet_xml)))
