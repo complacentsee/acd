@@ -91,6 +91,8 @@ from acd.l5x.textbox_text import textbox_texts_for as _textbox_texts_for
 from acd.l5x.trends import build_trends
 from acd.record.blobs import ControllerProps
 from acd.record.comps import CompsRecord, _SP_MARKER, decrypt_sp_nameless
+from acd.record.source_protection import (
+    _SP_KEYS, _SP_KEY_HINT, _SP_CT_OFFSET, _sp_aes, _sp_cbc)
 
 
 # Maps primitive DataType names to their L5K zero-default value string.
@@ -3630,6 +3632,87 @@ def _parse_aoi_nameless(data: bytes) -> dict:
     return result
 
 
+def _decode_oid_list(rec: bytes):
+    """u32 object_id array from a nameless list record, or None.
+
+    Studio persists an AOI's declared parameter order (and its local-tag order)
+    as a list record whose body is a u16 count followed by that many u32 object
+    ids. The count sits at 0x14 (short header, V<=21) or 0x18 (long header, V24+,
+    after the extra ``ffffffff`` word); both are tried and the one whose array
+    fills the record EXACTLY wins, which also means a 0xFF-padded or unrelated
+    record never mis-decodes."""
+    for c, a in ((0x14, 0x16), (0x18, 0x1A)):
+        if len(rec) < a + 2:
+            continue
+        cnt = struct.unpack_from("<H", rec, c)[0]
+        if cnt > 0 and a + 4 * cnt == len(rec):
+            return [struct.unpack_from("<I", rec, a + 4 * i)[0]
+                    for i in range(cnt)]
+    return None
+
+
+def _sp_list_candidates(rec: bytes):
+    """Yield plaintext forms of a nameless list record: the record itself when
+    unprotected, else one reconstruction per project SP key. A source-protected
+    AOI encrypts the list body behind the ``aa96aa0a`` marker exactly as it does
+    the metadata record; the caller validates which key is right by the superset
+    check, so no plaintext-shape gate is applied here."""
+    midx = rec.find(_SP_MARKER)
+    if midx < 0:
+        yield rec
+        return
+    plen = int.from_bytes(rec[midx + 4:midx + 6], "little")
+    ctlen = ((plen + 15) // 16) * 16
+    ct = rec[midx + _SP_CT_OFFSET:midx + _SP_CT_OFFSET + ctlen]
+    ct = ct[:(len(ct) // 16) * 16]
+    nblk = len(ct) // 16
+    if nblk == 0:
+        return
+    order = list(_SP_KEYS)
+    hint = _SP_KEY_HINT[0]
+    if hint is not None:
+        order.sort(key=lambda kv: 0 if kv[0] == hint else 1)
+    for config, key in order:
+        try:
+            pt = _sp_cbc(ct, _sp_aes(config, key), nblk)
+        except Exception:  # noqa: BLE001
+            continue
+        pad = pt[-1] if pt else 0
+        if 1 <= pad <= 16 and pt[-pad:] == bytes([pad]) * pad:
+            pt = pt[:-pad]
+        yield rec[:midx] + b"\xff\xff\xff\xff" + pt
+
+
+def _aoi_param_order(cur, aoi_oid: int, param_oids):
+    """Authored parameter order (a list of object_ids) for one AOI, or None.
+
+    The order is the nameless list record under the AOI (parent -> container ->
+    the parameter list and the local-tag list) whose oid array is a superset of
+    the classified parameter oids; the sibling local-tag list shares none, so the
+    match is unambiguous. ``EnableIn``/``EnableOut`` are simply its first two
+    entries -- not a special rule. Returns the parameter oids in list order, or
+    None so the caller keeps the seq_number order (fail closed on an absent or
+    undecodable list -- never a wrong order)."""
+    pset = set(param_oids)
+    if not pset:
+        return None
+    try:
+        containers = cur.execute(
+            "SELECT object_id FROM nameless WHERE parent_id=?",
+            (aoi_oid,)).fetchall()
+        for (cont,) in containers:
+            for (lrec,) in cur.execute(
+                    "SELECT record FROM nameless WHERE parent_id=?",
+                    (cont,)).fetchall():
+                for cand in _sp_list_candidates(bytes(lrec)):
+                    arr = _decode_oid_list(cand)
+                    if arr and pset.issubset(arr):
+                        return [o for o in arr if o in pset]
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 @dataclass
 class AoiBuilder(L5xElementBuilder):
     _data_types_map: Dict[str, "DataType"] = field(default_factory=dict)
@@ -3919,6 +4002,8 @@ class AoiBuilder(L5xElementBuilder):
                     "software_revision": "", "revision_extension": None}
 
         parameters: List[Parameter] = []
+        _param_oids: List[int] = []  # comps object_id per built parameter, in
+        # collection (seq_number) order; used to restore the authored order below
         local_tags: List[LocalTag] = []
         routines: List[Routine] = []
         # Dead-relic (FDFD-only) AOI children are deleted params/tags/routines
@@ -4004,6 +4089,7 @@ class AoiBuilder(L5xElementBuilder):
                         except Exception:
                             pass
                         parameters.append(p)
+                        _param_oids.append(child_oid)
                     except Exception:
                         pass
                 else:
@@ -4023,6 +4109,27 @@ class AoiBuilder(L5xElementBuilder):
                         local_tags.append(lt)
                     except Exception:
                         pass
+
+        # Restore the authored parameter order. The RxTagCollection walk above is
+        # seq_number order (a category tag, NOT the declared order); Studio emits
+        # parameters in the order held by the AOI's nameless parameter-list
+        # record. Reorder to match; fail closed to the seq_number order when the
+        # list is absent or does not cover every parameter (never a wrong order).
+        if len(parameters) > 1:
+            # Match the order list against the parameters Studio actually EMITS.
+            # ACD-internal scratch tags (__SL/__l/__CLONE) can be misclassified as
+            # parameters but are dropped at emission and are absent from the
+            # authored order list, so excluding them keeps the match exact; they
+            # keep their place in the sort (a fallback rank) and render nothing.
+            _emit = [(o, p) for o, p in zip(_param_oids, parameters)
+                     if not getattr(p, "_l5x_exclude", False)]
+            _order = _aoi_param_order(
+                self._cur, self._object_id, [o for o, _ in _emit])
+            if _order is not None and set(_order) == set(o for o, _ in _emit):
+                _rank = {oid: i for i, oid in enumerate(_order)}
+                parameters = [p for _, p in sorted(
+                    zip(_param_oids, parameters),
+                    key=lambda t: _rank.get(t[0], len(_order)))]
 
         # --- Extract Routines from RxRoutineCollection ---
         self._cur.execute(
