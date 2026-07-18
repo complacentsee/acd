@@ -258,6 +258,8 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count):
                   103: "PLC5 Typed Write", 104: "PLC5 Typed Read"}.get(svc)
         elif fam == 7:
             mt = "Module Reconfigure"
+        elif fam == 8:
+            mt = {0x4f: "SERCOS IDN Read", 0x50: "SERCOS IDN Write"}.get(svc)
         elif fam == 0:
             mt = "Unconfigured"
         else:
@@ -363,6 +365,36 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count):
                       ("LocalElement", le)]
                 if cf == 1:
                     P.append(("CacheConnections", cc_val))
+        elif mt in ("SERCOS IDN Read", "SERCOS IDN Write"):
+            # A SERCOS IDN message targets a motion axis (the ConnectionPath) via
+            # the CIP setup struct (ServiceCode/ObjectType/AttributeNumber, same
+            # fields as CIP Generic), carries the real CommTypeCode, a RemoteIndex
+            # (u32 @345) and a LocalElement, and emits zeroed DH+ routing fields.
+            # Require the axis path, the local element, and structurally-zero DH+
+            # routing so a mis-decoded blob can never fabricate a route.
+            if le is None or not has_cp:
+                return None
+            if (a1[324] | (a1[325] << 8) | a1[326] | (a1[327] << 8)
+                    | a1[328] | (a1[329] << 8)):
+                return None
+            ridx = (a1[345] | (a1[346] << 8) | (a1[347] << 16)
+                    | (a1[348] << 24))
+            P += [("RequestedLength", str(req))]
+            add_cp()
+            P += [("CommTypeCode", str(ctc)),
+                  ("ServiceCode", "16#%04x" % mc.service_code),
+                  ("ObjectType", "16#%04x" % mc.object_type),
+                  ("AttributeNumber", "16#%04x" % mc.attribute_number)]
+            # The connected SERCOS variant (CommTypeCode 5) carries vestigial,
+            # always-zero DH+ routing attrs; the unconnected variant (ctc 0)
+            # omits them entirely.
+            if ctc == 5:
+                P += [("DHPlusSourceLink", "0"),
+                      ("DHPlusDestinationLink", "0"),
+                      ("DHPlusDestinationNode", "8#000_000")]
+            P += [("LocalIndex", str(a1[340])),
+                  ("RemoteIndex", str(ridx)),
+                  ("LocalElement", le)]
         elif mt == "Module Reconfigure":
             P += [("RequestedLength", str(req))]
             add_cp()
