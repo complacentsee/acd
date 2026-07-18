@@ -14,7 +14,7 @@ from acd.zip.unzip import Unzip
 from loguru import logger as log
 
 from acd.l5x.base import external_access_enum, language_desc_oid
-from acd.l5x.sheet_layout import build_sheet_layout_rows
+from acd.l5x.sheet_layout import build_sheet_layout_rows, build_v21_sheet_rows
 from acd.l5x.elements import (
     Controller,
     ControllerBuilder,
@@ -643,6 +643,22 @@ class ExportL5x:
                 "INSERT INTO sheet_layout VALUES (?,?,?,?)", _sl_rows)
             self._cur.execute(
                 "CREATE INDEX idx_sheet_layout ON sheet_layout(prog, rkey)")
+            self._db.commit()
+        except Exception:  # noqa: BLE001
+            pass
+
+        # V21 keeps its whole comps DB config-5 encrypted and stores each FBD
+        # routine's sheet in a per-program RxDataCollection record; harvest the
+        # decrypted (cid -> size,orient) into a side table the same resolver reads
+        # as a fallback. Empty on every other version.
+        self._cur.execute(
+            "CREATE TABLE sheet_layout_v21(cid int, size_index int, orient int)")
+        try:
+            _v21 = build_v21_sheet_rows(self._cur)
+            self._cur.executemany(
+                "INSERT INTO sheet_layout_v21 VALUES (?,?,?)", _v21)
+            self._cur.execute(
+                "CREATE INDEX idx_sheet_layout_v21 ON sheet_layout_v21(cid)")
             self._db.commit()
         except Exception:  # noqa: BLE001
             pass

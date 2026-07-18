@@ -19,12 +19,28 @@ id). Matching on the pair is required -- ``rkey`` alone collides across programs
 
 Older files (V16..V30) predate this mechanism and carry no such records; the
 lookup returns None for them and the caller falls back to fail-closed behaviour.
+
+V21 uses a different mechanism: it AES-encrypts the whole comps database with the
+standard config-5 key (transparent, not user source protection), and stores each
+FBD routine's sheet in a per-program ``RxDataCollection`` record whose decrypted
+body carries attribute id ``0x66`` = ``(index u32, orient u32)``. ``build_
+v21_sheet_rows`` decrypts and harvests those, keyed by the record's program id
+(comps ``kind`` == program ``comment_id``). Because that key is the program, not
+the routine, the size is applied only when a program maps to exactly ONE such
+record (one FBD routine) -- a program with several FBD routines is ambiguous and
+falls back to fail-closed.
 """
 import struct
 from typing import Dict, Optional, Tuple
 
+from acd.record.comps import _SP_KEY_BY_CONFIG, _sp_aes, _sp_cbc
+
 _FAFA = b"\xfa\xfa"
 _UNSET = 0xFFFFFFFF
+_SP_MARK = b"\xaa\x96\xaa\x0a"
+# Attribute id 0x66 (len 0x10) inside a decrypted V21 sheet record; its value's
+# first two u32s are the size index and orientation.
+_V21_SIZE_ATTR = b"\x66\x00\x00\x00\x10\x00\x00\x00"
 
 # ms_sizeList order from RxSheetLayout (Services.DLL). Corpus-witnessed:
 # 0/1/2/4/7; 3/5/6 (A/C/D) are from the same ordered table.
@@ -87,13 +103,67 @@ def build_sheet_layout_rows(comments_dat: bytes):
     return rows
 
 
+def _decrypt_sp_tail(rec: bytes) -> Optional[bytes]:
+    """Decrypt a config-5 SP-framed comps record's tail, or None. PKCS7-checked."""
+    mi = rec.find(_SP_MARK)
+    if mi < 0 or mi + 18 > len(rec):
+        return None
+    declared = struct.unpack_from("<I", rec, mi + 12)[0]
+    config = rec[mi + 17]
+    if config not in _SP_KEY_BY_CONFIG:
+        return None
+    ct_len = declared + 16 - declared % 16
+    ct = rec[mi + 18:mi + 18 + ct_len]
+    if len(ct) != ct_len or ct_len % 16:
+        return None
+    try:
+        pt = _sp_cbc(ct, _sp_aes(config, _SP_KEY_BY_CONFIG[config]), ct_len // 16)
+    except Exception:  # noqa: BLE001
+        return None
+    pad = pt[-1] if pt else 0
+    if not (1 <= pad <= 16) or pt[-pad:] != bytes([pad]) * pad:
+        return None
+    return pt[:-pad]
+
+
+def build_v21_sheet_rows(cur):
+    """Rows ``(cid, size_index, orient)`` from V21 encrypted per-program sheet
+    records (one per FBD routine). Decrypts every ``RxDataCollection`` child that
+    is config-5 SP-framed and carries the attr-0x66 size value; the row key is the
+    program id (comps ``kind`` == program ``comment_id``). Empty on non-V21 files
+    (they have no SP-framed records).
+    """
+    rows = []
+    for (rr,) in cur.execute(
+            "SELECT record FROM comps WHERE parent_id IN "
+            "(SELECT object_id FROM comps WHERE comp_name='RxDataCollection')"):
+        rec = bytes(rr)
+        if len(rec) < 18:
+            continue
+        body = _decrypt_sp_tail(rec)
+        if body is None:
+            continue
+        j = body.rfind(_V21_SIZE_ATTR)
+        if j < 0 or j + 16 > len(body):
+            continue
+        idx = struct.unpack_from("<I", body, j + 8)[0]
+        ori = struct.unpack_from("<I", body, j + 12)[0]
+        if idx >= 13 or ori >= 2:
+            continue
+        cid = struct.unpack_from("<H", rec, 16)[0]
+        rows.append((cid, idx, ori))
+    return rows
+
+
 def sheet_size_of(cur, comment_id: int,
                   routine_record: bytes) -> Optional[Tuple[str, str]]:
     """Resolve (size, orientation) strings for one routine from the DB, or None.
 
-    None means no record for this routine (an older, pre-V31 file) OR an index
-    outside the known table -- both fail closed, so the caller emits nothing
-    rather than a guessed sheet.
+    Tries the V31+ ``sheet_layout`` table (keyed by program+routine id), then the
+    V21 ``sheet_layout_v21`` table (keyed by program id, applied only when that
+    program owns exactly one sheet record). None -- no record, an ambiguous
+    program, or an index outside the known table -- fails closed, so the caller
+    emits nothing rather than a guessed sheet.
     """
     if len(routine_record) < _ROUTINE_KEY_OFF + 2:
         return None
@@ -102,7 +172,12 @@ def sheet_size_of(cur, comment_id: int,
         "SELECT size_index, orient FROM sheet_layout WHERE prog=? AND rkey=?",
         (comment_id & 0xFFFF, rkey)).fetchone()
     if row is None:
-        return None
+        v21 = cur.execute(
+            "SELECT size_index, orient FROM sheet_layout_v21 WHERE cid=?",
+            (comment_id & 0xFFFF,)).fetchall()
+        if len(v21) != 1:   # 0 = not V21; >1 = ambiguous program, fail closed
+            return None
+        row = v21[0]
     size = INDEX_TO_SIZE.get(row[0])
     orient = ORIENT_TO_STR.get(row[1])
     if size is None or orient is None:
