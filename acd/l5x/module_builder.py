@@ -564,8 +564,9 @@ class Module(L5xElement):
                     addr_attr = f' Address="{self._slot if self._slot != 0xFFFFFFFF else 0}"'
             elif pd.address_mode == "zero":
                 addr_attr = ' Address="0"'
-            else:  # "empty" — use IP from binary if present, else omit value
-                addr_attr = f' Address="{self._ip_address}"'
+            else:  # "empty" — IP from the binary; omit the attribute when absent
+                addr_attr = (f' Address="{self._ip_address}"'
+                             if self._ip_address else "")
 
             # --- Bus element ---
             # Bus is only emitted on downstream (Upstream="false") ports.
@@ -1277,7 +1278,7 @@ class ModuleBuilder(L5xElementBuilder):
                 _nb = bus_sizes.get(_pidi)
                 if _nb is not None:
                     bus = str(_nb)
-            addr_attr = f' Address="{addr}"' if addr is not None else ""
+            addr_attr = f' Address="{addr}"' if addr else ""
             # SafetyNetwork (safety modules only) follows Upstream, matching OEM.
             _snv = port_sn.get(_pidi)
             sn_attr = f' SafetyNetwork="{_snv}"' if _snv else ""
