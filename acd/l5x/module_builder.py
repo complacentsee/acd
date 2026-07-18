@@ -1953,6 +1953,13 @@ class ModuleBuilder(L5xElementBuilder):
             if _fmi.class_word in (0x0200, 0x0201):
                 _p = _fe1.find(b"\xff\xff\xff\xff")
                 _v = struct.unpack_from("<I", _fe1, _p - 4)[0] if _p >= 4 else 0
+                # Inline-form blob (a file family that stores ext-0x1 inline
+                # throughout): its FIRST 0xFFFFFFFF is a header field at 0x1C
+                # and the ADC word sits in the top half of the u32 before it.
+                # Corpus-validated 600/600 vs the reference
+                # (scripts/val_drives_adc.py).
+                if _p == 0x1C:
+                    _v >>= 16
                 drives_adc_enabled = "true" if (_v & 0x40) else "false"
                 drives_adc_mode = "true" if (_v & 0x02) else "false"
             if _fmi.safety_network is not None and _fmi.safety_network[5] != 0:
