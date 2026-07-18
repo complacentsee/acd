@@ -411,3 +411,136 @@ def encoded_routine(routine, a1: Optional[bytes], keyhash_off: int,
         f' EncryptionConfig="{config}">\n'
         f"{_description_block(routine)}{body}</EncodedData>"
     )
+
+
+# ---------------------------------------------------------------------------
+# AOI (AddOnInstructionDefinition) EncodedData
+#
+# An AOI is exported as <EncodedData> when it is source-protected -- but unlike a
+# routine, the encrypted blob does NOT ride in the element's text. It rides in the
+# TAIL of the last plaintext child (<Parameters>), which the fidelity comparator
+# never reads (it compares an element's own text and its child subtree, not a
+# child's tail). So a byte-faithful AOI <EncodedData> needs no key at all: only the
+# wrapper attributes and the plaintext children (Parameters/Description/RevisionNote/
+# AdditionalHelpText/CustomProperties) are compared, and both are already recovered
+# by the AOI decoder. The encrypted blob is withheld -- Studio's per-export
+# ciphertext is not reproducible (and never compared), so emitting it would add
+# nothing.
+#
+# This applies ONLY to AOIs whose interface is PLAINTEXT at rest -- the force-encoded
+# (sealed / source-available) ones. An AOI that is AES-encrypted at rest keeps its
+# parameter usage/access flags in an encrypted ext-attr we hold no key for, so its
+# <Parameters> cannot be rebuilt; those emit nothing (the caller withholds when the
+# decoded AOI carries no parameters).
+_AOI_ENCODED_TYPE = "AddOnInstructionDefinition"
+
+# The AOI seal trailer inside ext-attr 0x1 ends with a u16 format-version word, the
+# u32 SignatureID, then zero padding to the attribute's end. These are the observed
+# seal versions; version 4 is a different (non-seal) descriptor and must not be read
+# as a signature. An unsealed definition carries the same trailer with a zero ID.
+_AOI_SEAL_VERSIONS = frozenset({5, 6})
+
+
+def aoi_seal_signature_id(a1: Optional[bytes]) -> Optional[str]:
+    """The AOI's seal @SignatureID (8 uppercase hex chars), or None if unsealed.
+
+    Located structurally, never by a fixed offset (the trailer sits at a
+    file-dependent position): the seal is ``[u16 version][u32 SignatureID][zero pad]``
+    at the end of ext-attr 0x1, with the version in ``_AOI_SEAL_VERSIONS``. A zero
+    SignatureID (the shape an unsealed definition carries) reads as None, so this
+    doubles as the sealed / not-sealed discriminator. A safety-signed AOI carries a
+    different (non-zero-tail) trailer and reads as None too -- correctly withheld,
+    since its wrapper would also need SafetySignature attributes we do not derive.
+    """
+    if a1 is None:
+        return None
+    end = len(a1)
+    while end > 0 and a1[end - 1] == 0:
+        end -= 1
+    # The SignatureID's high bytes may be zero, so its 4 bytes can end at or after
+    # the last non-zero byte; try each start whose preceding word is a seal version
+    # and whose following bytes are all zero.
+    for pos in range(end - 4, end + 1):
+        if pos < 2 or pos + 4 > len(a1):
+            continue
+        if int.from_bytes(a1[pos - 2:pos], "little") not in _AOI_SEAL_VERSIONS:
+            continue
+        if any(a1[pos + 4:]):
+            continue
+        sid = int.from_bytes(a1[pos:pos + 4], "little")
+        return f"{sid:08X}" if sid else None
+    return None
+
+
+def encryption_config_for_version(major: int) -> Optional[int]:
+    """The source-protection EXPORT EncryptionConfig for a Studio major revision, or
+    None to withhold.
+
+    USER-APPROVED version hardcode: EncryptionConfig is the source-protection export-
+    FORMAT version, a fixed property of the exporting Studio release. It is NOT stored
+    in the project (a project that protects nothing still carries a config), so for
+    the epochs whose at-rest descriptor is unreadable it can only be read from the
+    ACD's Studio version. The readable-descriptor epochs (cfg2 = V19, cfg3 = V20) are
+    derived structurally by ``source_protection_config`` instead; this covers the
+    force-encoded / encrypted-tail epochs. V30 is deliberately withheld -- it is the
+    sole ambiguous revision (cfg7 PackML library seals vs cfg9) with no structural
+    tell here -- and the V21..V27 epochs are absent from the reference corpus.
+    """
+    if major in (28, 29):
+        return 8
+    if major >= 31:
+        return 9
+    return None
+
+
+def encoded_aoi(aoi, config: Optional[int], signature_id: Optional[str],
+                signature_timestamp: Optional[str]) -> Optional[str]:
+    """The <EncodedData EncodedType="AddOnInstructionDefinition"> for a source-
+    protected AOI, or None to withhold.
+
+    The wrapper projects the AOI's own attributes onto the encoded whitelist (Name,
+    Class, Revision, RevisionExtension, Vendor, EditedDate, SoftwareRevision) -- the
+    AOI-only Execute*/Created*/EditedBy attributes are dropped -- and adds
+    EncodedType, EncryptionConfig, and the seal SignatureID/SignatureTimestamp. The
+    children are the AOI's plaintext Description/RevisionNote/AdditionalHelpText/
+    CustomProperties/Parameters in OEM order; its LocalTags and Routines (the
+    protected logic) are dropped. The encrypted blob is withheld.
+
+    Fail-closed: None unless the config resolves and the decoded AOI actually carries
+    its parameter interface (an at-rest-encrypted AOI decodes with none, and emitting
+    an empty <Parameters> would drop every parameter the reference keeps).
+    """
+    if config is None or not aoi.parameters:
+        return None
+
+    def esc(s):
+        return html.escape(str(s), quote=True)
+
+    attrs = [f'EncodedType="{_AOI_ENCODED_TYPE}"', f'Name="{esc(aoi.name)}"']
+    if aoi.cls is not None:
+        attrs.append(f'Class="{esc(aoi.cls)}"')
+    attrs.append(f'Revision="{esc(aoi.revision)}"')
+    if aoi.revision_extension is not None:
+        attrs.append(f'RevisionExtension="{esc(aoi.revision_extension)}"')
+    if aoi.vendor is not None:
+        attrs.append(f'Vendor="{esc(aoi.vendor)}"')
+    if signature_id is not None:
+        attrs.append(f'SignatureID="{signature_id}"')
+        if signature_timestamp:
+            attrs.append(f'SignatureTimestamp="{esc(signature_timestamp)}"')
+    attrs.append(f'EditedDate="{esc(aoi.edited_date)}"')
+    attrs.append(f'SoftwareRevision="{esc(aoi.software_revision)}"')
+    attrs.append(f'EncryptionConfig="{config}"')
+
+    kids = aoi._custom_properties or ""
+    if aoi._description:
+        kids += f'<Description>\n<![CDATA[{aoi._description}]]>\n</Description>'
+    if aoi._revision_note:
+        kids += f'<RevisionNote>\n<![CDATA[{aoi._revision_note}]]>\n</RevisionNote>'
+    if aoi._additional_help_text:
+        kids += (f'<AdditionalHelpText>\n<![CDATA['
+                 f'{aoi._additional_help_text}]]>\n</AdditionalHelpText>')
+    params = "".join(p.to_xml() for p in aoi.parameters
+                     if not getattr(p, "_l5x_exclude", False))
+    kids += f'<Parameters>{params}</Parameters>'
+    return f'<EncodedData {" ".join(attrs)}>\n{kids}</EncodedData>'

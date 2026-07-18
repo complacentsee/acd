@@ -44,7 +44,10 @@ from acd.l5x.base import (
 )
 from acd.l5x.encoded_data import (
     _WRAPPED_KEY_VERSION,
+    aoi_seal_signature_id,
+    encoded_aoi,
     encoded_routine,
+    encryption_config_for_version,
     keyhash_slot_readable,
     source_key_unwraps,
     source_protection_config,
@@ -1577,12 +1580,18 @@ class AOI(L5xElement):
     # Pre-rendered <CustomProperties> block ("" if none); the first child of the
     # AOI definition, before Description.
     _custom_properties: str = field(default="")
+    # A source-protected AOI Studio exports as an <EncodedData> blob rather than a
+    # plaintext <AddOnInstructionDefinition>; when set, this holds that pre-rendered
+    # element and to_xml returns it verbatim (mirrors Routine._encoded).
+    _encoded: Union[str, None] = field(default=None)
 
     def __post_init__(self):
         super().__post_init__()
         self._export_name = "AddOnInstructionDefinition"
 
     def to_xml(self) -> str:
+        if self._encoded is not None:
+            return self._encoded
         base = super().to_xml()
         idx = base.index(">")
         inject = self._custom_properties
@@ -6034,22 +6043,49 @@ class ControllerBuilder(L5xElementBuilder):
             # (distinct from AoiBuilder's internal tag/routine child enums).
             if result[1] in dead:
                 continue
-            # In faithful mode, a source-protected AOI is exported by Studio as an
-            # <EncodedData> blob, not a plaintext <AddOnInstructionDefinition>; skip
-            # it (the keyed ciphertext OEM emits is unrecoverable -> under-emit rather
-            # than fabricate). In the default recovery mode we keep the decoded
-            # plaintext definition (more useful for recovering the protected source).
-            if self._faithful and _aoi_is_source_protected(bytes(result[4])):
-                continue
-            _aoi_object_id = result[1]
-            aois.append(AoiBuilder(
-                self._cur, _aoi_object_id,
+            rec = bytes(result[4])
+            _aoi = AoiBuilder(
+                self._cur, result[1],
                 _data_types_map=data_types_map,
                 _short_header=self._short_header,
                 _taginfo_layout=self._taginfo_layout,
                 _short_routine_desc=short_routine_desc,
                 _acd_major=self._acd_major,
-            ).build())
+            ).build()
+            if self._faithful:
+                # A source-protected AOI is exported by Studio as an <EncodedData>
+                # blob, not a plaintext <AddOnInstructionDefinition>. When the AOI's
+                # interface is PLAINTEXT at rest -- force-encoded/sealed, or the
+                # readable-descriptor at-rest form -- we rebuild that blob's compared
+                # surface (wrapper attributes + plaintext children) from the decoded
+                # definition and drop the unreproducible, never-compared ciphertext.
+                # When it is unrecoverable (interface AES-encrypted at rest, or the
+                # export config is undetermined) we keep today's behaviour: emit
+                # nothing rather than a plaintext def OEM never wrote. Recovery mode
+                # always keeps the decoded plaintext definition.
+                a1 = _ext_attr01(rec)
+                sid = aoi_seal_signature_id(a1)
+                if sid is not None:
+                    # Sealed AOI: OEM force-encodes it; its interface is plaintext, so
+                    # the decoded definition carries the real parameters. The seal
+                    # epoch has no readable descriptor, so the config follows the
+                    # Studio version.
+                    _aoi._encoded = encoded_aoi(
+                        _aoi, encryption_config_for_version(self._acd_major),
+                        sid, _aoi.edited_date)
+                elif _aoi_is_source_protected(rec):
+                    # At-rest source-protected with a readable descriptor (the
+                    # padded/filled-slot form, whose interface stays plaintext): the
+                    # config is the descriptor's scheme. The encrypted-tail form has
+                    # no readable descriptor (config None) and decodes with an empty
+                    # interface (no parameters) -- encoded_aoi withholds both.
+                    _aoi._encoded = encoded_aoi(
+                        _aoi,
+                        source_protection_config(rec, a1, _AOI_KEYHASH_OFF),
+                        None, None)
+                    if _aoi._encoded is None:
+                        continue
+            aois.append(_aoi)
         return aois
 
     def _pass_modules(self, io_data_map):
