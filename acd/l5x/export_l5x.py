@@ -866,6 +866,69 @@ class ExportL5x:
         except Exception as exc:  # noqa: BLE001 - never block export
             log.warning("TagInfo layout parse failed, skipping value decode: {}", exc)
             self._taginfo_layout = {}
+        self._load_datatype_tables()
+
+    def _load_datatype_tables(self):
+        """Populate two side tables the FBD pin-name derivation reads:
+
+        ``datatype_members(datatype, ordinal, name, hidden)`` -- the ordered
+        member list of every datatype (from the TagInfo layout), and
+        ``tag_datatype(tagname, datatype)`` -- each tag's declared DataType
+        (from TagInfo <Tags>/<Programs>). Together with the operand comps
+        record's DataType OID (offset 0x2A) these let ``fbd_content`` derive a
+        function-block's VisiblePins names from its datatype members instead of
+        a hardcoded per-type table. Best-effort; empty tables just make the
+        pin-space decoders fail closed (no regression)."""
+        self._cur.execute(
+            "CREATE TABLE datatype_members(datatype text, ordinal int, "
+            "name text, hidden int)")
+        self._cur.execute(
+            "CREATE TABLE tag_datatype(tagname text, datatype text)")
+        try:
+            rows = []
+            for dt, members in self._taginfo_layout.items():
+                if dt.startswith("@size@") or not isinstance(members, list):
+                    continue
+                for i, m in enumerate(members):
+                    rows.append((dt, i, m[0], 1 if m[4] else 0))
+            self._cur.executemany(
+                "INSERT INTO datatype_members VALUES (?,?,?,?)", rows)
+            self._cur.executemany(
+                "INSERT INTO tag_datatype VALUES (?,?)",
+                self._parse_tag_datatype(
+                    os.path.join(self._temp_dir, "TagInfo.XML")))
+            self._cur.execute(
+                "CREATE INDEX idx_dtm ON datatype_members(datatype, ordinal)")
+            self._cur.execute(
+                "CREATE INDEX idx_tagdt ON tag_datatype(tagname)")
+            self._db.commit()
+        except Exception as exc:  # noqa: BLE001 - never block export
+            log.warning("datatype tables skipped: {}", exc)
+
+    @staticmethod
+    def _parse_tag_datatype(taginfo_path: str):
+        """[(tagname, datatype)] from TagInfo controller + program tag scopes."""
+        import xml.etree.ElementTree as ET
+        if not os.path.exists(taginfo_path):
+            return []
+        with open(taginfo_path, "rb") as fh:
+            root = ET.fromstring(fh.read().decode("utf-16", errors="replace"))
+        out = []
+        tags = root.find("Tags")
+        if tags is not None:
+            for t in tags.findall("Tag"):
+                if t.get("Name") and t.get("DataType"):
+                    out.append((t.get("Name"), t.get("DataType")))
+        progs = root.find("Programs")
+        if progs is not None:
+            for prog in progs.findall("Program"):
+                pts = prog.find("Tags")
+                if pts is None:
+                    continue
+                for t in pts.findall("Tag"):
+                    if t.get("Name") and t.get("DataType"):
+                        out.append((t.get("Name"), t.get("DataType")))
+        return out
 
     def _create_indexes(self):
         log.info("Creating indexes for fast object graph queries")

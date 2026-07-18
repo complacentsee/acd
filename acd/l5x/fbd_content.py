@@ -27,7 +27,34 @@ KIND2TYPE = {
     0x44: 'RAD', 0x48: 'ABS', 0x4d: 'COS', 0x4f: 'DIV', 0x52: 'MUL',
     0x55: 'SUB', 0x5b: 'TONR', 0x5d: 'GEQ', 0x5e: 'GRT', 0x5f: 'LEQ',
     0x63: 'NEQ',
+    # pin-space types: wide datatype-derived mask, not the VISIBLE_PIN_BITS u32
+    0x0b: 'TOT', 0x1b: 'PIDE', 0x29: 'PI', 0x58: 'CTUD',
 }
+PIDE_KIND = 0x1b
+
+# Pin-space FBD block types: their VisiblePins mask is a WIDE little-endian bit
+# array (base+9, or the PIDE prelude-keyed offset below), not the u32 at base+8
+# that VISIBLE_PIN_BITS decodes. Unlike the simpler blocks, their pin NAMES are
+# NOT tabled -- they are DERIVED from the block's own datatype member list in the
+# ACD (TagInfo/Comps), so the ~40-pin PIDE vocabulary and the PI/CTUD/TOT maps
+# come straight from the project. See _pins_from_mask / _datatype_pinmap.
+PINSPACE_TYPES = {'CTUD', 'PI', 'PIDE', 'TOT'}
+# Read-window bytes for the wide mask -- a generous upper bound. Trailing bytes
+# past the real mask are zero, and a set bit with no datatype member fails
+# closed, so an over-wide window only adds safety.
+PIN_MASK_BYTES = {'CTUD': 8, 'PI': 8, 'TOT': 8, 'PIDE': 24}
+# Hidden 'ulBoolInput<n>' input bit-collector members: the SECOND and later ones
+# each reserve one firmware pin slot ahead of the following pins (the only
+# structural "phantom" in the Logix FB pin numbering; the first collector and all
+# output collectors reserve nothing). This is a read over member NAMES -- a
+# derivation, not a per-type value. PIN_ULINPUT.match(name).group(1) -> n.
+PIN_ULINPUT = re.compile(r"^ulBoolInput(\d+)$")
+# PIDE's mask offset from base depends on the record generation, read off the
+# structure itself: the fixed prelude length = offset of the operand string
+# marker. V16-era records (prelude 48) start the mask at +12; the V20+/V31+
+# shape (prelude 76/80) at +9. Any other prelude is an unknown layout ->
+# fail closed.
+_PIDE_MASK_DELTA_BY_PRELUDE = {48: 12, 76: 9, 80: 9}
 
 VISIBLE_PIN_BITS = {
     'ABS': {10: 'Source', 12: 'Dest'},
@@ -80,7 +107,16 @@ WIRE_PARAM = {
     'SEL:S': {3: 'In1', 5: 'SelectorIn', 8: 'Out'},
     'SRTP:S': {1: 'EnableIn', 3: 'In', 10: 'MinHeatTime', 13: 'EnableOut', 15: 'HeatOut'},
     'SSUM:S': {3: 'In1', 5: 'Select1', 6: 'In2', 8: 'Select2', 9: 'In3', 11: 'Select3', 12: 'In4', 14: 'Select4', 15: 'In5', 17: 'Select5', 18: 'In6', 20: 'Select6', 21: 'In7', 23: 'Select7', 24: 'In8', 26: 'Select8', 30: 'Out'},
+    # legacy pairs observed in the corpus wire evidence
+    'ABS:L': {2: 'Source', 4: 'Dest'},
+    'DERV:L': {3: 'In', 5: 'ByPass', 12: 'Out'},
+    'DIV:L': {2: 'SourceA', 3: 'SourceB', 5: 'Dest'},
+    'LPF:L': {3: 'In', 13: 'Out'},
+    'SUB:L': {2: 'SourceA', 3: 'SourceB', 5: 'Dest'},
 }
+# NB: pin-space types (PIDE/PI/CTUD/TOT) are NOT in WIRE_PARAM -- their wire
+# param names are derived from the block's datatype pinmap (a wire index is a
+# pin bit), the same source as VisiblePins. See _wparam in _decode.
 
 TYPE_RANK = {'IRef': 0, 'ORef': 1, 'Block': 2, 'TextBox': 3}
 _TOK = re.compile(r"@([0-9a-fA-F]+)@")
@@ -89,6 +125,135 @@ _AMP = re.compile(r"^&([0-9a-fA-F]+)(.*)$")
 
 def _kind(r):
     return struct.unpack_from("<H", r, 16)[0] if len(r) >= 18 else -1
+
+
+def _operand_oid(er):
+    """object_id of the block operand's base tag (its first @<hex>@ token)."""
+    txt = _rawtext(er)
+    if not txt:
+        return None
+    m = _TOK.search(txt)
+    return int(m.group(1), 16) if m else None
+
+
+def _block_datatype(cur, operand_oid, operand_name):
+    """DataType name for a pin-space block operand, or None (fail closed).
+
+    Prefer the operand's OWN comps record (a unique object_id -- no cross-scope
+    name collision): its DataType OID at record offset 0x2A resolves to the
+    datatype's comp_name. Fall back to the tag_datatype map by base name when the
+    record is too short to carry 0x2A (some V36 tags), and there fail closed if
+    the name is ambiguous (maps to more than one datatype).
+    """
+    if operand_oid is not None:
+        row = cur.execute("SELECT record FROM comps WHERE object_id=?",
+                          (operand_oid,)).fetchone()
+        if row and row[0] is not None:
+            rb = bytes(row[0])
+            if len(rb) >= 0x2E:
+                dt_oid = struct.unpack_from("<I", rb, 0x2A)[0]
+                r2 = cur.execute(
+                    "SELECT comp_name FROM comps WHERE object_id=?",
+                    (dt_oid,)).fetchone()
+                if r2 and r2[0]:
+                    return r2[0]
+    if operand_name:
+        base = operand_name.split('.')[0].split('[')[0]
+        dts = cur.execute(
+            "SELECT DISTINCT datatype FROM tag_datatype WHERE tagname=?",
+            (base,)).fetchall()
+        if len(dts) == 1:
+            return dts[0][0]
+    return None
+
+
+def _datatype_pinmap(cur, datatype):
+    """{pin_bit: (member_name, hidden)} for a datatype, or None (no members).
+
+    pin_bit(member@ordinal) = ordinal + 1 + reserved, where reserved counts the
+    hidden ulBoolInput<n>=2..> members before it (each such second+ input
+    bit-collector reserves one firmware pin slot). Names and order come entirely
+    from the datatype member list, so no per-type pin table is needed.
+    """
+    rows = cur.execute(
+        "SELECT name, hidden FROM datatype_members WHERE datatype=? "
+        "ORDER BY ordinal", (datatype,)).fetchall()
+    if not rows:
+        return None
+    out = {}
+    reserved = 0
+    for i, (name, hidden) in enumerate(rows):
+        out[i + 1 + reserved] = (name, bool(hidden))
+        mm = PIN_ULINPUT.match(name or "")
+        if hidden and mm and int(mm.group(1)) >= 2:
+            reserved += 1
+    return out
+
+
+def _pins_from_mask(er, base, bt, pinmap):
+    """VisiblePins string for a pin-space block via its derived pinmap, or None.
+
+    Reads the wide little-endian mask at its per-generation offset and maps
+    ascending set bits through ``pinmap``; a set bit with no member, a bit that
+    maps to a hidden member, or an unknown PIDE prelude rejects the element.
+    """
+    delta = 9
+    if bt == 'PIDE':
+        j = er.find(b'\xff\xfe\xff')
+        if j < 0:
+            return None
+        delta = _PIDE_MASK_DELTA_BY_PRELUDE.get(j - base)
+        if delta is None:
+            return None
+    nb = PIN_MASK_BYTES[bt]
+    if len(er) < base + delta + nb:
+        return None
+    mask = int.from_bytes(er[base + delta:base + delta + nb], "little")
+    pins = []
+    for b in range(nb * 8):
+        if mask & (1 << b):
+            e = pinmap.get(b)
+            if e is None or e[1]:
+                return None
+            pins.append(e[0])
+    return " ".join(pins)
+
+
+def _pide_autotune(cur, eo):
+    """Resolve a PIDE block's AutotuneTag property child, or fail.
+
+    Returns (ok, name_or_None): the block may own at most ONE child -- a
+    kind-0x80 property record holding two strings, an operand reference
+    (empty => the property is unset) and the literal property name
+    ``AutotuneTag``. Anything else is an unknown shape -> (False, None).
+    """
+    kids = _rows(cur, eo)
+    if not kids:
+        return True, None
+    if len(kids) != 1:
+        return False, None
+    ko, kr = kids[0]
+    if _kind(kr) != 0x80 or _rows(cur, ko):
+        return False, None
+    j = kr.find(b'\xff\xfe\xff')
+    if j < 0 or len(kr) < j + 4:
+        return False, None
+    n = kr[j + 3]
+    if n == 0xFF:
+        return False, None
+    end = j + 4 + 2 * n
+    if len(kr) < end + 4 or kr[end:end + 3] != b'\xff\xfe\xff':
+        return False, None
+    n2 = kr[end + 3]
+    prop = kr[end + 4:end + 4 + 2 * n2].decode("utf-16-le", "replace")
+    if prop != 'AutotuneTag':
+        return False, None
+    if n == 0:
+        return True, None
+    name = _operand(cur, kr)
+    if name is None:
+        return False, None
+    return True, name
 
 
 def _rows(cur, pid):
@@ -217,27 +382,45 @@ def _decode(cur, oid, sh, size, orient, tbtext):
                 bt = KIND2TYPE[k]
                 if bt in FAM_OK and fam not in FAM_OK[bt]:
                     return None
-                if _has_children(cur, eo):
+                autotune = None
+                if bt == 'PIDE':
+                    ok, autotune = _pide_autotune(cur, eo)
+                    if not ok:
+                        return None
+                elif _has_children(cur, eo):
                     return None
                 op = _operand(cur, er)
                 if op is None:
                     return None
                 x = struct.unpack_from("<I", er, base)[0]
                 y = struct.unpack_from("<I", er, base + 4)[0]
-                moff = base + MASK_DELTA.get(bt, 8)
-                if len(er) < moff + 4:
-                    return None
-                mask = struct.unpack_from("<I", er, moff)[0]
-                tab = VISIBLE_PIN_BITS.get(bt)
-                if tab is None:
-                    return None
-                pins = []
-                for b in range(32):
-                    if mask & (1 << b):
-                        if b not in tab:
-                            return None
-                        pins.append(tab[b])
-                elems.append([eo, 'Block', x, y, op, " ".join(pins), bt])
+                pinmap = None
+                if bt in PINSPACE_TYPES:
+                    dt = _block_datatype(cur, _operand_oid(er), op)
+                    if dt is None:
+                        return None
+                    pinmap = _datatype_pinmap(cur, dt)
+                    if pinmap is None:
+                        return None
+                    pins_str = _pins_from_mask(er, base, bt, pinmap)
+                    if pins_str is None:
+                        return None
+                else:
+                    moff = base + MASK_DELTA.get(bt, 8)
+                    if len(er) < moff + 4:
+                        return None
+                    mask = struct.unpack_from("<I", er, moff)[0]
+                    tab = VISIBLE_PIN_BITS.get(bt)
+                    if tab is None:
+                        return None
+                    pins = []
+                    for b in range(32):
+                        if mask & (1 << b):
+                            if b not in tab:
+                                return None
+                            pins.append(tab[b])
+                    pins_str = " ".join(pins)
+                elems.append([eo, 'Block', x, y, op, pins_str, bt, autotune, pinmap])
             else:
                 return None
 
@@ -262,15 +445,25 @@ def _decode(cur, oid, sh, size, orient, tbtext):
         return ('<FBDContent SheetSize=%s SheetOrientation=%s>\n<Sheet Number="1"/>\n</FBDContent>'
                 % (quoteattr(size), quoteattr(orient)))
 
-    es = sorted(elems, key=lambda e: (TYPE_RANK[e[1]], e[4] if e[4] is not None else '', e[2], e[3]))
+    # ID assignment order: type rank, then the Block TYPE name, then operand,
+    # then position. The type-name component is load-bearing: OEM orders a
+    # MUL before a PIDE even when the PIDE's operand sorts first (corpus:
+    # 116/116 routines consistent; operand-only ordering broke on exactly
+    # that shape). Non-Block elements contribute '' so their order is
+    # unchanged.
+    def _idkey(e):
+        return (TYPE_RANK[e[1]], e[6] if e[1] == 'Block' else '',
+                e[4] if e[4] is not None else '', e[2], e[3])
+    es = sorted(elems, key=_idkey)
     keys = set()
     for e in es:
-        key = (TYPE_RANK[e[1]], e[4] if e[4] is not None else '', e[2], e[3])
+        key = _idkey(e)
         if key in keys:
             return None
         keys.add(key)
     idmap = {e[0]: i for i, e in enumerate(es)}
     etype = {e[0]: (e[1], e[6]) for e in es}
+    epin = {e[0]: (e[8] if len(e) > 8 else None) for e in es}
 
     el_xml = []
     for i, e in enumerate(es):
@@ -279,8 +472,10 @@ def _decode(cur, oid, sh, size, orient, tbtext):
             el_xml.append('<%s ID="%d" X="%d" Y="%d" Operand=%s HideDesc="false"/>'
                           % (typ, i, e[2], e[3], quoteattr(e[4])))
         elif typ == 'Block':
-            el_xml.append('<Block Type="%s" ID="%d" X="%d" Y="%d" Operand=%s VisiblePins=%s HideDesc="false"/>'
-                          % (e[6], i, e[2], e[3], quoteattr(e[4]), quoteattr(e[5])))
+            at = ' AutotuneTag=%s' % quoteattr(e[7]) \
+                if len(e) > 7 and e[7] else ''
+            el_xml.append('<Block Type="%s" ID="%d" X="%d" Y="%d" Operand=%s VisiblePins=%s HideDesc="false"%s/>'
+                          % (e[6], i, e[2], e[3], quoteattr(e[4]), quoteattr(e[5]), at))
         elif typ == 'TextBox':
             el_xml.append('<TextBox ID="%d" X="%d" Y="%d" Width="0"><Text><![CDATA[%s]]></Text></TextBox>'
                           % (i, e[2], e[3], e[6]))
@@ -297,24 +492,38 @@ def _decode(cur, oid, sh, size, orient, tbtext):
             if fo not in idmap or to not in idmap:
                 return None
             wires.append((fo, fp, to, tp))
+    def _wparam(bt, idx, pinmap):
+        # A pin-space block's wire index is its pin bit -- resolve through the
+        # same datatype-derived pinmap as VisiblePins; other blocks use the
+        # tabled WIRE_PARAM. Fail closed on an unknown / hidden index.
+        if pinmap is not None:
+            e = pinmap.get(idx)
+            return None if e is None or e[1] else e[0]
+        return WIRE_PARAM.get("%s:%s" % (bt, fam), {}).get(idx)
+
     resolved = []
     for fo, fp, to, tp in wires:
         fattr = tattr = ""
+        fname = tname = ""
         ft, fbt = etype[fo]
         tt, tbt = etype[to]
         if ft == 'Block':
-            nm = WIRE_PARAM.get("%s:%s" % (fbt, fam), {}).get(fp)
-            if nm is None:
+            fname = _wparam(fbt, fp, epin.get(fo))
+            if fname is None:
                 return None
-            fattr = ' FromParam="%s"' % nm
+            fattr = ' FromParam="%s"' % fname
         if tt == 'Block':
-            nm = WIRE_PARAM.get("%s:%s" % (tbt, fam), {}).get(tp)
-            if nm is None:
+            tname = _wparam(tbt, tp, epin.get(to))
+            if tname is None:
                 return None
-            tattr = ' ToParam="%s"' % nm
-        resolved.append((idmap[fo], idmap[to], fattr, tattr))
-    wire_xml = ['<Wire FromID="%d"%s ToID="%d"%s/>' % (fid, fa, tid, ta)
-                for fid, tid, fa, ta in sorted(resolved, key=lambda w: (w[0], w[1]))]
+            tattr = ' ToParam="%s"' % tname
+        resolved.append((idmap[fo], idmap[to], fattr, tattr, fname, tname))
+    # Same-endpoint wire pairs (several wires between one element pair) are
+    # ordered ALPHABETICALLY by param name -- corpus: OEM lists DevDeadband,
+    # ProgAutoReq, ProgProgReq (names ordered; their pin indices 61, 67, 64
+    # are not), and DevHLimit before DevLLimit.
+    wire_xml = ['<Wire FromID="%d"%s ToID="%d"%s/>' % (w[0], w[2], w[1], w[3])
+                for w in sorted(resolved, key=lambda w: (w[0], w[1], w[4], w[5]))]
 
     att = []
     for go in ags:
