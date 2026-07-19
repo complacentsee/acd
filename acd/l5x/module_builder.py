@@ -63,6 +63,36 @@ _NM_PORT_COLLECTION_KIND = 0x836
 _NM_SIZED_BUS_KINDS = frozenset({0x837, 0x83A, 0x83D, 0x83F, 0x85F, 0x860})
 
 
+def _controlnet_keeper(cur, config_ref, short_header) -> int:
+    """The ControlNet keeper CRC (u32) for a CN scanner, or 0.
+
+    The scanner's config_ref (identity e1[0x20:0x24]) links to a value-backing
+    RxDataCollection record by main_record@0x28 (record[54:58]). That record's
+    ext-attr 0x66 config image is [u32 len][u32 type][payload]; a ControlNet
+    connection config is type 3 with img[8]==0x05 and the keeper u32 at
+    img[9:13]. config_ref 0 (unscheduled), no match, or disagreeing keepers
+    all yield 0 -- the value OEM emits for an unscheduled network. NOT gated on
+    type-3/0x05 alone: every connection carries a type-3 image (non-keeper ones
+    hold 0x00000001); the config_ref link is what isolates the ControlNet one.
+    """
+    if not config_ref:
+        return 0
+    vals = []
+    for (rec,) in cur.execute(
+            "SELECT c.record FROM comps c JOIN comps p "
+            "ON c.parent_id = p.object_id "
+            "WHERE p.comp_name = 'RxDataCollection'").fetchall():
+        rec = bytes(rec) if rec else b""
+        if len(rec) < 58 or struct.unpack_from("<I", rec, 54)[0] != config_ref:
+            continue
+        img = CompsRecord.read_value_attrs(
+            rec, short_header, body_mode=True).get(0x66)
+        if (img and len(img) >= 13 and img[4:8] == b"\x03\x00\x00\x00"
+                and img[8] == 0x05):
+            vals.append(struct.unpack_from("<I", img, 9)[0])
+    return vals[0] if len(set(vals)) == 1 else 0
+
+
 def _nm_kind(rec: bytes) -> Union[int, None]:
     """The class id of a nameless record (u16 @ 0x10), or None if too short."""
     return struct.unpack_from("<H", rec, 0x10)[0] if len(rec) >= 0x12 else None
@@ -209,6 +239,11 @@ class Module(L5xElement):
     _ud_minor: Union[int, None] = field(default=None)
     _ud_catalog_number: Union[str, None] = field(default=None)
     _shutdown_parent_on_fault: Union[str, None] = field(default=None)
+    # ControlNet keeper signature (u32) for a CN scanner (a module with a
+    # DOWNSTREAM ControlNet port); None on every other module (attribute
+    # omitted). 0 is a valid emitted value: an unscheduled network still
+    # exports 16#0000_0000.
+    _controlnet_signature: Union[int, None] = field(default=None)
 
     def __post_init__(self):
         super().__post_init__()
@@ -262,6 +297,13 @@ class Module(L5xElement):
         # reference never writes CatalogNumber="" (0 occurrences pool-wide).
         cat_attr = (f'CatalogNumber="{self.catalog_number}" '
                     if self.catalog_number else '')
+        # @ControlNetSignature (CN scanner modules only) follows MajorFault:
+        # the keeper CRC rendered as two u16 halves; 0 -> 16#0000_0000.
+        cnet_attr = ""
+        if self._controlnet_signature is not None:
+            _cv = self._controlnet_signature
+            cnet_attr = (f' ControlNetSignature='
+                         f'"16#{(_cv >> 16) & 0xffff:04x}_{_cv & 0xffff:04x}"')
         attrs = (
             f'{name_attr}'
             f'{cat_attr}'
@@ -273,7 +315,7 @@ class Module(L5xElement):
             f'ParentModule="{self.parent_module}" '
             f'ParentModPortId="{self.parent_mod_port_id}" '
             f'Inhibited="{self.inhibited}" '
-            f'MajorFault="{self.major_fault}"{shutdown_attr}{dxid_attr}'
+            f'MajorFault="{self.major_fault}"{cnet_attr}{shutdown_attr}{dxid_attr}'
             f'{safety_attr}{udcn_attr}{autodiags_attr}'
         )
 
@@ -1948,6 +1990,16 @@ class ModuleBuilder(L5xElementBuilder):
         ports_override = self._ports_from_data_collection(
             data_link, validate_controller=(is_root or name in ("Local", "Local2")))
 
+        # @ControlNetSignature: emitted only on a CN scanner -- a module with a
+        # DOWNSTREAM ControlNet port (Type/Upstream are adjacent in the rendered
+        # tag, so the substring is per-port exact). Value = the keeper CRC in
+        # the type-3/0x05 config image reached by config_ref; config_ref 0
+        # (unscheduled) or an unresolvable keeper -> 0, which OEM still emits.
+        cnet_sig = None
+        if ('Type="ControlNet" Upstream="false"' in (ports_override or "")):
+            cnet_sig = _controlnet_keeper(
+                self._cur, mi.config_ref, self._short_header)
+
         # SafetyEnabled="true" iff the module owns a safety connection (a
         # SafetyInput/SafetyOutput/*Safety* connection record under its
         # RxMapConnectionCollection). Non-safety modules omit the attribute.
@@ -2129,4 +2181,5 @@ class ModuleBuilder(L5xElementBuilder):
             _ud_minor=ud_minor,
             _ud_catalog_number=ud_catalog_number,
             _shutdown_parent_on_fault=shutdown_parent_on_fault,
+            _controlnet_signature=cnet_sig,
         )
