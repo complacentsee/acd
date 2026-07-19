@@ -2704,6 +2704,31 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
         )
 
 
+def _axis_sched_class(modid, gcid, known_modids, grp_cids) -> str:
+    """Classify one AXIS_CIP_DRIVE record for the MotionSync RPI pass.
+
+    'scheduled'  -- the axis links a known drive (modid) and its group cid
+                    names a MOTION_GROUP, or the group image was unreadable
+                    (fail toward scheduled: never a wrong RPI 0);
+    'ungrouped'  -- links a known drive but the readable group cid names no
+                    group (the drive stays unscheduled unless another of its
+                    axes schedules it);
+    'unassigned' -- modid 0 with a readable not-in-any-group cid: a fully
+                    unassigned axis, a resolved state that must not void the
+                    pass's completeness gate;
+    'unresolved' -- anything else (unknown nonzero modid, unreadable record,
+                    modid 0 whose cid claims a group): the layout cannot be
+                    trusted for this file and the caller aborts the pass.
+    """
+    if modid in known_modids:
+        if gcid is None or gcid in grp_cids:
+            return "scheduled"
+        return "ungrouped"
+    if modid == 0 and gcid is not None and gcid not in grp_cids:
+        return "unassigned"
+    return "unresolved"
+
+
 def _program_tag_usage(ext01: bytes) -> Union[str, None]:
     """Return the @Usage of a long-header PROGRAM-scope tag from its ext-attr 0x01
     blob, or None (no @Usage attribute). The flag shares the same byte the AOI
@@ -6556,18 +6581,23 @@ class ControllerBuilder(L5xElementBuilder):
             pass
 
     def _pass_motion_sync(self, tags, programs, modules):
-        # CIP Motion: a 2094-family integrated-motion drive (ProductType 37) exports
-        # its MotionSync connection with RPI 0 when the drive is UNSCHEDULED -- when
-        # it owns no axis, OR its axis is not assigned to a motion group. A scheduled
-        # drive keeps the connection blob's RPI (the group's coarse update period).
-        # Two record fields decide it, both on the AXIS_CIP_DRIVE tag's data-table
-        # record: the drive modid (u32 at full-payload offset 250 = body 102 on the
-        # long header) links the axis to its module, and the axis' group assignment
-        # (u16 at offset 8 of the record's ext-attr 0x1 value image) names its motion
-        # group -- 0, or a cid no MOTION_GROUP tag carries, means unassigned. Only act
-        # when EVERY axis' modid resolves to a known module (that confirms the layout
-        # for this project); an unreadable group image counts the axis as scheduled,
-        # so a drive that really is grouped is never wrongly zeroed. Long-header only.
+        # CIP Motion: an integrated-motion drive (ProductType 37 = 2094 family,
+        # 45 = Kinetix 5700 dual-axis) exports its MotionSync connection with
+        # RPI 0 when the drive is UNSCHEDULED -- when it owns no axis, OR no
+        # axis of its is assigned to a motion group. A scheduled drive keeps
+        # the connection blob's RPI (the group's coarse update period). Two
+        # record fields decide it, both on the AXIS_CIP_DRIVE tag's data-table
+        # record: the drive modid (u32 at full-payload offset 250 = body 102 on
+        # the long header) links the axis to its module, and the axis' group
+        # assignment (u16 at offset 8 of the record's ext-attr 0x1 value image)
+        # names its motion group -- 0, or a cid no MOTION_GROUP tag carries,
+        # means ungrouped. Only act when every axis' state RESOLVES (see
+        # _axis_sched_class: modid a known module, or the fully-unassigned
+        # modid-0/ungrouped state); any unresolvable axis means the layout
+        # cannot be trusted for this file and the whole pass aborts. An
+        # unreadable group image on a linked axis counts as scheduled, so a
+        # drive that really is grouped is never wrongly zeroed. Long-header
+        # only.
         try:
             if not self._short_header:
                 _axis_tags = [t for t in tags if (t.data_type or "") == "AXIS_CIP_DRIVE"]
@@ -6595,20 +6625,21 @@ class ControllerBuilder(L5xElementBuilder):
                     _buf = bytes(_arow[0]) if _arow and _arow[0] else b""
                     _cand = (struct.unpack_from("<I", _buf, 102)[0]
                              if len(_buf) >= 106 else None)
-                    if _cand not in _known:
-                        _complete = False
-                        continue
-                    _vb = CompsRecord.read_value_attrs(
+                    _vb = (CompsRecord.read_value_attrs(
                         _buf, self._short_header, full=True,
                         body_mode=True).get(0x01)
-                    # Fail toward scheduled (keep the blob RPI) on an unreadable
-                    # image -- never emit a wrong 0.
-                    if (_vb is None or len(_vb) < 10
-                            or struct.unpack_from("<H", _vb, 8)[0] in _grp_cids):
+                        if len(_buf) >= 106 else None)
+                    _gcid = (struct.unpack_from("<H", _vb, 8)[0]
+                             if _vb is not None and len(_vb) >= 10 else None)
+                    _cls = _axis_sched_class(_cand, _gcid, _known, _grp_cids)
+                    if _cls == "scheduled":
                         _scheduled.add(_cand)
+                    elif _cls == "unresolved":
+                        _complete = False
                 if _complete:
                     for _m in modules:
-                        if _m._product_type == 37 and _m._modid and _m._modid not in _scheduled:
+                        if (_m._product_type in (37, 45)
+                                and _m._modid and _m._modid not in _scheduled):
                             for _c in _m._connections:
                                 if _c.get("type") == "MotionSync":
                                     _c["rpi"] = "0"
