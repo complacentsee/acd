@@ -18,6 +18,7 @@ from acd.l5x.base import (
     L5xElementBuilder,
     own_data_exchange_id,
     own_description,
+    resolve_at_tokens,
     safety_signature_row,
     short_own_description,
 )
@@ -1279,11 +1280,15 @@ class ModuleBuilder(L5xElementBuilder):
                 if _nb is not None:
                     bus = str(_nb)
             addr_attr = f' Address="{addr}"' if addr else ""
-            # SafetyNetwork (safety modules only) follows Upstream, matching OEM.
+            # Width (blob-verbatim; witnessed on safety controller/partner ICP
+            # ports) follows Upstream; SafetyNetwork (safety modules only)
+            # follows Width -- both matching OEM attribute order.
+            _w = a.get("Width")
+            w_attr = f' Width="{_w}"' if _w is not None else ""
             _snv = port_sn.get(_pidi)
             sn_attr = f' SafetyNetwork="{_snv}"' if _snv else ""
             head = (f'<Port Id="{pid}"{addr_attr} Type="{ptype}" '
-                    f'Upstream="{upstream}"{sn_attr}')
+                    f'Upstream="{upstream}"{w_attr}{sn_attr}')
             if bus is None:
                 ports.append((_pidi, f"{head}/>\n"))
             elif bus == "":
@@ -1340,6 +1345,14 @@ class ModuleBuilder(L5xElementBuilder):
         # Hex-encoded names like $02cc5e9d$ are unnamed peripheral modules (drive expansion
         # cards, etc.).  Logix Designer exports these with Name="?".
         name = "?" if (db_name.startswith("$") and db_name.endswith("$")) else db_name
+        # A comp name embedding an @<hex>@ token (a safety PARTNER module --
+        # the token is the root controller comp's object id) renders with the
+        # token resolved to that comp's name: OEM writes '<Controller>:Partner'.
+        # Fail-closed: any unresolvable token keeps the raw name unchanged.
+        if "@" in name and name != "?":
+            _rn = resolve_at_tokens(self._cur, db_name)
+            if _rn:
+                name = _rn
 
         # Identity recovery chain (truncated-record parse -> inline 44 02 00 00
         # marker alias -> the untruncated comps.record body), shared with the
@@ -1963,7 +1976,14 @@ class ModuleBuilder(L5xElementBuilder):
                     _v >>= 16
                 drives_adc_enabled = "true" if (_v & 0x40) else "false"
                 drives_adc_mode = "true" if (_v & 0x02) else "false"
-            if _fmi.safety_network is not None and _fmi.safety_network[5] != 0:
+            # A safety PARTNER module (the Studio-generated ':Partner' name --
+            # ':' is impossible in a user identifier) carries an ALL-ZERO SNN
+            # that OEM still emits; on every other module a zero SNN means the
+            # attribute is absent (class 0x900 non-partners exist with zero SNN
+            # and OEM omits it there, so the class word is NOT the gate).
+            if _fmi.safety_network is not None and (
+                    _fmi.safety_network[5] != 0
+                    or name.endswith(":Partner")):
                 _be = _fmi.safety_network[::-1].hex()
                 safety_network = f"16#0000_{_be[0:4]}_{_be[4:8]}_{_be[8:12]}"
         except Exception:

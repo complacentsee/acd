@@ -93,3 +93,17 @@ def test_context_dependent_types_kept_verbatim():
     # PointIO / RhinoBP are correct on hundreds of ports and must NOT be expanded.
     out = decode('<in><Port Id="1" Type="PointIO"/></in>')
     assert 'Type="PointIO"' in out
+
+
+def test_width_passes_through_between_upstream_and_safety_network():
+    sn = "16#0000_0000_0000_0000"
+    out = decode('<in><Port Id="1" Type="ICP" Addr="1" Width="0" '
+                 'Ups="False"/></in>', {1: sn})
+    assert ' Width="0"' in out
+    assert out.index("Upstream=") < out.index("Width=")
+    assert out.index("Width=") < out.index("SafetyNetwork=")
+
+
+def test_width_absent_is_omitted():
+    out = decode('<in><Port Id="1" Type="ICP" Addr="0"/></in>')
+    assert "Width" not in out
