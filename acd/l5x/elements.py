@@ -1728,7 +1728,8 @@ class Controller(L5xElement):
     comm_path: Union[str, None]  # None if not set (omitted from XML)
     project_sn: str
     match_project_to_controller: str
-    can_use_rpi_from_producer: str
+    # None omits the attribute (the short classic blob does not carry it).
+    can_use_rpi_from_producer: Union[str, None]
     inhibit_automatic_firmware_update: str
     pass_through_configuration: str
     download_project_documentation_and_extended_properties: str
@@ -5585,10 +5586,23 @@ class ControllerBuilder(L5xElementBuilder):
             # DataTablePadPercentage = u16 @ 18 (a per-controller value, 50 or 0).
             io_memory_pad_percentage = str(_props.io_memory_pad)
             data_table_pad_percentage = str(_props.data_table_pad)
-        # CompatibilityMode "V20.01" marks the pre-V21 classic save format, whose
-        # controller-properties blob is exactly 62 bytes.
+        # CompatibilityMode marks the pre-V21 classic save format, whose
+        # controller-properties blob is exactly 62 bytes. The service level is
+        # presence-keyed: a LIVE MinorRevCompat record (an RxERRDCollection
+        # child, not FDFD-dead) marks the V20.03 save; its absence is V20.01.
         if _props.size == 62:
             compatibility_mode = "V20.01"
+            try:
+                _dead = CompsRecord.dead_oids(self._cur, self._short_header)
+                _mrc = self._cur.execute(
+                    "SELECT c.object_id FROM comps c "
+                    "JOIN comps p ON c.parent_id = p.object_id "
+                    "WHERE c.comp_name='MinorRevCompat' "
+                    "AND p.comp_name='RxERRDCollection'").fetchall()
+                if any(_r[0] not in _dead for _r in _mrc):
+                    compatibility_mode = "V20.03"
+            except Exception:
+                pass
         # EtherNetIPMode: ext-attr 0x7c is a u16 dual-port mode index on 5x80
         # controllers (1 -> Dual-IP, 2 -> Linear/DLR).
         _eth = _ctlattrs.get(0x7C)
@@ -6432,9 +6446,25 @@ class ControllerBuilder(L5xElementBuilder):
         _fw = int(major_rev) if str(major_rev).isdigit() else 0
         _v24_plus = is_5x80 or self._acd_major >= 24
         _v28_plus = is_5x80 or _fw >= 28
-        pass_through = "EnabledWithAppend" if _v24_plus else None
-        download_docs = "true" if _v24_plus else None
-        download_custom = "true" if _v28_plus else None
+        # PassThroughConfiguration: ControllerProps blob byte 46 (0=Disabled,
+        # 3=EnabledWithAppend; other values are unwitnessed and keep the
+        # legacy default). DownloadProjectDocumentationAndExtendedProperties /
+        # DownloadProjectCustomProperties: blob byte 49 bits 7/6, set = the
+        # setting is OFF ("false"). The corpus only witnesses the two bits
+        # moving together (0x00 / 0xc0), so the 7-vs-6 assignment between the
+        # two attributes is by convention; either scores identically.
+        if _v24_plus:
+            _ptb = _ctlblob[46] if len(_ctlblob) > 46 else None
+            pass_through = {0: "Disabled", 3: "EnabledWithAppend"}.get(
+                _ptb, "EnabledWithAppend")
+        else:
+            pass_through = None
+        download_docs = (
+            ("false" if (len(_ctlblob) > 49 and (_ctlblob[49] & 0x80))
+             else "true") if _v24_plus else None)
+        download_custom = (
+            ("false" if (len(_ctlblob) > 49 and (_ctlblob[49] & 0x40))
+             else "true") if _v28_plus else None)
         # ReportMinorOverflow is a per-controller bit: byte 70 (bit 0) of the
         # ControllerProps blob -- the first byte after the 8-byte 0xFF landmark,
         # mirroring the AutoDiags byte-135 read below. Fail-closed: a short or
@@ -6882,8 +6912,17 @@ class ControllerBuilder(L5xElementBuilder):
             sfc_last_scan,
             comm_path,
             project_sn,
-            "false",        # MatchProjectToController
-            "false",        # CanUseRPIFromProducer
+            # MatchProjectToController: bit 0 of ControllerProps blob byte 24;
+            # a short or protected blob keeps the "false" default.
+            ("true" if (len(_ctlblob) > 24 and (_ctlblob[24] & 1))
+             else "false"),
+            # CanUseRPIFromProducer: bit 0 of blob byte 45. The short classic
+            # blob (<=45 bytes) does not carry the setting and the reference
+            # omits the attribute there; an unreadable (empty) blob keeps the
+            # "false" default.
+            (("true" if (_ctlblob[45] & 1) else "false")
+             if len(_ctlblob) > 45
+             else (None if len(_ctlblob) > 0 else "false")),
             # InhibitAutomaticFirmwareUpdate: byte 27 (bit 0) of the ControllerProps
             # blob (ext-attr 0x1); fail-closed to "0" on a short/protected blob.
             ("1" if (len(_ctlblob) > 27 and (_ctlblob[27] & 1)) else "0"),
