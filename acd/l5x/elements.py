@@ -1793,6 +1793,11 @@ class Controller(L5xElement):
     _ts_priority2: str = field(default="128")
     # <CST MasterID>, read from the controller's CST config record. Default "0".
     _cst_master_id: str = field(default="0")
+    # <WallClockTime> attributes from the controller's WallClockTime config
+    # record (RxControllerCollection child): TimeZone = u16@8,
+    # LocalTimeAdjustment = u16@18 of ext-attr 0x1. Defaults 0/0 when absent.
+    _wct_local_time_adjustment: str = field(default="0")
+    _wct_time_zone: str = field(default="0")
     # Pre-rendered controller communication port elements (see
     # acd.l5x.controller_ports): <CommPorts> sits immediately before <CST>;
     # <InternetProtocol>, <EthernetPorts> and <EthernetNetwork> follow
@@ -1887,7 +1892,9 @@ class Controller(L5xElement):
             + self._alarm_definitions
             + self._comm_ports_xml
             + f'<CST MasterID="{self._cst_master_id}"/>'
-            + '<WallClockTime LocalTimeAdjustment="0" TimeZone="0"/>'
+            + (f'<WallClockTime LocalTimeAdjustment='
+               f'"{self._wct_local_time_adjustment}" '
+               f'TimeZone="{self._wct_time_zone}"/>')
             + self._trends_xml
             + ('<DataLogs/>' if self._emit_data_logs else '')
             + (f'<TimeSynchronize Priority1="{self._ts_priority1}" '
@@ -5599,6 +5606,7 @@ class ControllerBuilder(L5xElementBuilder):
         # mismatch, priorities byte-exact). Defaults stay true/128/128 when absent.
         ts_ptp_enable, ts_priority1, ts_priority2 = "true", "128", "128"
         cst_master_id = "0"
+        wct_lta, wct_tz = "0", "0"
 
         def _rcc_attr(child):
             _rcc = self._cur.execute(
@@ -5623,9 +5631,21 @@ class ControllerBuilder(L5xElementBuilder):
             _cb = _rcc_attr("CST")
             if len(_cb) >= 16:
                 cst_master_id = str(struct.unpack_from("<H", _cb, 14)[0])
+            # WallClockTime: TimeZone = u16@8, LocalTimeAdjustment = u16@18 of
+            # the WallClockTime record's 0x1 attribute (a 181-byte image,
+            # layout constant V17-V37 corpus-wide). LTA is witnessed only 0/1;
+            # any other value keeps both defaults (fail-closed on an unknown
+            # layout rather than fabricating a timezone).
+            _wb = _rcc_attr("WallClockTime")
+            if len(_wb) >= 20:
+                _lta = struct.unpack_from("<H", _wb, 18)[0]
+                if _lta in (0, 1):
+                    wct_lta = str(_lta)
+                    wct_tz = str(struct.unpack_from("<H", _wb, 8)[0])
         except Exception:
             pass
-        return ts_ptp_enable, ts_priority1, ts_priority2, cst_master_id
+        return (ts_ptp_enable, ts_priority1, ts_priority2, cst_master_id,
+                wct_lta, wct_tz)
 
     def _pass_data_types(self):
         # Get the data types
@@ -6797,7 +6817,8 @@ class ControllerBuilder(L5xElementBuilder):
         self._object_id = results[0][1]
         controller_name = results[0][0]
 
-        ts_ptp_enable, ts_priority1, ts_priority2, cst_master_id = self._pass_time_sync_cst()
+        (ts_ptp_enable, ts_priority1, ts_priority2, cst_master_id,
+         wct_lta, wct_tz) = self._pass_time_sync_cst()
         data_types, data_types_map = self._pass_data_types()
         tags, io_data_map, alarm_map, short_routine_desc, _ctrl_tags_sig = \
             self._pass_controller_tags(data_types_map)
@@ -6887,6 +6908,8 @@ class ControllerBuilder(L5xElementBuilder):
             _ts_priority1=ts_priority1,
             _ts_priority2=ts_priority2,
             _cst_master_id=cst_master_id,
+            _wct_local_time_adjustment=wct_lta,
+            _wct_time_zone=wct_tz,
             _root_signature=root_sig,
             _ctrl_attr_signature=ctrl_attr_sig,
             _tag_map_signature=tag_map_sig,
