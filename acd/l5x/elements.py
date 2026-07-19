@@ -54,6 +54,7 @@ from acd.l5x.encoded_data import (
 )
 from acd.l5x.connections import (
     _DESC_BLOCK_RE,
+    _FORCE_BLOCK_RE,
     _build_config_holders,
     _build_connection_map,
     _build_consume_map,
@@ -1210,9 +1211,19 @@ class Tag(L5xElement):
             try:
                 # <ForceData> for an I/O tag with installed forces sits between
                 # the flat value block and the Decorated tree (the order Logix
-                # uses).
-                force_xml = (f'<ForceData>{self._force_data}</ForceData>'
-                             if self._force_data else '')
+                # uses). The raw-hex era writes the hex form; the L5K era
+                # writes a Format="L5K" CDATA bracket list of the blob bytes as
+                # SIGNED i8 decimals (wrapped by the root L5K post-pass).
+                if self._force_data and not self._raw_hex_data:
+                    _fb = bytes.fromhex(self._force_data.replace(" ", ""))
+                    _fl = ",".join(str(b - 256 if b > 127 else b)
+                                   for b in _fb)
+                    force_xml = (f'<ForceData Format="L5K">\n'
+                                 f'<![CDATA[[{_fl}]]]>\n</ForceData>')
+                elif self._force_data:
+                    force_xml = f'<ForceData>{self._force_data}</ForceData>'
+                else:
+                    force_xml = ''
                 _fmask, _fval = self._force_images()
                 data_xml = _render_value_blocks(
                     "Data", self.data_type, self.dimensions, self._value_bytes,
@@ -1940,7 +1951,8 @@ class Controller(L5xElement):
 # wrapped: the reference wraps tag-value L5K lists (4216 blocks) but never wraps
 # AOI <DefaultData Format="L5K"> (5841 blocks, 0 wrapped), so those stay single-line.
 _L5K_CDATA_RE = re.compile(
-    r'(<Data\b[^>]*\bFormat="L5K"[^>]*>\s*<!\[CDATA\[)(.*?)(\]\]>)',
+    r'(<(?:Data|ForceData)\b[^>]*\bFormat="L5K"[^>]*>\s*<!\[CDATA\[)'
+    r'(.*?)(\]\]>)',
     re.S,
 )
 
@@ -5914,9 +5926,40 @@ class ControllerBuilder(L5xElementBuilder):
                         except Exception:
                             _fv = None
                         if _fv and len(_fv) == 4:
-                            _fimg = force_pool.get(struct.unpack("<I", _fv)[0])
+                            _hoid = struct.unpack("<I", _fv)[0]
+                            _fimg = force_pool.get(_hoid)
                             if _fimg and len(_fimg) == 3 * len(tag._value_bytes):
                                 tag._force_data = _tag_value.render_hex(_fimg)
+                            else:
+                                # Modern-save recovery: the holder stores no
+                                # blob@410 image; its ext-attrs are
+                                # self-describing instead -- head of 0x64 (or
+                                # 0x1) = [data_size][mult], 0x66 = the
+                                # mask/value/state image. Gated on mult==3, the
+                                # exact tag data size, the exact 3x image
+                                # length AND >=1 set mask bit (this era only
+                                # exports forces a tag actually carries) --
+                                # anything else emits nothing.
+                                try:
+                                    _hrow = self._cur.execute(
+                                        "SELECT record FROM comps "
+                                        "WHERE object_id=?", (_hoid,)).fetchone()
+                                    _ha = (CompsRecord.read_value_attrs(
+                                        bytes(_hrow[0]), self._short_header,
+                                        body_mode=True) if _hrow else {})
+                                except Exception:
+                                    _ha = {}
+                                _h66 = _ha.get(0x66)
+                                _hh = _ha.get(0x64) or _ha.get(0x1, b"")
+                                if _h66 is not None and len(_hh) >= 8:
+                                    _dsz, _mult = struct.unpack_from(
+                                        "<II", _hh, 0)
+                                    if (_mult == 3
+                                            and _dsz == len(tag._value_bytes)
+                                            and len(_h66) == 3 * _dsz
+                                            and any(_h66[_dsz:2 * _dsz])):
+                                        tag._force_data = \
+                                            _tag_value.render_hex(_h66)
                         elif _fv is None and _forces_installed:
                             # Source-protected backing: the short read cannot reach the
                             # force pointer (0x6b sits past the encrypted 0x66), and the
@@ -5989,10 +6032,17 @@ class ControllerBuilder(L5xElementBuilder):
                             size = int.from_bytes(tag._value_bytes[0:4], "little") - 4
                             slot_entry["C"] = (inner, size)
                         elif io_type in ("O", "O1", "O2", "SO") and inner:
-                            # Output tags (standard and safety) keep the inner verbatim.
+                            # Output tags (standard and safety) keep the inner
+                            # verbatim. L5K era: minus ForceData -- no corpus
+                            # witness exists for an L5K-era output force, so
+                            # never emit that unproven content (fail-closed;
+                            # a no-op on the current corpus).
+                            if not tag._raw_hex_data:
+                                inner = _FORCE_BLOCK_RE.sub("", inner)
                             slot_entry[io_type] = inner
                         elif inner:  # I*/S* input/status tags: strip the raw value block
-                            si = _strip_input_tag_inner(inner)
+                            si = _strip_input_tag_inner(
+                                inner, strip_force=not tag._raw_hex_data)
                             # An OEM safety InputTag carries no <Description> (a safety
                             # I/O tag's description is not rendered inside the connection
                             # tag -- verified: every safety connection InputTag in the

@@ -131,3 +131,17 @@ def test_l5k_storage_form_never_carries_force():
     node = TV._walk_struct("FT", _IMAGE, _LAYOUT, _DTM, 0,
                            bytes(fmask), bytes(fval))
     assert TV._emit_l5k(node) == plain
+
+
+def test_strip_input_tag_inner_force_block_era_keyed():
+    from acd.l5x.connections import _strip_input_tag_inner
+    inner = ('<Data Format="L5K">\n<![CDATA[[1,2]]]>\n</Data>'
+             '<ForceData Format="L5K">\n<![CDATA[[0,0,1,0,3,0]]]>\n'
+             '</ForceData>'
+             '<Data Format="Decorated"><DataValue DataType="INT" '
+             'Value="1"/></Data>')
+    # Raw-hex era (default): ForceData is kept in the captured inner.
+    assert "ForceData" in _strip_input_tag_inner(inner)
+    # L5K era: the connection InputTag never carries ForceData.
+    out = _strip_input_tag_inner(inner, strip_force=True)
+    assert "ForceData" not in out and 'Format="Decorated"' in out

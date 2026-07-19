@@ -538,10 +538,20 @@ _ALARM_BLOCK_RE = re.compile(r'<AlarmConditions\b.*?</AlarmConditions>', re.S)
 _DESC_BLOCK_RE = re.compile(r'<Description\b.*?</Description>\s*', re.S)
 
 
-def _strip_input_tag_inner(inner: str) -> str:
-    """Transform a backing tag's rendered inner into an <InputTag>'s inner."""
+_FORCE_BLOCK_RE = re.compile(r"<ForceData\b.*?</ForceData>", re.S)
+
+
+def _strip_input_tag_inner(inner: str, strip_force: bool = False) -> str:
+    """Transform a backing tag's rendered inner into an <InputTag>'s inner.
+
+    ``strip_force``: the L5K-era reference renders a connection InputTag
+    WITHOUT the <ForceData> block (the block stays on the controller-scope
+    tag's own <Data>); the raw-hex era keeps it.
+    """
     inner = _ALARM_BLOCK_RE.sub("", inner)
     inner = _RAW_DATA_BLOCK_RE.sub("", inner)
+    if strip_force:
+        inner = _FORCE_BLOCK_RE.sub("", inner)
     return inner
 
 
