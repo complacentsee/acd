@@ -719,6 +719,14 @@ class ExportL5x:
         self._cur.execute(
             "CREATE TABLE connection_signatures(otype int, cid int, disc int, signature text, timestamp text)"
         )
+        # An unsigned-but-signature-generated safety <Tags> collection has an
+        # ALL-ZERO-hash GSS record (dropped from connection_signatures, which
+        # keeps only nonzero signatures) yet the reference still emits its
+        # timestamp + the all-zero signature. Keyed by the same triple.
+        self._cur.execute(
+            "CREATE TABLE zero_tag_signatures(otype int, cid int, disc int, "
+            "timestamp text)"
+        )
         # The five controller-level safety signatures (<SafetyInfo> children) use the
         # SAME GSS records but at controller scope (cid 0/1) and some carry an embedded
         # NAME after the "GSS" marker (0x13 + NUL-terminated UTF-16): "OverallSignature"
@@ -769,6 +777,7 @@ class ExportL5x:
 
         _gss: Dict[tuple, list] = {}
         _gss3: Dict[tuple, list] = {}
+        _gss3z: Dict[tuple, str] = {}   # triple -> ts for all-zero-hash records
         _named: Dict[tuple, list] = {}
         _cp: List[tuple] = []
         _amsg: List[tuple] = []
@@ -819,11 +828,17 @@ class ExportL5x:
             _si = _buf.find(_sig_needle)
             if _si >= 0:
                 _h = _buf[_si + len(_sig_needle) + 14:_si + len(_sig_needle) + 46]
-                if len(_h) == 32 and any(_h):
-                    _sig = " - ".join(
-                        "%08X" % struct.unpack_from(">I", _h, _i * 4)[0] for _i in range(8))
-                    _gss.setdefault(_key, [None, None])[0] = _sig
-                    _gss3.setdefault(_key3, [None, None])[0] = _sig
+                if len(_h) == 32:
+                    if any(_h):
+                        _sig = " - ".join(
+                            "%08X" % struct.unpack_from(">I", _h, _i * 4)[0] for _i in range(8))
+                        _gss.setdefault(_key, [None, None])[0] = _sig
+                        _gss3.setdefault(_key3, [None, None])[0] = _sig
+                    else:
+                        # All-zero hash: an unsigned safety collection whose
+                        # timestamp the reference still emits. Its ts is filled
+                        # by the timestamp block below.
+                        _gss3z.setdefault(_key3, "")
             _ti = _buf.find(_ts_needle)
             if _ti >= 0:
                 _txt = _buf[_ti + len(_ts_needle) + 12:].split(b"\x00")[0]
@@ -831,6 +846,8 @@ class ExportL5x:
                     _ts = _txt.decode("ascii")
                     _gss.setdefault(_key, [None, None])[1] = _ts
                     _gss3.setdefault(_key3, [None, None])[1] = _ts
+                    if _key3 in _gss3z:
+                        _gss3z[_key3] = _ts
                 except UnicodeDecodeError:
                     pass
             # Controller-level (cid 0/1) signatures, keyed by (otype, name). The hash
@@ -856,6 +873,9 @@ class ExportL5x:
         self._cur.executemany(
             "INSERT INTO connection_signatures VALUES (?,?,?,?,?)",
             [(k[0], k[1], k[2], v[0], v[1]) for k, v in _gss3.items() if v[0]])
+        self._cur.executemany(
+            "INSERT INTO zero_tag_signatures VALUES (?,?,?,?)",
+            [(k[0], k[1], k[2], ts) for k, ts in _gss3z.items() if ts])
         self._cur.executemany(
             "INSERT INTO named_safety_signatures VALUES (?,?,?,?)",
             [(k[0], k[1], v[0], v[1]) for k, v in _named.items() if v[0]])

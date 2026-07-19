@@ -4553,6 +4553,21 @@ def _tagcoll_sig_attrs(cur, oid, short_header):
             if sr[1]:
                 a += f' SafetySignatureTimestamp="{html.escape(sr[1], quote=True)}"'
             return a
+        # An unsigned safety collection carries an all-zero signature + a real
+        # timestamp (from an all-zero-hash GSS record, absent from the nonzero
+        # connection_signatures table). Same triple; fires only when there is
+        # no real signature.
+        zr = cur.execute(
+            "SELECT timestamp FROM zero_tag_signatures "
+            "WHERE otype=? AND cid=? AND disc=?",
+            (struct.unpack_from("<H", rb, 10)[0],
+             struct.unpack_from("<I", rb, 12)[0],
+             struct.unpack_from("<I", rb, 16)[0])).fetchone()
+        if zr and zr[0]:
+            a = ' SafetySignature="' + " - ".join(["00000000"] * 8) + '"'
+            a += (f' SafetySignatureTimestamp='
+                  f'"{html.escape(zr[0], quote=True)}"')
+            return a
     except Exception:
         pass
     return ""
