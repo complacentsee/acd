@@ -377,15 +377,17 @@ def _read_str(r, j):
     return r[p:p + 2 * n].decode("utf-16-le", "replace"), p + 2 * n
 
 
-def _block_arrays(cur, eo):
+def _block_arrays(cur, eo, base):
     """Resolve an array-parameter block's <Array> children, or fail.
 
     The block owns exactly ONE kind-0x77 group; its children are kind-0x75
     array records with no further children, each holding two consecutive
     fffeff strings: the operand reference (empty => the parameter is unbound)
-    and the array parameter name. Returns (ok, [(name, operand_or_None), ...]);
-    any other shape, an unresolved operand or a duplicate name is unknown ->
-    (False, None).
+    and the array parameter name. The pin-slot u32 sits at the header-family
+    ``base`` offset (20 short / 24 long) -- a fixed 24 read a constant 0xCA
+    on short-header records, colliding every array on one bogus slot. Returns
+    (ok, [(name, operand_or_None, slot), ...]); any other shape, an
+    unresolved operand or a duplicate name/slot is unknown -> (False, None).
     """
     kids = _rows(cur, eo)
     if len(kids) != 1:
@@ -397,9 +399,9 @@ def _block_arrays(cur, eo):
     for ao, ar in _rows(cur, go):
         if _kind(ar) != ARRAY_ELEM or _rows(cur, ao):
             return False, None
-        if len(ar) < 28:
+        if len(ar) < base + 8:
             return False, None
-        slot = struct.unpack_from("<I", ar, 24)[0]
+        slot = struct.unpack_from("<I", ar, base)[0]
         j = ar.find(b'\xff\xfe\xff')
         if j < 0:
             return False, None
@@ -626,7 +628,7 @@ def _decode(cur, oid, sh, size, orient, tbtext):
                         if not ok:
                             return None
                     elif bt in ARRAY_TYPES:
-                        ok, arrays = _block_arrays(cur, eo)
+                        ok, arrays = _block_arrays(cur, eo, base)
                         if not ok:
                             return None
                     elif _has_children(cur, eo):
