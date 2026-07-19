@@ -384,6 +384,11 @@ _CONN_PRIORITY_MAP = {1: "High", 2: "Scheduled"}
 _CONN_ICT_MAP = {2: "Unicast", 1: "Multicast"}
 _CONN_IPT_MAP = {0: "Cyclic", 2: "Application"}
 _CONN_SAFETY_ASM_INSTANCES = frozenset({0x66, 0x0360})
+# A data-driven connection's backing I/O tag comp is named
+# '&<modhex>[:<slot>]:<suffix>'; the trailing token IS the rendered
+# Input/OutputTagSuffix (reached via ext-attr 0x190/0x191, the direction's
+# backing-tag object_id).
+_CONN_BACKING_TAG_RE = re.compile(r"^&[0-9a-fA-F]+(?::\d+)?:([A-Za-z0-9]+)$")
 
 
 def _conn_num(x: float) -> str:
@@ -421,7 +426,26 @@ def _conn_first_instance(cp: ConnectionParams):
     return None
 
 
-def _conn_modern_attrs(cp: ConnectionParams, fmt: int) -> dict:
+def _conn_backing_suffix(cur, ea: dict, attr_id: int):
+    """The direction's TagSuffix from its backing-tag comp name, or None.
+
+    The connection record's ext-attr 0x190 (input) / 0x191 (output) holds the
+    backing I/O tag's object_id; that comp's name ends in the suffix Studio
+    renders ('SI'/'SO' on safety assemblies, 'I1'/'O1' on numbered slots...).
+    Reading it beats inferring from the EPATH assembly instance, which cannot
+    separate e.g. a dual-personality safety adapter's connections.
+    """
+    v = ea.get(attr_id)
+    if not v or len(v) < 4:
+        return None
+    row = cur.execute("SELECT comp_name FROM comps WHERE object_id=?",
+                      (struct.unpack_from("<I", v, 0)[0],)).fetchone()
+    m = _CONN_BACKING_TAG_RE.match(row[0]) if row and row[0] else None
+    return m.group(1) if m else None
+
+
+def _conn_modern_attrs(cp: ConnectionParams, fmt: int,
+                       in_sfx=None, out_sfx=None) -> dict:
     """Recover the data-driven / safety <Connection> attributes from the blob."""
     out: dict = {}
     if fmt in _CONN_DATADRIVEN_FMTS:
@@ -437,19 +461,29 @@ def _conn_modern_attrs(cp: ConnectionParams, fmt: int) -> dict:
         if path_hex is not None:
             out["ConnectionPath"] = path_hex
         inst = _conn_first_instance(cp)
-        if inst is not None:
-            safe = inst in _CONN_SAFETY_ASM_INSTANCES
-            # A suffix names that direction's I/O tag, so it is emitted only when
-            # the connection actually carries that direction (size > 0). A plain
-            # StandardDataDriven (fmt 48) input-only module has out_size 0 and the
-            # reference omits OutputTagSuffix there; gating each side on its size
-            # matches the reference (no suffix ever appears without its tag).
-            in_size = cp.input_size if cp.input_size is not None else 0
-            out_size = cp.output_size if cp.output_size is not None else 0
-            if fmt in (48, 49) and in_size:   # has an input side
-                out["InputTagSuffix"] = "I1" if inst == 1 else ("SI" if safe else "I")
-            if fmt in (48, 50) and out_size:  # has an output side
-                out["OutputTagSuffix"] = "O1" if inst == 1 else ("SO" if safe else "O")
+        # A suffix names that direction's I/O tag, so it is emitted only when
+        # the connection actually carries that direction (size > 0). A plain
+        # StandardDataDriven (fmt 48) input-only module has out_size 0 and the
+        # reference omits OutputTagSuffix there; gating each side on its size
+        # matches the reference (no suffix ever appears without its tag). The
+        # backing-tag name (in_sfx/out_sfx) is authoritative; the
+        # first-EPATH-instance heuristic covers records without the attr.
+        in_size = cp.input_size if cp.input_size is not None else 0
+        out_size = cp.output_size if cp.output_size is not None else 0
+        if fmt in (48, 49) and in_size:   # has an input side
+            if in_sfx is None and inst is not None:
+                in_sfx = ("I1" if inst == 1
+                          else "SI" if inst in _CONN_SAFETY_ASM_INSTANCES
+                          else "I")
+            if in_sfx is not None:
+                out["InputTagSuffix"] = in_sfx
+        if fmt in (48, 50) and out_size:  # has an output side
+            if out_sfx is None and inst is not None:
+                out_sfx = ("O1" if inst == 1
+                           else "SO" if inst in _CONN_SAFETY_ASM_INSTANCES
+                           else "O")
+            if out_sfx is not None:
+                out["OutputTagSuffix"] = out_sfx
     if fmt in _CONN_SAFETY_FMTS:
         if cp.timeout_multiplier is not None:
             out["TimeoutMultiplier"] = str(cp.timeout_multiplier)
@@ -574,7 +608,11 @@ def _build_connection_map(cur, short_header: bool) -> Dict[int, dict]:
                 "OutputCxnPoint": cp.output_cxn_point,
                 "OutputSize": cp.output_size,
             }
-            entry.update(_conn_modern_attrs(cp, fmt))
+            _in_sfx = _out_sfx = None
+            if fmt in _CONN_DATADRIVEN_FMTS:
+                _in_sfx = _conn_backing_suffix(cur, ea, _PRODUCE_EXT_CONSUMED)
+                _out_sfx = _conn_backing_suffix(cur, ea, _PRODUCE_EXT_PRODUCED)
+            entry.update(_conn_modern_attrs(cp, fmt, _in_sfx, _out_sfx))
             # Safety connections carry a per-connection SafetySignature: the GSS
             # record keyed (otype 105, cid=u32@rec[12], disc=u32@rec[16]).
             if fmt in (28, 29, 49, 50) and len(rec) >= 20:
