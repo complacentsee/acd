@@ -420,3 +420,18 @@ def test_depth_capped_self_reference_terminates_quickly():
         '</Array>'
     )
     assert T.render_l5k_layout("T1", "3", b"\x00" * 24, lm, {}) is None
+
+
+# --------------------------------------------------------------------------- #
+# Scalar BOOL is bit 0 of its byte -- the upper 7 bits are preserved-but-
+# ignored garbage a stale save can leave behind (OEM's raw <Data> hex keeps
+# them; its rendered value masks them). Truthiness leaked them as '1'.
+# --------------------------------------------------------------------------- #
+def test_scalar_bool_masks_to_bit_zero():
+    assert T._atomic_text("BOOL", b"\x01") == "1"
+    assert T._atomic_text("BOOL", b"\x00") == "0"
+    # 0xA0: garbage upper bits, bit 0 clear -> "0" (was wrongly "1").
+    assert T._atomic_text("BOOL", b"\xa0") == "0"
+    assert T._atomic_text("BOOL", b"\xa1") == "1"
+    assert T._atomic_text_decorated("BOOL", b"\xa0") == "0"
+    assert T._atomic_text_decorated("BOOL", b"\xa1") == "1"

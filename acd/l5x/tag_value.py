@@ -192,7 +192,10 @@ def _atomic_text(dt: str, b: bytes) -> str:
     if dt == "REAL":
         return _fmt_real(val)
     if dt == "BOOL":
-        return "1" if val else "0"
+        # A BOOL is bit 0 of its byte; the upper 7 bits are preserved-but-
+        # ignored garbage (the raw <Data> hex keeps them, the rendered value
+        # masks them). Truthiness would leak them as a wrong '1'.
+        return str(val & 1)
     return str(val)
 
 
@@ -211,7 +214,7 @@ def _atomic_text_decorated(dt: str, b: bytes) -> str:
     if dt == "REAL":
         return _fmt_real_decorated(val)
     if dt == "BOOL":
-        return "1" if val else "0"
+        return str(val & 1)   # bit 0 only; see _atomic_text
     return str(val)
 
 
@@ -1005,7 +1008,7 @@ def render_decorated(dt_base: str, dimensions: Optional[str], image: bytes,
                 return _atomic_text_decorated(dt_base, image[off:off + width])
             v = struct.unpack_from(fmt, image, off)[0]
             if dt_base in ("BOOL", "BIT"):
-                return "1" if v else "0"
+                return str(v & 1)   # bit 0 only; see _atomic_text
             return _format_int_radix(dt_base, v, width, eff)
 
         if total == 0:
