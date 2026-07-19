@@ -696,9 +696,16 @@ def _build_config_holders(cur, short_header: bool = False):
                 seen28[mr28] = seen28.get(mr28, 0) + 1
                 by_mr28[mr28] = oid
             if len(rec) >= 14:
-                cid = struct.unpack_from("<H", rec, 12)[0]
-                seencid[cid] = seencid.get(cid, 0) + 1
-                by_cid[cid] = oid
+                # The cid slot (record[12:14]) is only meaningful on a
+                # controller-scope (cip 0x6A) holder; other classes store
+                # unrelated data there, and counting them in the uniqueness
+                # census turned genuinely-unique cids ambiguous -- dropping
+                # the module -> ConfigScript link exactly on modules whose
+                # (shared) config image has many holders.
+                if struct.unpack_from("<H", rec, 10)[0] == 0x006A:
+                    cid = struct.unpack_from("<H", rec, 12)[0]
+                    seencid[cid] = seencid.get(cid, 0) + 1
+                    by_cid[cid] = oid
         by_mr28 = {k: v for k, v in by_mr28.items() if seen28[k] == 1}
         by_cid = {k: v for k, v in by_cid.items() if seencid[k] == 1}
     except Exception:
