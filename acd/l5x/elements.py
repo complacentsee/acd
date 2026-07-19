@@ -954,6 +954,12 @@ class Tag(L5xElement):
     # @Usage ("Public"/"Input"/"Output"/"InOut") for a PROGRAM-scope tag; None
     # omits it. Set by TagBuilder from the tag's ext-attr 0x01 (ext01[0x20E]).
     _usage: Union[str, None] = None
+    # Engineering Min/Max limit attributes (None omits them). Public so the
+    # generic serializer renders @Max/@Min; declared last so existing positional
+    # Tag() constructions are unaffected. Recovered by TagBuilder from the
+    # tag's OWN limit records (empty-operand kind-0x02/0x03 comment rows).
+    max: Union[str, None] = None
+    min: Union[str, None] = None
 
     def _inject_tag_attrs(self, base: str) -> str:
         """Insert OpcUaAccess / Class attributes into the opening <Tag ...> of base.
@@ -2572,6 +2578,34 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
                 mins = []
                 maxes = []
 
+        # Tag-OWN engineering limits (@Min/@Max on the <Tag> element itself).
+        # Same Comments.Dat store as the operand Min/Max rows above, staged
+        # with an EMPTY tag_reference (no operand = the limit decorates the
+        # component itself; see CommentsRecord._parse_long_own_limit).
+        # Fail-closed: both bounds present, a single value each, and the scope
+        # key owned by exactly one live comp. Controller-scope (cip-0x6B) only:
+        # program tags share their program's key.
+        tag_max: Union[str, None] = None
+        tag_min: Union[str, None] = None
+        if not self._short_header and r.cip_type == 0x6B:
+            try:
+                _lim_key = (r.comment_id * 0x10000) + r.cip_type
+                if self._cur.execute(
+                        "SELECT 1 FROM unique_comment_key WHERE k=?",
+                        (_lim_key,)).fetchone():
+                    _lims = self._cur.execute(
+                        "SELECT member_ref, record_string FROM comments "
+                        "WHERE parent=? AND tag_reference='' "
+                        "AND member_ref IN (2, 3) AND record_string!=''",
+                        (_lim_key,)).fetchall()
+                    _lmin = {v for k, v in _lims if k == 2}
+                    _lmax = {v for k, v in _lims if k == 3}
+                    if len(_lmin) == 1 and len(_lmax) == 1:
+                        tag_min = next(iter(_lmin))
+                        tag_max = next(iter(_lmax))
+            except Exception:
+                tag_max = tag_min = None
+
         extended_records: Dict[int, bytes] = {}
         for extended_record in r.extended_records:
             extended_records[extended_record.attribute_id] = bytes(
@@ -2666,6 +2700,7 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
             _data_exchange_id=_dxid,
             _usage=_usage,
             _opc_ua=_opc_ua, _class_attr=_cls_attr(),
+            max=tag_max, min=tag_min,
         )
 
 
