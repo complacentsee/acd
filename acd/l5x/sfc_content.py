@@ -23,8 +23,10 @@ from the Step->DescBox reference so the same offsets work across firmware.
 L5X element IDs are assigned in order (steps+their actions, transitions,
 branches+legs, stops, textboxes); links/attachments reference them by hash.
 The document emits Stops AFTER the Branch elements (matching the reference)
-even though Stop IDs precede the TextBox range. Branches sort by Y and fail
-closed on a tie; TextBoxes sort by (X, Y).
+even though Stop IDs precede the TextBox range. Branches sort by Y; a shared
+Y is ordered by the per-element creation counter modern-layout (d == 0)
+records persist at offset 20 (old-layout records store no counter there, so
+their ties fail closed). TextBoxes sort by (X, Y).
 
 Fail-closed: any unrecognised record, an unresolved operand, a hash that does not
 map to an emitted element, or an ambiguous base shift returns None, so the
@@ -420,9 +422,30 @@ def decode_sfc(cur, routine_oid, _prove_sheet=None, textbox_text=None):
         S.sort(key=lambda s: s["op"])
         T.sort(key=lambda t: t["op"])
         P.sort(key=lambda p: p["op"])
-        if len({b["Y"] for b in B}) != len(B):
-            return None
-        B.sort(key=lambda b: b["Y"])
+        # Branch bars can legitimately share a Y (side-by-side parallel
+        # structures). Modern-layout (d == 0) records persist a per-element
+        # creation counter in the u32 at offset 20 -- the very field whose
+        # presence IS the d shift -- and the reference orders same-Y bars by
+        # it, ascending (a stable Y-sort over creation order). The old layout
+        # (d == -4) does not store the counter (offset 20 holds a constant),
+        # so an old-layout tie stays fail-closed.
+        by_y = {}
+        for b in B:
+            by_y.setdefault(b["Y"], []).append(b)
+        ordered = []
+        for y in sorted(by_y):
+            grp = by_y[y]
+            if len(grp) > 1:
+                if d != 0:
+                    return None
+                uids = [u32(subtree[bo], 20) for bo in
+                        (byhash[b["hash"]] for b in grp)]
+                if len(set(uids)) != len(uids):
+                    return None
+                grp = [b for _u, b in
+                       sorted(zip(uids, grp), key=lambda t: t[0])]
+            ordered.extend(grp)
+        B = ordered
         if len({(t["X"], t["Y"]) for t in TB}) != len(TB):
             return None
         TB.sort(key=lambda t: (t["X"], t["Y"]))

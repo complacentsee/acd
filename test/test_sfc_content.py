@@ -59,8 +59,9 @@ def _stop(h, dbh, x, y, op):
     return _rec(1021, h, body, _text(op))
 
 
-def _branch(kind, h, grph, y, prio=False):
-    body = _u32s(0, 0, y, struct.unpack("<I", grph)[0])
+def _branch(kind, h, grph, y, prio=False, uid=0):
+    # u32@20 = the modern-layout per-element creation counter (0 = absent)
+    body = _u32s(uid, 0, y, struct.unpack("<I", grph)[0])
     if prio:
         body += _u32s(1)
     return _rec(kind, h, body)
@@ -153,7 +154,7 @@ def test_selection_branch_priority_kept():
             'BranchFlow="Diverge" Priority="Default">') in out
 
 
-def test_branch_y_tie_fails_closed():
+def test_branch_y_tie_without_counter_fails_closed():
     rows = _base_chart()
     rows += [
         (5, ROUTINE, _branch(1017, _h(5), _h(6), 200, prio=True)),
@@ -164,6 +165,38 @@ def test_branch_y_tie_fails_closed():
         (10, ROUTINE, _leg(1013, _h(10))),
     ]
     assert _decode(rows) is None
+
+
+def test_branch_y_tie_orders_by_creation_counter():
+    # the LATER-stored branch has the SMALLER counter and two legs, so a
+    # correct counter sort puts the two-leg branch first (IDs 2..4)
+    rows = _base_chart()
+    rows += [
+        (5, ROUTINE, _branch(1017, _h(5), _h(6), 200, prio=True, uid=90)),
+        (6, ROUTINE, _leggroup(_h(6), [_h(7)])),
+        (7, ROUTINE, _leg(1013, _h(7))),
+        (8, ROUTINE, _branch(1017, _h(8), _h(9), 200, prio=True, uid=40)),
+        (9, ROUTINE, _leggroup(_h(9), [_h(10), _h(11)])),
+        (10, ROUTINE, _leg(1013, _h(10))),
+        (11, ROUTINE, _leg(1013, _h(11))),
+    ]
+    out = _decode(rows)
+    assert out is not None
+    first = out.split('<Branch ID="5"')[0]
+    assert '<Branch ID="2"' in first
+    assert '<Leg ID="3"/>' in first and '<Leg ID="4"/>' in first
+    assert '<Leg ID="6"/>' in out.split('<Branch ID="5"')[1]
+    # tie with EQUAL counters (counter absent/constant) fails closed
+    rows_eq = _base_chart()
+    rows_eq += [
+        (5, ROUTINE, _branch(1017, _h(5), _h(6), 200, prio=True, uid=7)),
+        (6, ROUTINE, _leggroup(_h(6), [_h(7)])),
+        (7, ROUTINE, _leg(1013, _h(7))),
+        (8, ROUTINE, _branch(1017, _h(8), _h(9), 200, prio=True, uid=7)),
+        (9, ROUTINE, _leggroup(_h(9), [_h(10)])),
+        (10, ROUTINE, _leg(1013, _h(10))),
+    ]
+    assert _decode(rows_eq) is None
 
 
 def test_textbox_x_tie_sorts_by_y():
