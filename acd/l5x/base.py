@@ -555,10 +555,15 @@ def radix_enum(i: int) -> str:
     return "General"
 
 
-def external_access_enum(i: int) -> str:
+def external_access_enum(i: int, undefined_ok: bool = False) -> str:
     default = "Read/Write"
     if i == 0:
         return default
+    # Raw 1 = "Undefined" (a component predating ExternalAccess). Only the AOI
+    # Parameter/LocalTag surface is known to carry it; other call sites keep
+    # the legacy default until validated.
+    if i == 1 and undefined_ok:
+        return "Undefined"
     if i == 2:
         return "Read Only"
     if i == 3:

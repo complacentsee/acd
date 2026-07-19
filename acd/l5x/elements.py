@@ -2897,7 +2897,7 @@ class ParameterBuilder(L5xElementBuilder):
             constant: Union[str, None] = None if data_type in _no_constant_inout else "false"
         elif len(ext01) > 0x21F:
             ea_val = struct.unpack_from("<H", ext01, 0x21E)[0]
-            external_access = external_access_enum(ea_val)
+            external_access = external_access_enum(ea_val, undefined_ok=True)
             constant = None
         else:
             external_access = "Read/Write"
@@ -3044,7 +3044,7 @@ class LocalTagBuilder(L5xElementBuilder):
         ext01 = exts.get(0x01, b"")
         if len(ext01) > 0x21F:
             ea_val = struct.unpack_from("<H", ext01, 0x21E)[0]
-            external_access = external_access_enum(ea_val)
+            external_access = external_access_enum(ea_val, undefined_ok=True)
         else:
             external_access = "Read/Write"
 
