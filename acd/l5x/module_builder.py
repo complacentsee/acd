@@ -258,9 +258,13 @@ class Module(L5xElement):
         # @AutoDiagsEnabled trails UserDefinedCatalogNumber in the reference.
         autodiags_attr = (f' AutoDiagsEnabled="{self._auto_diags}"'
                           if self._auto_diags else "")
+        # An empty resolved catalog omits the attribute entirely: the
+        # reference never writes CatalogNumber="" (0 occurrences pool-wide).
+        cat_attr = (f'CatalogNumber="{self.catalog_number}" '
+                    if self.catalog_number else '')
         attrs = (
             f'{name_attr}'
-            f'CatalogNumber="{self.catalog_number}" '
+            f'{cat_attr}'
             f'Vendor="{self.vendor}" '
             f'ProductType="{self.product_type}" '
             f'ProductCode="{self.product_code}" '
