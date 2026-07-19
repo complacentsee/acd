@@ -6461,19 +6461,25 @@ class ControllerBuilder(L5xElementBuilder):
         # slot was appended back, which only matched when the dropped character
         # happened to equal the slot). Fall back to the old prefix+slot form when the
         # full attribute is unavailable.
+        # The body-direct 0x06A (from record_attrs) is the robust source: the
+        # kaitai extended_records parse that feeds _comm_path_prefix can RAISE on
+        # some controllers (a mis-framed ext-record length), zeroing the prefix
+        # even though 0x06A is intact. Prefer 0x06A verbatim; a NON-EMPTY guard
+        # is mandatory (0x06A is present-but-empty on controllers that carry no
+        # path -- emitting "" would fabricate the attribute). The prefix+slot
+        # form remains only as the fallback when 0x06A is truly absent.
         comm_path: Union[str, None] = None
-        if _comm_path_prefix is not None:
+        _cp_full = _ctlattrs.get(0x06A)
+        if _cp_full:
+            _cp_str = _cp_full.decode("utf-16-le", errors="replace").rstrip("\x00")
+            if _cp_str:
+                comm_path = _cp_str
+        if comm_path is None and _comm_path_prefix is not None:
             _ctrl_slot = next(
                 (m._slot for m in modules if m._is_root), None
             )
             if _ctrl_slot is not None:
-                # Same presence as before (a stored prefix + a root slot); only the
-                # value source changes to the untruncated 0x06A attribute.
-                _cp_full = _ctlattrs.get(0x06A)
-                comm_path = (
-                    _cp_full.decode("utf-16-le", errors="replace").rstrip("\x00")
-                    if _cp_full else _comm_path_prefix + str(_ctrl_slot)
-                )
+                comm_path = _comm_path_prefix + str(_ctrl_slot)
         return processor_type, major_rev, minor_rev, comm_path
 
     def _pass_project_settings(self, processor_type, _ctlattrs, _ctlblob,
