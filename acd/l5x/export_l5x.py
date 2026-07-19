@@ -605,6 +605,23 @@ class ExportL5x:
             for oid, nm in rung_name_lookup.items()
         }
 
+        # A rung token that references the CONTROLLER component itself renders
+        # as the '::THIS' self-scope, never the controller's name (witnessed on
+        # alarm-set instruction @AlarmSet arguments). The controller comp is
+        # the unique NAMED root row; anything but exactly one match leaves the
+        # map unchanged (fail-closed). Mutating here is safe: the strip
+        # comprehension above built a fresh dict, so the write-back
+        # _id_to_name map keeps the real name.
+        try:
+            _ctl = self._cur.execute(
+                "SELECT object_id FROM comps WHERE parent_id=0 AND "
+                "record_type=256 AND comp_name IS NOT NULL AND comp_name!=''"
+            ).fetchall()
+            if len(_ctl) == 1:
+                rung_name_lookup[_ctl[0][0]] = "::THIS"
+        except Exception:
+            pass
+
         log.info(
             "Getting records from ACD SbRegion file and storing in sqllite database"
         )
