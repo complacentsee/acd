@@ -28,17 +28,20 @@ from acd.record.comps import CompsRecord
 # converter must never emit a wrong block -- that would score worse than the
 # missing element it replaces).
 _MSG_IPRE = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
+_MSG_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _msg_route_segment(m) -> bytes:
-    """The EPATH segment from a module's parent down to the module.
+def _msg_route_segment(m):
+    """The (EPATH segment, trusted) pair from a module's parent to the module.
 
     Port byte = parent_mod_port_id (the parent port facing this module). The
     address comes from the module's UPSTREAM port (the rendered Upstream="true"
     port): an IP address yields an extended-link segment (0x10|port, len, ascii
     padded to even), a slot yields a 1-byte address. The module's own
     _ip_address must NOT be used directly -- a backplane-upstream bridge also
-    carries a downstream-port IP that would mis-encode the segment.
+    carries a downstream-port IP that would mis-encode the segment. A segment
+    built without an upstream-port address (the slot fallback) is untrusted:
+    it names a module Logix itself leaves numeric.
     """
     ppid = m.parent_mod_port_id & 0xFF
     # Parse the ports as XML (works for both the RxDataCollection override and
@@ -58,22 +61,26 @@ def _msg_route_segment(m) -> bytes:
             a = addr.encode("ascii", "replace")
             if len(a) % 2:
                 a = a + b"\x00"
-            return bytes([0x10 | ppid, len(addr)]) + a
+            return bytes([0x10 | ppid, len(addr)]) + a, True
         if addr:
             try:
-                return bytes([ppid, int(addr) & 0xFF])
+                return bytes([ppid, int(addr) & 0xFF]), True
             except Exception:
                 pass
     slot = m._slot if m._slot != 0xFFFFFFFF else 0
-    return bytes([ppid, slot & 0xFF])
+    return bytes([ppid, slot & 0xFF]), False
 
 
 def _msg_build_module_routes(modules):
     """Return (name->route bytes, {route: count}).
 
     A module's route is the concatenation of its ParentModule-chain segments
-    (the root's route is empty). A bare backplane slot-0 route is dropped from
-    the name map: slot 0 is the controller's own slot, never an addressable hop.
+    (the root's route is empty). A module enters the name map only when its
+    name is a plain identifier (excludes the '?' placeholder and
+    partner/unresolved pseudo-modules, whose names Logix never writes into a
+    ConnectionPath) and every segment of its chain came from a real
+    upstream-port address -- a chain containing the slot fallback describes a
+    module Logix cannot address and leaves numeric.
     """
     by_name = {}
     for m in modules:
@@ -85,8 +92,8 @@ def _msg_build_module_routes(modules):
         if k in cache:
             return cache[k]
         if getattr(m, "_is_root", False) or m.parent_module == m.name:
-            cache[k] = b""
-            return b""
+            cache[k] = (b"", True)
+            return cache[k]
         p = by_name.get(m.parent_module)
         if p is None or m.name in seen:
             cache[k] = None
@@ -95,17 +102,17 @@ def _msg_build_module_routes(modules):
         if pr is None:
             cache[k] = None
             return None
-        r = pr + _msg_route_segment(m)
-        cache[k] = r
-        return r
+        seg, trusted = _msg_route_segment(m)
+        cache[k] = (pr[0] + seg, pr[1] and trusted)
+        return cache[k]
 
     nr: Dict[str, bytes] = {}
     for m in modules:
-        if m.name == "?":
+        if m.name == "?" or not _MSG_NAME_RE.match(m.name):
             continue
         r = route(m, set())
-        if r:
-            nr.setdefault(m.name, r)
+        if r and r[0] and r[1]:
+            nr.setdefault(m.name, r[0])
     route_count: Dict[bytes, int] = {}
     for r in nr.values():
         route_count[r] = route_count.get(r, 0) + 1
@@ -168,8 +175,6 @@ def _msg_resolve_cp(epath, nr, route_count):
     best_route = b""
     for name, r in nr.items():
         lr = len(r)
-        if r == b"\x01\x00":
-            continue
         if lr <= len(epath) and epath[:lr] == r and lr > bl:
             best = name
             bl = lr
