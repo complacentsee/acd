@@ -915,7 +915,8 @@ class ModuleBuilder(L5xElementBuilder):
         """
         if not data_link:
             return ""
-        for child_oid, _raw in self._rxdata_by_cid.get(data_link & 0xFFFF, []):
+        children = self._rxdata_by_cid.get(data_link & 0xFFFF, [])
+        for child_oid, _raw in children:
             frow = self._cur.execute(
                 "SELECT record FROM comps WHERE object_id=?",
                 (child_oid,)).fetchone()
@@ -937,6 +938,22 @@ class ModuleBuilder(L5xElementBuilder):
                 if e >= 0:
                     return img[s:e + len(b"</private>")].decode(
                         "latin-1", errors="replace")
+        # EMPTY form: a stored self-closing <private/> block, which the
+        # reference still renders (as '<private />'). Second pass only after
+        # the content search missed EVERY child, so a content-form block
+        # always wins. An attributed form (<private key="v"/>) matches
+        # neither pass and emits nothing -- fail-closed.
+        for child_oid, _raw in children:
+            frow = self._cur.execute(
+                "SELECT record FROM comps WHERE object_id=?",
+                (child_oid,)).fetchone()
+            full = bytes(frow[0]) if frow and frow[0] is not None else b""
+            if re.search(rb"<private\s*/>", full):
+                return "<private />"
+            img = CompsRecord.record_attrs(
+                self._cur, child_oid, self._short_header).get(0x66, b"")
+            if re.search(rb"<private\s*/>", img):
+                return "<private />"
         return ""
 
     def _udcn_from_data_collection(self, data_link: int) -> Union[str, None]:
