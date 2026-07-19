@@ -477,6 +477,73 @@ class CommentsRecord:
     _UDI_HISTORY_MARKER = "UDI_HISTORY".encode("utf-16-le") + b"\x00\x00"
 
     @staticmethod
+    def _parse_sp_udi_text(raw: bytes) -> Optional[tuple]:
+        """Recover a SOURCE-PROTECTED long-header AOI UDI text record, or None.
+
+        The UDI type marker ("UDI_EXT_HELP" / "UDI_HISTORY", UTF-16LE) is
+        encrypted along with the text tail under the same AES-CBC scheme as
+        source-protected descriptions, so the plaintext marker gate in
+        _parse_core never fires and the record is dropped. Only the marker's
+        FIRST code unit ('U\\x00') stays plaintext before the ``aa 96 aa 0a``
+        marker; decrypting the tail and splicing that prefix back on
+        reconstructs the exact plaintext layout _parse_udi_text reads.
+
+        Fail-closed: emit nothing unless the framing config is a key we hold,
+        the PKCS7 padding validates, the reconstruction starts with a known UDI
+        marker, and the text decodes as UTF-8. A config we lack (cfg9 etc.)
+        returns None -> the element stays a genuine key floor.
+        """
+        mi = raw.find(_SP_MARKER)
+        if mi < 30:
+            return None
+        framing = _sp_comment_framing(raw)
+        if framing is None:
+            return None
+        ct_off, declared, config = framing
+        ct_len = declared + 16 - declared % 16
+        ct = raw[ct_off:ct_off + ct_len]
+        if len(ct) != ct_len:
+            return None
+        pt = _sp_cbc(ct, _sp_aes(config, _SP_KEY_BY_CONFIG[config]),
+                     ct_len // 16)
+        pad = ct_len - declared
+        if len(pt) != ct_len or pt[-pad:] != bytes([pad]) * pad:
+            return None
+        recon = raw[30:mi] + pt[:declared]
+        if recon.startswith(CommentsRecord._UDI_EXT_HELP_MARKER):
+            marker, tag_ref, object_id = (
+                CommentsRecord._UDI_EXT_HELP_MARKER, "__EXT_HELP__", 0)
+        elif recon.startswith(CommentsRecord._UDI_HISTORY_MARKER):
+            marker, tag_ref, object_id = (
+                CommentsRecord._UDI_HISTORY_MARKER, "__REVISION_NOTE__", 1)
+        else:
+            return None
+        pos = len(marker)
+        while pos < len(recon) and recon[pos] == 0:
+            pos += 1
+        end = recon.find(b"\x00", pos)
+        if end < 0:
+            end = len(recon)
+        try:
+            text = recon[pos:end].decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        if not text:
+            return None
+        return (
+            struct.unpack_from("<H", raw, 4)[0],    # seq_number
+            struct.unpack_from("<H", raw, 8)[0],    # sub_record_length
+            object_id,
+            text,
+            struct.unpack_from("<H", raw, 6)[0],    # record_type
+            struct.unpack_from("<I", raw, 10)[0],   # parent
+            tag_ref,
+            0,
+            0,
+            0,
+        )
+
+    @staticmethod
     def _parse_udi_text(raw: bytes, short_header: bool, marker: bytes,
                         tag_ref: str, object_id: int) -> Optional[tuple]:
         """Parse an AOI UDI text record (help text / revision note), or None.
@@ -845,6 +912,13 @@ class CommentsRecord:
             parsed = CommentsRecord._parse_udi_text(
                 raw_full, short_header, CommentsRecord._UDI_HISTORY_MARKER,
                 "__REVISION_NOTE__", 1)
+            if parsed is not None:
+                return parsed
+        # A source-protected long-header UDI record hides its marker in the
+        # ciphertext, so the plaintext gates above miss it. Recover it (fully
+        # fail-closed) before the operand branches can mis-handle the record.
+        if not short_header and _SP_MARKER in raw_full:
+            parsed = CommentsRecord._parse_sp_udi_text(raw_full)
             if parsed is not None:
                 return parsed
         # V10..V21 short-header operand comments (member/bit/array element
