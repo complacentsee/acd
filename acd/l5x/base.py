@@ -500,6 +500,67 @@ def load_member_limits(cur: Cursor) -> Dict[Tuple[str, str], Tuple[str, str]]:
             for k, d in agg.items() if len(d[2]) == 1 and len(d[3]) == 1}
 
 
+def load_definition_member_limits(
+        cur: Cursor) -> Dict[Tuple[str, str], Tuple[str, str]]:
+    """{(DataType_upper, member_upper): (min, max)} from DEFINITION limit records.
+
+    A UDT member's or AOI parameter's @Min/@Max is also stored DIRECTLY on the
+    definition -- a cip-0x6C empty-operand limit comment record (the sibling of
+    the cip-0x6B tag-own record ``load_member_limits`` never sees). Unlike the
+    instance-propagation path, this needs no instance: it is why an AOI with no
+    instance in the project (previously a floor) still carries its limits.
+
+    Each such record (staged by CommentsRecord._parse_long_own_limit with
+    tag_reference '', member_ref=kind, and the member token in object_id) keys
+    its member by ``member_resolve[(comment_id << 16) | token]`` and its owning
+    DataType by that comment_id. Fail-closed, mirroring load_member_limits:
+    both bounds present, a single value each (newest revision wins), and a
+    comment_id that resolves to more than one DataType is dropped.
+    """
+    rows = [r for r in cur.execute(
+        "SELECT parent, object_id, record_string, member_ref, revision "
+        "FROM comments WHERE member_ref IN (2, 3) AND tag_reference = '' "
+        "AND record_string != ''").fetchall()
+        if (r[0] & 0xFFFF) == 0x6C and r[1]]
+    if not rows:
+        return {}
+    mres = dict(cur.execute(
+        "SELECT k, name FROM member_resolve").fetchall())
+    # comment_id -> DataType, taken from each member comp's own record: a
+    # cip-0x6C child of RxTypeMemberCollection carries the UDT's comment_id at
+    # record[12:14]; its grandparent comp is the UDT/AOI definition. A
+    # comment_id resolving to more than one DataType is ambiguous -> dropped.
+    cid_dts: Dict[int, set] = {}
+    for name, rec in cur.execute(
+            "SELECT g.comp_name, c.record FROM comps c "
+            "JOIN comps p ON c.parent_id = p.object_id "
+            "JOIN comps g ON p.parent_id = g.object_id "
+            "WHERE p.comp_name = 'RxTypeMemberCollection' "
+            "AND c.record IS NOT NULL").fetchall():
+        rb = bytes(rec)
+        if len(rb) >= 14 and struct.unpack_from("<H", rb, 10)[0] == 0x6C:
+            cid_dts.setdefault(
+                struct.unpack_from("<H", rb, 12)[0], set()).add(name)
+    cid_dt = {k: next(iter(v)) for k, v in cid_dts.items() if len(v) == 1}
+    # Newest revision per (comment_id, token, kind).
+    best: Dict[Tuple[int, int, int], Tuple[int, str]] = {}
+    for parent, token, val, kind, rev in rows:
+        k = (parent, token, kind)
+        if k not in best or (rev or 0) > best[k][0]:
+            best[k] = (rev or 0, val)
+    agg: Dict[Tuple[str, str], Dict[int, set]] = {}
+    for (parent, token, kind), (rev, val) in best.items():
+        cidn = parent >> 16
+        dt = cid_dt.get(cidn)
+        member = mres.get((cidn << 16) | token)
+        if dt is None or member is None:
+            continue
+        agg.setdefault((dt.upper(), member.upper()),
+                       {2: set(), 3: set()})[kind].add(val)
+    return {k: (next(iter(d[2])), next(iter(d[3])))
+            for k, d in agg.items() if len(d[2]) == 1 and len(d[3]) == 1}
+
+
 def short_own_description(cur: Cursor, comment_id: int, cip_type: int,
                           require_unique: bool = False) -> Union[str, None]:
     """A component's own Description (short-header V10-V21 form), or None.

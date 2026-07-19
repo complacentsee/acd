@@ -16,6 +16,7 @@ from loguru import logger as log
 from acd.l5x.base import (
     external_access_enum,
     language_desc_oid,
+    load_definition_member_limits,
     load_member_limits,
 )
 from acd.l5x.sheet_layout import build_sheet_layout_rows, build_v21_sheet_rows
@@ -897,6 +898,15 @@ class ExportL5x:
             self._member_limits = load_member_limits(self._cur)
         except Exception:  # noqa: BLE001 - never block export
             self._member_limits = {}
+        # A definition also stores its members' limits directly (cip-0x6C
+        # records); merge them as a FALLBACK so the instance-derived value wins
+        # on any overlap and only the no-instance gaps (e.g. an AOI with no
+        # instance in the project) are filled.
+        try:
+            for _k, _v in load_definition_member_limits(self._cur).items():
+                self._member_limits.setdefault(_k, _v)
+        except Exception:  # noqa: BLE001 - never block export
+            pass
 
     def _load_datatype_tables(self):
         """Populate two side tables the FBD pin-name derivation reads:

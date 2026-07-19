@@ -740,13 +740,18 @@ class CommentsRecord:
 
     @staticmethod
     def _parse_long_own_limit(raw: bytes) -> Optional[tuple]:
-        """Parse a long-header component-OWN engineering-limit record, or None.
+        """Parse a long-header definition-scope engineering-limit record, or None.
 
-        A tag's own @Min/@Max (no operand -- the limit decorates the component
-        itself, not one of its members) is an rt-1 record whose layout matches
-        neither the AsciiRecord description form nor the operand-comment form:
+        A @Min/@Max limit that decorates a component itself (no operand) is an
+        rt-1 record whose layout matches neither the AsciiRecord description
+        form nor the operand-comment form:
           [4:6] seq   [6:8] rt == 1   [8:10] sub_record_length
           [10:14] parent (comment_id << 16 | cip_type)
+          [16:18] member token (u16): 0 when the limit is the component's OWN
+                  (a controller-scope tag, cip 0x6B); the member's resolution
+                  token when it is one member of a definition (a UDT member or
+                  AOI parameter, cip 0x6C) -- (comment_id << 16 | token) is the
+                  member_resolve key.
           [26] == 0x00   [27] kind: 0x02 Min / 0x03 Max   [28:30] revision
           [32:36] u32 CIP type code of the limit datum, zero padding, then the
           value as the record's TRAILING `width` bytes, little-endian.
@@ -757,10 +762,12 @@ class CommentsRecord:
 
         The kaitai AsciiRecord parse previously staged these rows as EMPTY
         descriptions (inert). Staged here as member_ref=kind rows with
-        tag_reference '' (empty operand = component-own) and object_id 0, they
-        stay invisible to every other consumer: operand paths require
-        tag_reference != '', description paths member_ref == 0 or
-        object_id == 1 / a language id.
+        tag_reference '' (empty operand) and the member token in object_id,
+        they stay invisible to every other consumer: operand paths require
+        tag_reference != '', description paths require member_ref == 0. The
+        token (a u16) sits in the object_id column purely as a carrier for
+        base.load_definition_member_limits, which keys on the cip_type; the
+        tag-own consumer (cip 0x6B) never reads it.
         """
         if len(raw) < 47:
             return None
@@ -780,12 +787,11 @@ class CommentsRecord:
         return (
             struct.unpack_from("<H", raw, 4)[0],   # seq_number
             srl,
-            0,                                     # object_id (inert: never 1
-                                                   # nor a language id)
+            struct.unpack_from("<H", raw, 16)[0],  # object_id = member token
             str(val),                              # record_string = the value
             0x01,                                  # record_type
             struct.unpack_from("<I", raw, 10)[0],  # parent
-            "",                                    # tag_reference (own limit)
+            "",                                    # tag_reference (no operand)
             0,                                     # rung_content
             raw[27],                               # member_ref = kind
             raw[27],                               # owner_ref
