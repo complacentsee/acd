@@ -2711,6 +2711,19 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
         )
 
 
+def _is_tombstone_module(rec) -> bool:
+    """True for a device-collection row whose comps record is a deleted-module
+    tombstone: cip word u16@10 == 0x8069 (0x69 with bit 15 set). A tombstone
+    carries NO identity ext-attrs at all -- the all-zero shell the identity
+    fallback would emit is synthesized, not stored -- and Studio never exports
+    the row. Live modules are always 0x0069.
+    """
+    if rec is None:
+        return False
+    b = bytes(rec)
+    return len(b) >= 12 and struct.unpack_from("<H", b, 10)[0] == 0x8069
+
+
 def _axis_sched_class(modid, gcid, known_modids, grp_cids) -> str:
     """Classify one AXIS_CIP_DRIVE record for the MotionSync RPI pass.
 
@@ -6214,7 +6227,12 @@ class ControllerBuilder(L5xElementBuilder):
             # mapping -> ParentModule / :C ConfigTag cascade). Long-header only;
             # its own gauntlet (P6.9 C4). Hard prerequisite of the FDFD flip (C5).
             _dead = CompsRecord.dead_oids(self._cur, self._short_header)
-            mod_rows = [r for r in self._cur.fetchall() if r[1] not in _dead]
+            # Also drop tombstoned rows (cip 0x8069): deleted-module
+            # placeholders that are still seq-live so the FDFD filter misses
+            # them; they have no identity and Studio never exports them.
+            mod_rows = [r for r in self._cur.fetchall()
+                        if r[1] not in _dead
+                        and not _is_tombstone_module(r[2])]
 
             # First pass: build modid→name map so child modules can resolve their
             # parent name. Identity resolution runs the shared recovery chain
