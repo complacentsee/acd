@@ -8,8 +8,10 @@ Each subtree record self-links by object_id at record[12:16] and carries a u16
   * 1003 Step (X/Y, operand, DescBox ref, flags, optional Preset expr, Action
     group ref), 1006 Transition (X/Y, operand, condition body), 1021 Stop,
   * 1005 Action (qualifier, operand, ST body), grouped under a 1004 action group,
-  * 1017/1018 diverge/converge Branch, whose legs (1013/1014) come from a 1012
-    leg-group's trailing hash array, 1007 DirectedLink (from/to hashes + Show),
+  * 1017/1018 diverge/converge Selection Branch and 1019/1020 diverge/converge
+    Simultaneous Branch (same layout, no Priority word), whose legs (1013/1014
+    Selection, 1015/1016 Simultaneous) come from a 1012 leg-group's trailing
+    hash array, 1007 DirectedLink (from/to hashes + Show),
   * 130 DescBox (DescX/DescY), 129 TextBox, 136 Attachment,
   * ST bodies: a 2003 container -> 2002 (ordered line-hash array) -> 2001 line
     records (FF FE FF + UTF-16LE text); operands use the shared ``@<hex>@`` ->
@@ -18,8 +20,11 @@ Each subtree record self-links by object_id at record[12:16] and carries a u16
 A per-record base shift ``d`` (0 for V33-era, -4 for V20-era) is auto-detected
 from the Step->DescBox reference so the same offsets work across firmware.
 
-L5X element IDs are assigned in emit order (steps+their actions, transitions,
+L5X element IDs are assigned in order (steps+their actions, transitions,
 branches+legs, stops, textboxes); links/attachments reference them by hash.
+The document emits Stops AFTER the Branch elements (matching the reference)
+even though Stop IDs precede the TextBox range. Branches sort by Y and fail
+closed on a tie; TextBoxes sort by (X, Y).
 
 Fail-closed: any unrecognised record, an unresolved operand, a hash that does not
 map to an emitted element, or an ambiguous base shift returns None, so the
@@ -187,6 +192,8 @@ def decode_sfc(cur, routine_oid, _prove_sheet=None, textbox_text=None):
         stops = []
         div_b = []
         conv_b = []
+        sdiv_b = []
+        sconv_b = []
         textboxes = []
         attachments = []
         for oid, r in subtree.items():
@@ -201,6 +208,10 @@ def decode_sfc(cur, routine_oid, _prove_sheet=None, textbox_text=None):
                 div_b.append((oid, r))
             elif dd == 1018:
                 conv_b.append((oid, r))
+            elif dd == 1019:
+                sdiv_b.append((oid, r))
+            elif dd == 1020:
+                sconv_b.append((oid, r))
             elif dd == 129:
                 textboxes.append((oid, r))
             elif dd == 136:
@@ -316,25 +327,31 @@ def decode_sfc(cur, routine_oid, _prove_sheet=None, textbox_text=None):
                 return None
             return [bytes(r[ao + 4 * i:ao + 4 * i + 4]) for i in range(cnt)]
 
-        def parse_branch(r, flow):
-            need = (40 if flow == "Diverge" else 36) + d
+        _LEG_KIND = {("Selection", "Diverge"): 1013, ("Selection", "Converge"): 1014,
+                     ("Simultaneous", "Diverge"): 1015, ("Simultaneous", "Converge"): 1016}
+
+        def parse_branch(r, flow, btype):
+            # only a Selection Diverge carries the trailing Priority word
+            has_prio = (flow == "Diverge" and btype == "Selection")
+            need = (40 if has_prio else 36) + d
             if len(r) < need:
                 return None
             Y = u32(r, 28 + d)
             priority = None
-            if flow == "Diverge":
+            if has_prio:
                 if r[36 + d:40 + d] != b"\x01\x00\x00\x00":
                     return None
                 priority = "Default"
             legs = leg_hashes(r[32 + d:36 + d])
             if legs is None:
                 return None
-            want = 1013 if flow == "Diverge" else 1014
+            want = _LEG_KIND[(btype, flow)]
             for lh in legs:
                 lr = by_h(lh)
                 if lr is None or disc(lr) != want:
                     return None
-            return dict(hash=bytes(selfhash(r)), Y=Y, flow=flow, priority=priority, legs=legs)
+            return dict(hash=bytes(selfhash(r)), Y=Y, flow=flow, btype=btype,
+                        priority=priority, legs=legs)
 
         def parse_textbox(r):
             if len(r) != 32:
@@ -368,16 +385,15 @@ def decode_sfc(cur, routine_oid, _prove_sheet=None, textbox_text=None):
                 return None
             P.append(p)
         B = []
-        for oid, r in div_b:
-            p = parse_branch(r, "Diverge")
-            if p is None:
-                return None
-            B.append(p)
-        for oid, r in conv_b:
-            p = parse_branch(r, "Converge")
-            if p is None:
-                return None
-            B.append(p)
+        for lst, flow, btype in ((div_b, "Diverge", "Selection"),
+                                 (conv_b, "Converge", "Selection"),
+                                 (sdiv_b, "Diverge", "Simultaneous"),
+                                 (sconv_b, "Converge", "Simultaneous")):
+            for oid, r in lst:
+                p = parse_branch(r, flow, btype)
+                if p is None:
+                    return None
+                B.append(p)
         TB = []
         for oid, r in textboxes:
             p = parse_textbox(r)
@@ -407,9 +423,9 @@ def decode_sfc(cur, routine_oid, _prove_sheet=None, textbox_text=None):
         if len({b["Y"] for b in B}) != len(B):
             return None
         B.sort(key=lambda b: b["Y"])
-        if len({t["X"] for t in TB}) != len(TB):
+        if len({(t["X"], t["Y"]) for t in TB}) != len(TB):
             return None
-        TB.sort(key=lambda t: t["X"])
+        TB.sort(key=lambda t: (t["X"], t["Y"]))
         nid = 0
         id_by_hash = {}
         for s in S:
@@ -508,21 +524,25 @@ def decode_sfc(cur, routine_oid, _prove_sheet=None, textbox_text=None):
             out += stcontent(t["cond"])
             out.append('</Condition>')
             out.append('</Transition>')
+        for b in B:
+            if b["priority"] is not None:
+                out.append('<Branch ID="%d" Y="%d" BranchType="%s" '
+                           'BranchFlow="Diverge" Priority="%s">'
+                           % (b["id"], b["Y"], b["btype"], b["priority"]))
+            else:
+                out.append('<Branch ID="%d" Y="%d" BranchType="%s" '
+                           'BranchFlow="%s">'
+                           % (b["id"], b["Y"], b["btype"], b["flow"]))
+            for lid in b["legids"]:
+                out.append('<Leg ID="%d"/>' % lid)
+            out.append('</Branch>')
+        # the reference emits Stops after the Branch elements (their IDs
+        # already follow the branch/leg range)
         for p in P:
             dx, dy, dw = p["db"]
             out.append('<Stop ID="%d" X="%d" Y="%d" Operand="%s" '
                        'HideDesc="false" DescX="%d" DescY="%d" DescWidth="%d"/>'
                        % (p["id"], p["X"], p["Y"], escape(p["op"]), dx, dy, dw))
-        for b in B:
-            if b["flow"] == "Diverge":
-                out.append('<Branch ID="%d" Y="%d" BranchType="Selection" '
-                           'BranchFlow="Diverge" Priority="Default">' % (b["id"], b["Y"]))
-            else:
-                out.append('<Branch ID="%d" Y="%d" BranchType="Selection" '
-                           'BranchFlow="Converge">' % (b["id"], b["Y"]))
-            for lid in b["legids"]:
-                out.append('<Leg ID="%d"/>' % lid)
-            out.append('</Branch>')
         for fr, to, show in links:
             out.append('<DirectedLink FromID="%d" ToID="%d" Show="%s"/>' % (fr, to, show))
         for t in TB:
