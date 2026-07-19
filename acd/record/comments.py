@@ -752,7 +752,9 @@ class CommentsRecord:
                   token when it is one member of a definition (a UDT member or
                   AOI parameter, cip 0x6C) -- (comment_id << 16 | token) is the
                   member_resolve key.
-          [26] == 0x00   [27] kind: 0x02 Min / 0x03 Max   [28:30] revision
+          [26] == 0x00   [27] kind: 0x02 Min / 0x03 Max / 0x05 EngineeringUnit
+                 (0x05 carries a UTF-8 text payload, not a numeric tail)
+          [28:30] revision
           [32:36] u32 CIP type code of the limit datum, zero padding, then the
           value as the record's TRAILING `width` bytes, little-endian.
         Structural gate: len(raw) == 32 + sub_record_length and
@@ -769,13 +771,37 @@ class CommentsRecord:
         base.load_definition_member_limits, which keys on the cip_type; the
         tag-own consumer (cip 0x6B) never reads it.
         """
-        if len(raw) < 47:
+        if len(raw) < 34:
             return None
-        if raw[26] != 0x00 or raw[27] not in (0x02, 0x03):
+        if raw[26] != 0x00 or raw[27] not in (0x02, 0x03, 0x05):
             return None
         srl = struct.unpack_from("<H", raw, 8)[0]
         if len(raw) != 32 + srl:
             return None
+        if raw[27] == 0x05:
+            # EngineeringUnit: kind 0x05 carries a UTF-8 NUL-terminated TEXT
+            # payload (12 reserved zero bytes at raw[32:44], then the unit
+            # string), not the numeric tail the Min/Max kinds use.
+            if srl < 13:
+                return None
+            end = raw.find(b"\x00", 44, 32 + srl)
+            if end < 0:
+                end = 32 + srl
+            unit = raw[44:end].decode("utf-8", errors="replace")
+            if not unit:
+                return None
+            return (
+                struct.unpack_from("<H", raw, 4)[0],   # seq_number
+                srl,
+                struct.unpack_from("<H", raw, 16)[0],  # object_id = member token
+                unit,                                  # record_string = the unit
+                0x01,                                  # record_type
+                struct.unpack_from("<I", raw, 10)[0],  # parent
+                "",                                    # tag_reference (no operand)
+                0,                                     # rung_content
+                raw[27],                               # member_ref = kind (5)
+                raw[27],                               # owner_ref
+            )
         fmt = _MINMAX_VALUE_FMT.get(struct.unpack_from("<I", raw, 32)[0])
         if fmt is None or fmt[0] in ("<f", "<d"):
             return None

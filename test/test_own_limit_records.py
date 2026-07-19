@@ -142,3 +142,50 @@ def test_load_definition_member_limits_fail_closed_half_pair():
     cur.execute("INSERT INTO comments VALUES (0,15,?,'7',1,?,'',0,3,3,0)",
                 (TOK, (CID << 16) | 0x6C))
     assert load_definition_member_limits(cur) == {}
+
+
+def test_engineering_unit_record_parses_text_payload():
+    # kind 0x05: 12 reserved zero bytes at raw[32:44], then UTF-8 NUL-term text.
+    srl = 15  # 12 reserved + "ms" (2) + NUL (1)
+    body = bytearray(18 + srl)
+    struct.pack_into("<H", body, 2, 0x3AAB)   # member token @raw[16:18]
+    body[13] = 0x05                           # kind = EngineeringUnit
+    body[len(body) - 3:] = b"ms\x00"
+    raw = (struct.pack("<I", 0x0A + len(body))
+           + struct.pack("<HHHI", 1, 1, srl, (0x099D << 16) | 0x6C)
+           + bytes(body))
+    row = CommentsRecord.parse(_dat(raw))
+    assert row is not None
+    assert row[3] == "ms"            # record_string = the unit text
+    assert row[8] == 0x05            # member_ref = kind (EngineeringUnit)
+    assert row[6] == ""              # empty operand
+    assert row[2] == 0x3AAB          # object_id = member token
+
+
+def test_load_definition_member_engineering_units_end_to_end():
+    import sqlite3
+    from acd.l5x.base import load_definition_member_engineering_units
+    db = sqlite3.connect(":memory:")
+    cur = db.cursor()
+    cur.execute("CREATE TABLE comps(object_id int, parent_id int, "
+                "comp_name text, record BLOB)")
+    cur.execute("CREATE TABLE member_resolve(k INTEGER PRIMARY KEY, name TEXT)")
+    cur.execute("CREATE TABLE comments(seq_number int, sub_record_length int, "
+                "object_id int, record_string text, record_type int, "
+                "parent int, tag_reference text, rung_content int, "
+                "member_ref int, owner_ref int, revision int)")
+    CID, TOK = 0x099D, 0x3AAB
+    mrec = bytearray(14)
+    struct.pack_into("<H", mrec, 10, 0x6C)
+    struct.pack_into("<H", mrec, 12, CID)
+    cur.execute("INSERT INTO comps VALUES (10, 0, 'SP_K50_HMI', NULL)")
+    cur.execute("INSERT INTO comps VALUES (20, 10, 'RxTypeMemberCollection', "
+                "NULL)")
+    cur.execute("INSERT INTO comps VALUES (30, 20, 'On_Delay', ?)",
+                (bytes(mrec),))
+    cur.execute("INSERT INTO member_resolve VALUES (?, 'On_Delay')",
+                ((CID << 16) | TOK,))
+    cur.execute("INSERT INTO comments VALUES (0,15,?,'ms',1,?,'',0,5,5,0)",
+                (TOK, (CID << 16) | 0x6C))
+    got = load_definition_member_engineering_units(cur)
+    assert got == {("SP_K50_HMI", "ON_DELAY"): "ms"}

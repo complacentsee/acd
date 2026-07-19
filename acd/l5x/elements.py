@@ -5391,6 +5391,10 @@ class ControllerBuilder(L5xElementBuilder):
     # from instance operand comments (base.load_member_limits), applied to AOI
     # Parameters and UDT Members. Empty -> no @Min/@Max emitted (prior behaviour).
     _member_limits: Dict = field(default_factory=dict)
+    # {(DATATYPE_UPPER, MEMBER_UPPER): unit} EngineeringUnit strings recovered
+    # from definition-scope comment records (base.load_definition_member_
+    # engineering_units), applied to UDT Members. Empty -> none emitted.
+    _member_eng_units: Dict = field(default_factory=dict)
     # ACD save-version major (e.g. 21, 36). 0 if unknown. Used to gate
     # version-specific attribute emission (e.g. Program/@UseAsFolder).
     _acd_major: int = field(default=0)
@@ -5743,6 +5747,7 @@ class ControllerBuilder(L5xElementBuilder):
             dt = DataTypeBuilder(
                 self._cur, _data_type_object_id, _short_header=self._short_header,
                 _member_limits=self._member_limits,
+                _member_eng_units=self._member_eng_units,
             ).build()
             all_data_types_map[dt.name.upper()] = dt
             if self._short_header:

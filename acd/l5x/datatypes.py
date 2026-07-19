@@ -45,21 +45,34 @@ class Member(L5xElement):
     # DataTypeBuilder from the project's instance operand comments.
     max: Union[str, None] = field(default=None)
     min: Union[str, None] = field(default=None)
+    # EngineeringUnit CDATA child text (None omits the element). Rendered after
+    # <Description>. Recovered by DataTypeBuilder from the definition-scope
+    # kind-0x05 comment records.
+    _engineering_unit: Union[str, None] = field(default=None)
 
     def to_xml(self) -> str:
         # ``base`` already carries any @Max/@Min (public fields rendered by the
-        # generic serializer); only the <Description> child needs injecting here.
+        # generic serializer); the <Description> and <EngineeringUnit> children
+        # need injecting here.
         base = super().to_xml()
-        if self._description is None:
+        if self._description is None and self._engineering_unit is None:
             return base
         # A "" description is the foreign-only sentinel: the member has a
         # description in some non-export language, which the reference exports as
         # a literal empty <Description/> (minidom self-closes it).
-        desc_xml = (f'<Description>\n<![CDATA[{_xml_sane(self._description)}]]>\n'
-                    f'</Description>' if self._description
-                    else '<Description></Description>')
+        child_xml = ""
+        if self._description is not None:
+            child_xml += (
+                f'<Description>\n<![CDATA[{_xml_sane(self._description)}]]>\n'
+                f'</Description>' if self._description
+                else '<Description></Description>')
+        # EngineeringUnit follows Description in the reference sibling order.
+        if self._engineering_unit:
+            child_xml += (f'<EngineeringUnit>\n<![CDATA['
+                          f'{_xml_sane(self._engineering_unit)}]]>\n'
+                          f'</EngineeringUnit>')
         idx = base.index(">")
-        return base[:idx + 1] + desc_xml + base[idx + 1:]
+        return base[:idx + 1] + child_xml + base[idx + 1:]
 
 
 @dataclass
@@ -443,6 +456,9 @@ class DataTypeBuilder(L5xElementBuilder):
     # from instance operand comments (base.load_member_limits), applied to this
     # datatype's members below. Empty -> no @Min/@Max (prior behaviour).
     _member_limits: Dict = field(default_factory=dict)
+    # {(DATATYPE_UPPER, MEMBER_UPPER): unit} EngineeringUnit strings, applied to
+    # this datatype's members. Empty -> none emitted.
+    _member_eng_units: Dict = field(default_factory=dict)
 
     def build(self) -> DataType:
         # Export-schema major, passed to each MemberBuilder for the rule-A
@@ -736,6 +752,13 @@ class DataTypeBuilder(L5xElementBuilder):
                     (name.upper(), (_m.name or "").upper()))
                 if _lim is not None:
                     _m.min, _m.max = _lim
+        # A member's EngineeringUnit is stored the same definition-scope way.
+        if self._member_eng_units:
+            for _m in children:
+                _u = self._member_eng_units.get(
+                    (name.upper(), (_m.name or "").upper()))
+                if _u is not None:
+                    _m._engineering_unit = _u
 
         dt = DataType(name, name, string_family, class_type, children, description,
                       _custom_properties=custom_props)

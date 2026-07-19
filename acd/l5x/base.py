@@ -526,22 +526,7 @@ def load_definition_member_limits(
         return {}
     mres = dict(cur.execute(
         "SELECT k, name FROM member_resolve").fetchall())
-    # comment_id -> DataType, taken from each member comp's own record: a
-    # cip-0x6C child of RxTypeMemberCollection carries the UDT's comment_id at
-    # record[12:14]; its grandparent comp is the UDT/AOI definition. A
-    # comment_id resolving to more than one DataType is ambiguous -> dropped.
-    cid_dts: Dict[int, set] = {}
-    for name, rec in cur.execute(
-            "SELECT g.comp_name, c.record FROM comps c "
-            "JOIN comps p ON c.parent_id = p.object_id "
-            "JOIN comps g ON p.parent_id = g.object_id "
-            "WHERE p.comp_name = 'RxTypeMemberCollection' "
-            "AND c.record IS NOT NULL").fetchall():
-        rb = bytes(rec)
-        if len(rb) >= 14 and struct.unpack_from("<H", rb, 10)[0] == 0x6C:
-            cid_dts.setdefault(
-                struct.unpack_from("<H", rb, 12)[0], set()).add(name)
-    cid_dt = {k: next(iter(v)) for k, v in cid_dts.items() if len(v) == 1}
+    cid_dt = _cid_datatype_map(cur)
     # Newest revision per (comment_id, token, kind).
     best: Dict[Tuple[int, int, int], Tuple[int, str]] = {}
     for parent, token, val, kind, rev in rows:
@@ -559,6 +544,64 @@ def load_definition_member_limits(
                        {2: set(), 3: set()})[kind].add(val)
     return {k: (next(iter(d[2])), next(iter(d[3])))
             for k, d in agg.items() if len(d[2]) == 1 and len(d[3]) == 1}
+
+
+def _cid_datatype_map(cur: Cursor) -> Dict[int, str]:
+    """comment_id -> DataType name from cip-0x6C member comps (unambiguous only).
+
+    Shared by the definition-scope limit / engineering-unit loaders: a cip-0x6C
+    child of RxTypeMemberCollection carries its UDT's comment_id at record
+    [12:14]; the grandparent comp is the UDT. A comment_id resolving to more
+    than one DataType is dropped.
+    """
+    cid_dts: Dict[int, set] = {}
+    for name, rec in cur.execute(
+            "SELECT g.comp_name, c.record FROM comps c "
+            "JOIN comps p ON c.parent_id = p.object_id "
+            "JOIN comps g ON p.parent_id = g.object_id "
+            "WHERE p.comp_name = 'RxTypeMemberCollection' "
+            "AND c.record IS NOT NULL").fetchall():
+        rb = bytes(rec)
+        if len(rb) >= 14 and struct.unpack_from("<H", rb, 10)[0] == 0x6C:
+            cid_dts.setdefault(
+                struct.unpack_from("<H", rb, 12)[0], set()).add(name)
+    return {k: next(iter(v)) for k, v in cid_dts.items() if len(v) == 1}
+
+
+def load_definition_member_engineering_units(
+        cur: Cursor) -> Dict[Tuple[str, str], str]:
+    """{(DataType_upper, member_upper): unit} from DEFINITION EngineeringUnit records.
+
+    The exact kind-0x05 sibling of the definition Min/Max records
+    (load_definition_member_limits): a cip-0x6C empty-operand comment record
+    (member_ref=5) whose record_string is the UTF-8 unit text, keyed to its
+    member by member_resolve[(comment_id << 16) | token] and to its DataType by
+    that comment_id. Fail-closed: a member resolving to more than one distinct
+    unit text (newest revision aside) is dropped.
+    """
+    rows = [r for r in cur.execute(
+        "SELECT parent, object_id, record_string, revision "
+        "FROM comments WHERE member_ref = 5 AND tag_reference = '' "
+        "AND record_string != ''").fetchall()
+        if (r[0] & 0xFFFF) == 0x6C and r[1]]
+    if not rows:
+        return {}
+    mres = dict(cur.execute("SELECT k, name FROM member_resolve").fetchall())
+    cid_dt = _cid_datatype_map(cur)
+    best: Dict[Tuple[int, int], Tuple[int, str]] = {}
+    for parent, token, unit, rev in rows:
+        k = (parent, token)
+        if k not in best or (rev or 0) > best[k][0]:
+            best[k] = (rev or 0, unit)
+    agg: Dict[Tuple[str, str], set] = {}
+    for (parent, token), (rev, unit) in best.items():
+        cidn = parent >> 16
+        dt = cid_dt.get(cidn)
+        member = mres.get((cidn << 16) | token)
+        if dt is None or member is None:
+            continue
+        agg.setdefault((dt.upper(), member.upper()), set()).add(unit)
+    return {k: next(iter(v)) for k, v in agg.items() if len(v) == 1}
 
 
 def short_own_description(cur: Cursor, comment_id: int, cip_type: int,

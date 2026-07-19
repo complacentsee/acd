@@ -16,6 +16,7 @@ from loguru import logger as log
 from acd.l5x.base import (
     external_access_enum,
     language_desc_oid,
+    load_definition_member_engineering_units,
     load_definition_member_limits,
     load_member_limits,
 )
@@ -907,6 +908,13 @@ class ExportL5x:
                 self._member_limits.setdefault(_k, _v)
         except Exception:  # noqa: BLE001 - never block export
             pass
+        # A definition member's EngineeringUnit is the kind-0x05 sibling of the
+        # limit records above, keyed the same (DataType, member) way.
+        try:
+            self._member_eng_units = \
+                load_definition_member_engineering_units(self._cur)
+        except Exception:  # noqa: BLE001 - never block export
+            self._member_eng_units = {}
 
     def _load_datatype_tables(self):
         """Populate two side tables the FBD pin-name derivation reads:
@@ -1084,6 +1092,7 @@ class ExportL5x:
                 _short_header=self._comps_short_header,
                 _taginfo_layout=getattr(self, "_taginfo_layout", {}),
                 _member_limits=getattr(self, "_member_limits", {}),
+                _member_eng_units=getattr(self, "_member_eng_units", {}),
                 _acd_major=_major,
                 _device_major=_dev_major,
                 _device_minor=_dev_minor,
