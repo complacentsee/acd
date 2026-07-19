@@ -1543,8 +1543,13 @@ class Routine(L5xElement):
                     # Logix Designer writes them (e.g. an emoji -> &#x01F600;).
                     comment_text = Tag._sanitize_xml_text(self._rung_comments[i])
                     comment_xml = f'<Comment><![CDATA[{comment_text}]]></Comment>'
+                # An empty routine's sole rung serializes as a bare ';' (the
+                # rung terminator, no instructions); Studio exports that
+                # placeholder as Type='e'. A rung with real ladder text has
+                # instructions before its ';' (text != ';') and stays 'N'.
+                rung_type = "e" if text == ";" else "N"
                 rung_xmls.append(
-                    f'<Rung Number="{i}" Type="N">'
+                    f'<Rung Number="{i}" Type="{rung_type}">'
                     f'{self._rung_custom_properties.get(i, "")}'
                     f'{comment_xml}'
                     f'<Text><![CDATA[{text}]]></Text>'
