@@ -216,6 +216,11 @@ class Module(L5xElement):
     # A connection whose suffix is absent falls back to the merged _input_inner /
     # _output_inner, so single-family modules are unchanged.
     _io_suffix_map: Union[dict, None] = field(default=None)
+    # True when the module's I/O map entry resolved but owns no output backing tag
+    # (:O/:O1/:O2/:SO or has_O). Studio never emits an <OutputTag> without a
+    # backing output tag, so its connections' OutputTag stubs are suppressed. An
+    # unresolved entry leaves this False (keeps today's emission -- fail-safe).
+    _io_no_output: bool = field(default=False)
     # Whether the module owns an :I / :O tag (a rack card's input :I tag carries no
     # design-value image, so _input_inner can be None even when the card has input);
     # used to decide a <RackConnection>'s InAliasTag / OutAliasTag presence.
@@ -416,7 +421,7 @@ class Module(L5xElement):
                                 self._io_suffix_map, c.get("InputTagSuffix"),
                                 self._input_inner)
                         tag_stubs += _io_tag("InputTag", inner)
-                    if c.get("has_output", True):
+                    if c.get("has_output", True) and not self._io_no_output:
                         # A safety output connection's <OutputTag> reuses the
                         # module's safety output (:SO) backing tag when the module
                         # owns one (motion-drive safety, e.g. CIP_Motion_Device_
@@ -1792,6 +1797,7 @@ class ModuleBuilder(L5xElementBuilder):
         safety_output_inner = None
         status_inner = None
         io_suffix_map = None
+        io_no_output = False
         rack_has_input = False
         rack_has_output = False
         rack_in_alias_inner = None
@@ -1835,6 +1841,9 @@ class ModuleBuilder(L5xElementBuilder):
                 for k in ("I", "SI", "I1", "I2", "O", "O1", "O2", "SO")
                 if isinstance(entry.get(k), str)
             } or None
+            io_no_output = not (
+                any(entry.get(k) for k in ("O", "O1", "O2", "SO"))
+                or entry.get("has_O"))
             rack_has_input = bool(entry.get("has_I"))
             rack_has_output = bool(entry.get("has_O"))
             rack_in_alias_inner = entry.get("alias_inner_I")
@@ -2196,6 +2205,7 @@ class ModuleBuilder(L5xElementBuilder):
             _safety_output_inner=safety_output_inner,
             _status_inner=status_inner,
             _io_suffix_map=io_suffix_map,
+            _io_no_output=io_no_output,
             _rack_has_input=rack_has_input,
             _rack_has_output=rack_has_output,
             _rack_in_alias_inner=rack_in_alias_inner,
