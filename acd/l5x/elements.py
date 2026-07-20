@@ -92,6 +92,7 @@ from acd.l5x.sfc_content import decode_sfc as _decode_sfc
 from acd.l5x.fbd_content import decode_fbd as _decode_fbd
 from acd.l5x.sheet_layout import sheet_size_of as _sheet_size_of
 from acd.l5x.textbox_text import textbox_texts_for as _textbox_texts_for
+from acd.l5x.textbox_text import textbox_texts_v20_for as _textbox_texts_v20_for
 from acd.l5x.trends import build_trends
 from acd.record.blobs import ControllerProps
 from acd.record.comps import CompsRecord, _SP_MARKER, decrypt_sp_nameless
@@ -3658,8 +3659,13 @@ class RoutineBuilder(L5xElementBuilder):
         sfc_content = None
         if routine_type == "SFC":
             _sheet = _sheet_size_of(self._cur, r.comment_id, bytes(record))
+            # V20 (old-layout) TextBox text lives in a sibling table keyed by an
+            # FO index instead of a global md; the decoder picks the right map by
+            # detected layout. Modern files return an empty V20 map (no-op).
+            _mdtext_v20 = _textbox_texts_v20_for(self._cur, r.comment_id)
             sfc_content = _decode_sfc(self._cur, self._object_id,
-                                      _prove_sheet=_sheet, textbox_text=_mdtext)
+                                      _prove_sheet=_sheet, textbox_text=_mdtext,
+                                      textbox_text_v20=_mdtext_v20)
         fbd_content = None
         if routine_type == "FBD":
             _sheet = _sheet_size_of(self._cur, r.comment_id, bytes(record))

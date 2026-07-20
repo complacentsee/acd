@@ -21,7 +21,8 @@ from acd.l5x.base import (
     load_member_limits,
 )
 from acd.l5x.sheet_layout import build_sheet_layout_rows, build_v21_sheet_rows
-from acd.l5x.textbox_text import build_textbox_text_rows
+from acd.l5x.textbox_text import (build_textbox_text_rows,
+                                  build_textbox_text_v20_rows)
 from acd.l5x.elements import (
     Controller,
     ControllerBuilder,
@@ -693,13 +694,23 @@ class ExportL5x:
         # can render each TextBox's <Text>. See acd.l5x.textbox_text.
         self._cur.execute(
             "CREATE TABLE textbox_text(cid int, md int, text text)")
+        # V20 (old-layout) files store TextBox text in "FO_<n>" records instead;
+        # a sibling table keeps the modern MD_ path byte-for-byte untouched.
+        self._cur.execute(
+            "CREATE TABLE textbox_text_v20(cid int, idx int, text text)")
         try:
             with open(os.path.join(self._temp_dir, "Comments.Dat"), "rb") as _cf:
-                _tb_rows = build_textbox_text_rows(_cf.read())
+                _cdat = _cf.read()
             self._cur.executemany(
-                "INSERT INTO textbox_text VALUES (?,?,?)", _tb_rows)
+                "INSERT INTO textbox_text VALUES (?,?,?)",
+                build_textbox_text_rows(_cdat))
+            self._cur.executemany(
+                "INSERT INTO textbox_text_v20 VALUES (?,?,?)",
+                build_textbox_text_v20_rows(_cdat))
             self._cur.execute(
                 "CREATE INDEX idx_textbox_text ON textbox_text(cid)")
+            self._cur.execute(
+                "CREATE INDEX idx_textbox_text_v20 ON textbox_text_v20(cid)")
             self._db.commit()
         except Exception:  # noqa: BLE001
             pass

@@ -54,7 +54,8 @@ _STEP_MASK = 0x33
 _SHEET = ('Letter - 8.5 x 11 in', 'Landscape')
 
 
-def decode_sfc(cur, routine_oid, _prove_sheet=None, textbox_text=None):
+def decode_sfc(cur, routine_oid, _prove_sheet=None, textbox_text=None,
+               textbox_text_v20=None):
     try:
         def kids(oid):
             return [o for (o,) in cur.execute(
@@ -361,9 +362,16 @@ def decode_sfc(cur, routine_oid, _prove_sheet=None, textbox_text=None):
         def parse_textbox(r):
             if len(r) != 32:
                 return None
-            md = u32(r, 20 + d)
             X = u32(r, 24 + d)
             Y = u32(r, 28 + d)
+            if d == 0:
+                # modern: record[20:24] is the global md id linking the MD_ text
+                md = u32(r, 20 + d)
+            else:
+                # V20: record[28:32] is the FO text index (0xFFFFFFFF = no text),
+                # the layout slot the modern md occupied is X here.
+                raw = u32(r, 28)
+                md = None if raw == 0xFFFFFFFF else raw
             return dict(hash=bytes(selfhash(r)), X=X, Y=Y, md=md)
 
         def parse_attachment(r):
@@ -580,8 +588,12 @@ def decode_sfc(cur, routine_oid, _prove_sheet=None, textbox_text=None):
                        % (p["id"], p["X"], p["Y"], escape(p["op"]), dx, dy, dw))
         for fr, to, show in links:
             out.append('<DirectedLink FromID="%d" ToID="%d" Show="%s"/>' % (fr, to, show))
+        # modern textboxes resolve text by global md id; V20 (old-layout)
+        # textboxes resolve by the FO index carried in record[28:32]. A file is
+        # exclusively one layout, so the two maps never overlap.
+        _tbmap = textbox_text if d == 0 else textbox_text_v20
         for t in TB:
-            txt = (textbox_text or {}).get(t["md"])
+            txt = None if t["md"] is None else (_tbmap or {}).get(t["md"])
             if txt is None:
                 out.append('<TextBox ID="%d" X="%d" Y="%d" Width="0"/>'
                            % (t["id"], t["X"], t["Y"]))
