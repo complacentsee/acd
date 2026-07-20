@@ -4906,7 +4906,13 @@ class ProgramBuilder(L5xElementBuilder):
                 _hit = _rout_by_id16.get(_ref)
                 if _ref and _hit and len(_hit) == 1:
                     main_routine_name = _hit[0]
-        if main_routine_name is None:
+        # An explicit "no main routine" sentinel (0xFFFFFFFF at the short-layout
+        # @0x1C6 main-routine reference) means the program has no main even when a
+        # routine happens to be named "main", so suppress that last-ditch fallback.
+        # Long-layout records read 0 there and are unaffected.
+        _no_main = (_rxok and len(prog_record) >= 0x1CA
+                    and struct.unpack_from("<I", prog_record, 0x1C6)[0] == 0xFFFFFFFF)
+        if main_routine_name is None and not _no_main:
             _cand = [n for n in routs.values() if n.lower() == "main"]
             if len(_cand) == 1:
                 main_routine_name = _cand[0]
@@ -5074,7 +5080,11 @@ class ProgramBuilder(L5xElementBuilder):
             except Exception:
                 prog_cp = ""
 
-        prog = Program(name, name, prog_cls, "false", main_routine_name,
+        # TestEdits is the program record flag byte at 0x74 (1 -> "true"); it is
+        # the sole discriminator across both program-record layouts.
+        _test_edits = ("true" if len(prog_record) > 0x74 and prog_record[0x74] == 1
+                       else "false")
+        prog = Program(name, name, prog_cls, _test_edits, main_routine_name,
                        fault_routine_name, disabled, sync_redundancy, use_as_folder,
                        tags, routines, safety_signature=prog_sig,
                        safety_signature_timestamp=prog_sig_ts,
@@ -6722,6 +6732,21 @@ class ControllerBuilder(L5xElementBuilder):
         # "Timestamp\x11GSS"). When present, the reference stamps the AOI collection
         # element with an all-zero signature and the (modal) GSS timestamp.
         aoi_sig = aoi_sig_ts = None
+        try:
+            # First: the AOI definition collection's own (otype, cid, disc) triple
+            # (body+10/+12/+16) keys the real signature in connection_signatures,
+            # exactly as a <Tags> collection does. On a hit, use it verbatim.
+            _cf = self._cur.execute(
+                "SELECT record FROM comps WHERE "
+                "comp_name='RxUDIDefinitionCollection'").fetchone()
+            if _cf and _cf[0]:
+                _rb = bytes(_cf[0])
+                if len(_rb) >= 20:
+                    _sr = connection_signature_row(self._cur, _rb, 0)
+                    if _sr and _sr[0]:
+                        return _sr[0], _sr[1]
+        except Exception:
+            pass
         try:
             _gss = [g[0] for g in self._cur.execute(
                 "SELECT record_string FROM comments WHERE tag_reference=?",
