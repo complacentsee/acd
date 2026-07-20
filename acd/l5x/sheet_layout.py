@@ -180,9 +180,14 @@ def _sl_chain_lookup(cur, comment_id: int,
     can never shadow the live one.
     """
     try:
+        # The hidden sheet tag names the discriminator either in decimal
+        # (__SL42620) or zero-padded hex (__SL0000a67c); query both spellings.
+        # The comment_id + single-candidate gates below keep the resolution
+        # unambiguous, and the '0000'-prefixed hex form cannot collide with a
+        # decimal spelling of the same disc.
         rows = cur.execute(
-            "SELECT object_id, record FROM comps WHERE comp_name=?",
-            ("__SL%d" % disc,)).fetchall()
+            "SELECT object_id, record FROM comps WHERE comp_name IN (?, ?)",
+            ("__SL%d" % disc, "__SL%08x" % disc)).fetchall()
     except Exception:  # noqa: BLE001
         return None
     if not rows:
