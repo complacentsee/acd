@@ -2006,8 +2006,14 @@ class Controller(L5xElement):
                f'TimeZone="{self._wct_time_zone}"/>')
             + self._trends_xml
             + ('<DataLogs/>' if self._emit_data_logs else '')
-            + (f'<TimeSynchronize Priority1="{self._ts_priority1}" '
-               f'Priority2="{self._ts_priority2}" PTPEnable="{self._ts_ptp_enable}"/>')
+            # The reference omits <TimeSynchronize> on the pre-V18 save format
+            # (V17 has no TimeSynchronize comp and its export carries no element),
+            # and emits it from V19 on. Gate on our own MajorRev, same style as the
+            # Security<20 gate above (fail-closed: an unknown version keeps it).
+            + ('' if str(self.major_rev).isdigit() and int(self.major_rev) <= 17
+               else (f'<TimeSynchronize Priority1="{self._ts_priority1}" '
+                     f'Priority2="{self._ts_priority2}" '
+                     f'PTPEnable="{self._ts_ptp_enable}"/>'))
             + self._internet_protocol_xml
             + self._ethernet_ports_xml
             + self._ethernet_network_xml
