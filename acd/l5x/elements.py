@@ -5080,11 +5080,7 @@ class ProgramBuilder(L5xElementBuilder):
             except Exception:
                 prog_cp = ""
 
-        # TestEdits is the program record flag byte at 0x74 (1 -> "true"); it is
-        # the sole discriminator across both program-record layouts.
-        _test_edits = ("true" if len(prog_record) > 0x74 and prog_record[0x74] == 1
-                       else "false")
-        prog = Program(name, name, prog_cls, _test_edits, main_routine_name,
+        prog = Program(name, name, prog_cls, "false", main_routine_name,
                        fault_routine_name, disabled, sync_redundancy, use_as_folder,
                        tags, routines, safety_signature=prog_sig,
                        safety_signature_timestamp=prog_sig_ts,
