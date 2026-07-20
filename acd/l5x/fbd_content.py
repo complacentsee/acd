@@ -201,7 +201,7 @@ def _datatype_pinmap(cur, datatype, array_slots=()):
     occupy (each 0x75 array record states its slot: MAVE StorageArray=9 /
     WeightArray=10, FGEN X1=7 Y1=8 X2=9 Y2=10). Members then fill the FREE
     slots in ordinal order -- except that the first hidden ``ulBoolOutput1``
-    fills AFTER the member that follows it (Brenton MAVE: EnableOut=11,
+    fills AFTER the member that follows it (a MAVE block: EnableOut=11,
     collector=12, Out=13; with no arrays the collector keeps its ordinal
     slot, CTUD-attested).
     """
