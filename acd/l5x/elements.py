@@ -4290,6 +4290,27 @@ class AoiBuilder(L5xElementBuilder):
                     and _xml_sane(_vendor) == _vendor):
                 vendor = _vendor
                 break
+        if vendor is None and not e01:
+            # Legacy AOI schema with no ext-attr 0x01: the Vendor is stored inline
+            # in the definition record. Run the identical structural scan over the
+            # raw record, but require a UNIQUE hit (fail closed) since the record is
+            # larger than the e01 blob and could carry an unrelated printable field.
+            _cands = []
+            for _p in range(6, len(aoi_record) - 1):
+                if aoi_record[_p - 6:_p - 2] != b"\x00\x00\x00\x00":
+                    continue
+                _vl = struct.unpack_from("<H", aoi_record, _p - 2)[0]
+                if not (0 < _vl <= 64) or _p + _vl > len(aoi_record):
+                    continue
+                try:
+                    _v = aoi_record[_p:_p + _vl].decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                if (_v.strip() and all(0x20 <= ord(c) < 0x7F for c in _v)
+                        and _xml_sane(_v) == _v):
+                    _cands.append(_v)
+            if len(_cands) == 1:
+                vendor = _cands[0]
 
         # --- Metadata from large nameless record ---
         self._cur.execute(
