@@ -2038,10 +2038,13 @@ class Controller(L5xElement):
             + self._trends_xml
             + ('<DataLogs/>' if self._emit_data_logs else '')
             + self._quick_watch_lists_xml
-            # The reference omits <TimeSynchronize> on the pre-V18 save format
-            # (V17 has no TimeSynchronize comp and its export carries no element),
-            # and emits it from V19 on. Gate on our own MajorRev, same style as the
-            # Security<20 gate above (fail-closed: an unknown version keeps it).
+            # CIP Sync / controller Time Synchronization (the PTP feature this
+            # element configures) was introduced in RSLogix 5000 v18 (Rockwell
+            # release notes: "Version 18.00.00 introduced CIP Synchronized Time
+            # Coordination"; the feature is available from controller firmware
+            # rev 18). So V17 and earlier export no <TimeSynchronize> element and
+            # V18+ do. Gate on our own MajorRev (emit at >= 18), same fail-closed
+            # style as the Security<20 gate above (an unknown version keeps it).
             + ('' if str(self.major_rev).isdigit() and int(self.major_rev) <= 17
                else (f'<TimeSynchronize Priority1="{self._ts_priority1}" '
                      f'Priority2="{self._ts_priority2}" '
@@ -6954,6 +6957,24 @@ class ControllerBuilder(L5xElementBuilder):
         # drive that really is grouped is never wrongly zeroed. Long-header
         # only.
         try:
+            # Studio v37+ exports every MotionSync connection with RPI 0 regardless
+            # of axis scheduling -- all four v37 references in the corpus do so,
+            # including SERCOS modules the CIP-Motion scheduling pass below does not
+            # cover. NOTE: this is a VERSION-KEYED heuristic and we are NOT fully
+            # confident it is a true version gate. The four witnesses could instead
+            # share another property (e.g. all their motion drives happen to be
+            # unscheduled), so this may not generalise; it is gated on the real
+            # gauntlet (0-worse) and applies only from v37 up, leaving pre-v37
+            # behaviour (the axis-scheduling pass below) unchanged.
+            _pf = self._cur.execute(
+                "SELECT sw_major FROM project_flags").fetchone()
+            _sw_major = (_pf[0] if _pf else 0) or 0
+            if _sw_major >= 37:
+                for _m in modules:
+                    for _c in _m._connections:
+                        if _c.get("type") == "MotionSync":
+                            _c["rpi"] = "0"
+                return
             if not self._short_header:
                 _axis_tags = [t for t in tags if (t.data_type or "") == "AXIS_CIP_DRIVE"]
                 _grp_tags = [t for t in tags
