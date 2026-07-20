@@ -256,6 +256,12 @@ class TagAliasResolver:
                             else seg + ".%d" % inner
                     if inner == 0:
                         return seg
+                    # Same legacy-struct-with-layout recursion for an array element.
+                    if self._taginfo_layout.get(mdt.upper()) is not None:
+                        sub = self._alias_walk_members(mdt, inner, alias_is_bool,
+                                                       "", alias_dt)
+                        if sub is not None:
+                            return seg + "." + sub
                     return None
             else:
                 if mbits is None:
@@ -272,6 +278,15 @@ class TagAliasResolver:
                                 else (prefix + mname + ".%d" % inner)
                         if inner == 0:
                             return prefix + mname
+                        # A legacy struct member (COUNTER/TIMER/CONTROL) that also
+                        # has a TagInfo layout: recurse so a non-BOOL alias landing
+                        # mid-member (e.g. COUNTER.ACC at bit 64) resolves by name
+                        # instead of failing closed to the Base fallback.
+                        if self._taginfo_layout.get(mdt.upper()) is not None:
+                            sub = self._alias_walk_members(mdt, inner, alias_is_bool,
+                                                           "", alias_dt)
+                            if sub is not None:
+                                return prefix + mname + "." + sub
                         return None
                     # non-atomic struct member: whole-member stop if alias dt matches
                     inner = target_bit - base_bit
