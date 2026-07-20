@@ -2180,8 +2180,19 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
         # the Base Constant="false" invariant (below) supply Constant.
         is_sp = _SP_MARKER in raw_rec
         if is_sp:
+            # The ext-attr tail is AES-encrypted, so ExternalAccess is not readable
+            # at the plaintext 0x278 offset. Decrypt the tail and take it from the
+            # attr-0x1 value byte 542 (the same field the plaintext path reads at
+            # 0x278); fall back to the plaintext main+34 byte when the tail does not
+            # decrypt to a long-enough attr (short/absent attr-1).
             external_access = external_access_enum(raw_rec[48])  # main+34, low byte
             constant = None
+            try:
+                _a1 = CompsRecord.read_ext_attrs_from_record(raw_rec).get(0x1, b"")
+                if len(_a1) >= 544:
+                    external_access = external_access_enum(_a1[542])
+            except Exception:
+                pass
         elif len(raw_rec) > 0x279:
             external_access = external_access_enum(raw_rec[0x278])
             constant = "true" if raw_rec[0x279] else None
