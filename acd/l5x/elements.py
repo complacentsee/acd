@@ -267,6 +267,21 @@ except ValueError:
 # body that could cross the threshold.
 _MIN_DECORATED_ELEM_CHARS = 10
 
+# Raw value-image BYTE ceiling at/above which Studio omits the L5K-first Decorated
+# <Data> block. The element-count ceiling above misses a tag whose Decorated tree
+# is modest in COUNT but whose value image is huge (e.g. a Revision UDT): a corpus
+# census of every L5K-first tag shows a clean frontier -- the largest kept image
+# is 97,928 bytes and the smallest omitted is 102,580, with zero overlap -- so a
+# single global threshold inside that gap suppresses exactly the omitted tags and
+# no kept one. Applied IN ADDITION to the element ceiling (either triggers the
+# omission), so no existing suppression changes. Overridable via
+# ACD_DECORATED_MAX_L5K_BYTES.
+try:
+    _DECORATED_MAX_L5K_BYTES = int(
+        os.environ.get("ACD_DECORATED_MAX_L5K_BYTES", "100000"))
+except ValueError:
+    _DECORATED_MAX_L5K_BYTES = 100000
+
 # CDATA sections in a Decorated body (string-member DATA) may contain literal
 # '<' characters, which must not be counted as element start tags.
 _CDATA_RE = re.compile(r"<!\[CDATA\[.*?\]\]>", re.S)
@@ -789,15 +804,19 @@ def _render_value_blocks(element: str,
                 and len(value_bytes) >= _DECORATED_MAX_BYTES):
             return first + force_xml
         # L5K-first era: the flat block is a compact CDATA literal, so a very
-        # large value shows only in the Decorated tree's element count. Studio
-        # omits the Decorated block once that count crosses a global ceiling
-        # (_DECORATED_MAX_ELEMS). Count the generated body (so the metric is
-        # exactly what would be emitted); the length pre-gate keeps this off the
-        # hot path for the overwhelming majority of small tags.
+        # large value shows in the Decorated tree's element count OR its raw value
+        # image. Studio omits the Decorated block once EITHER crosses a global
+        # ceiling: the element count (_DECORATED_MAX_ELEMS -- count the generated
+        # body so the metric is exactly what would be emitted; the length pre-gate
+        # keeps it off the hot path for small tags), or the raw value-image byte
+        # size (_DECORATED_MAX_L5K_BYTES, which catches a low-count-but-huge-image
+        # tag the element count misses).
         if (ok_first and decorated_inner is not None
-                and len(decorated_inner)
-                >= _DECORATED_MAX_ELEMS * _MIN_DECORATED_ELEM_CHARS
-                and _decorated_elem_count(decorated_inner) > _DECORATED_MAX_ELEMS):
+                and (len(value_bytes) >= _DECORATED_MAX_L5K_BYTES
+                     or (len(decorated_inner)
+                         >= _DECORATED_MAX_ELEMS * _MIN_DECORATED_ELEM_CHARS
+                         and _decorated_elem_count(decorated_inner)
+                         > _DECORATED_MAX_ELEMS))):
             return first + force_xml
         if ok_first and decorated_inner is not None:
             return (first + force_xml
