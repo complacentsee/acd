@@ -293,3 +293,22 @@ def build_ethernet_network(cur: Cursor, controller_oid: int,
         )
     except Exception:
         return ""
+
+
+def build_opc_ua_info(cur: Cursor, controller_oid: int,
+                      short_header: bool) -> str:
+    """<OpcUaInfo EnabledPorts=""/> when the controller has a live OPCUA comp,
+    or "" when it does not. The comp's 0x1 ext-attr is a 32-byte block (a
+    u32 flag pair then a 24-byte enabled-ports tail); only the all-zero tail
+    (EnabledPorts="") is reproduced -- a nonzero tail is unobserved, so it is
+    omitted (fail closed)."""
+    try:
+        attrs = _attrs(cur, controller_oid, "OPCUA", short_header)
+        if attrs is None:
+            return ""
+        v = attrs.get(0x1, b"")
+        if len(v) < 32 or any(v[8:32]):
+            return ""
+        return '<OpcUaInfo EnabledPorts=""/>'
+    except Exception:
+        return ""

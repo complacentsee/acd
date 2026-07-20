@@ -66,6 +66,7 @@ from acd.l5x.controller_ports import (
     build_ethernet_network,
     build_ethernet_ports,
     build_internet_protocol,
+    build_opc_ua_info,
 )
 from acd.l5x.datatypes import (
     DataType,
@@ -1916,6 +1917,8 @@ class Controller(L5xElement):
     _internet_protocol_xml: str = field(default="")
     _ethernet_ports_xml: str = field(default="")
     _ethernet_network_xml: str = field(default="")
+    # <OpcUaInfo> (controller OPC UA server), emitted last before </Controller>.
+    _opc_ua_info_xml: str = field(default="")
     # The controller-level safety signatures rendered as <SafetyInfo> children, each a
     # (signature, timestamp) pair or None. Populated only on safety-signed projects;
     # all None -> <SafetyInfo/> is emitted as before.
@@ -2017,6 +2020,7 @@ class Controller(L5xElement):
             + self._internet_protocol_xml
             + self._ethernet_ports_xml
             + self._ethernet_network_xml
+            + self._opc_ua_info_xml
             + '</Controller>'
         )
 
@@ -7086,6 +7090,8 @@ class ControllerBuilder(L5xElementBuilder):
             self._cur, self._object_id, self._short_header, major_rev)
         ethernet_network_xml = build_ethernet_network(
             self._cur, self._object_id, self._short_header)
+        opc_ua_info_xml = build_opc_ua_info(
+            self._cur, self._object_id, self._short_header)
         (pass_through, download_docs, download_custom, report_minor_overflow, auto_diags,
          web_server, _v24_plus) = self._pass_project_settings(
             processor_type, _ctlattrs, _ctlblob, major_rev)
@@ -7160,6 +7166,7 @@ class ControllerBuilder(L5xElementBuilder):
             _data_table_pad_percentage=data_table_pad_percentage,
             _comm_ports_xml=comm_ports_xml,
             _internet_protocol_xml=internet_protocol_xml,
+            _opc_ua_info_xml=opc_ua_info_xml,
             _ethernet_ports_xml=ethernet_ports_xml,
             _ethernet_network_xml=ethernet_network_xml,
             _ts_ptp_enable=ts_ptp_enable,
