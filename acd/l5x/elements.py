@@ -61,6 +61,10 @@ from acd.l5x.connections import (
     _build_produce_map,
     _strip_input_tag_inner,
 )
+from acd.l5x.controller_lists import (
+    build_parameter_connections,
+    build_quick_watch_lists,
+)
 from acd.l5x.controller_ports import (
     build_comm_ports,
     build_ethernet_network,
@@ -1919,6 +1923,10 @@ class Controller(L5xElement):
     _ethernet_network_xml: str = field(default="")
     # <OpcUaInfo> (controller OPC UA server), emitted last before </Controller>.
     _opc_ua_info_xml: str = field(default="")
+    # <QuickWatchLists> (before <TimeSynchronize>) and <ParameterConnections>
+    # (before <CST>); "" omits each.
+    _quick_watch_lists_xml: str = field(default="")
+    _parameter_connections_xml: str = field(default="")
     # The controller-level safety signatures rendered as <SafetyInfo> children, each a
     # (signature, timestamp) pair or None. Populated only on safety-signed projects;
     # all None -> <SafetyInfo/> is emitted as before.
@@ -2003,12 +2011,14 @@ class Controller(L5xElement):
             + self._safety_info_xml()
             + self._alarm_definitions
             + self._comm_ports_xml
+            + self._parameter_connections_xml
             + f'<CST MasterID="{self._cst_master_id}"/>'
             + (f'<WallClockTime LocalTimeAdjustment='
                f'"{self._wct_local_time_adjustment}" '
                f'TimeZone="{self._wct_time_zone}"/>')
             + self._trends_xml
             + ('<DataLogs/>' if self._emit_data_logs else '')
+            + self._quick_watch_lists_xml
             # The reference omits <TimeSynchronize> on the pre-V18 save format
             # (V17 has no TimeSynchronize comp and its export carries no element),
             # and emits it from V19 on. Gate on our own MajorRev, same style as the
@@ -7092,6 +7102,8 @@ class ControllerBuilder(L5xElementBuilder):
             self._cur, self._object_id, self._short_header)
         opc_ua_info_xml = build_opc_ua_info(
             self._cur, self._object_id, self._short_header)
+        quick_watch_lists_xml = build_quick_watch_lists(self._cur)
+        parameter_connections_xml = build_parameter_connections(self._cur)
         (pass_through, download_docs, download_custom, report_minor_overflow, auto_diags,
          web_server, _v24_plus) = self._pass_project_settings(
             processor_type, _ctlattrs, _ctlblob, major_rev)
@@ -7167,6 +7179,8 @@ class ControllerBuilder(L5xElementBuilder):
             _comm_ports_xml=comm_ports_xml,
             _internet_protocol_xml=internet_protocol_xml,
             _opc_ua_info_xml=opc_ua_info_xml,
+            _quick_watch_lists_xml=quick_watch_lists_xml,
+            _parameter_connections_xml=parameter_connections_xml,
             _ethernet_ports_xml=ethernet_ports_xml,
             _ethernet_network_xml=ethernet_network_xml,
             _ts_ptp_enable=ts_ptp_enable,
