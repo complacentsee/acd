@@ -37,6 +37,7 @@ from acd.l5x.connections import (
 from acd.l5x.port_structures import PORT_STRUCTURES
 from acd.l5x import tag_value as _tag_value
 from acd.record.comps import CompsRecord
+from acd.record.source_protection import sp_decrypt_nameless_element
 
 
 # --- Nameless module-port object graph ---------------------------------------
@@ -1250,14 +1251,20 @@ class ModuleBuilder(L5xElementBuilder):
             return {}
         out: Dict[int, int] = {}
         for coll_oid, coll_rec in colls:
-            if coll_rec is None or _nm_kind(bytes(coll_rec)) != _NM_PORT_COLLECTION_KIND:
+            # On a source-protected-at-rest project the port/bus records are
+            # AES-encrypted; decrypt each (fail-closed identity on plaintext) before
+            # reading its class id and payload, mirroring fbd_content.py.
+            if coll_rec is None:
+                continue
+            coll_rec = sp_decrypt_nameless_element(bytes(coll_rec))
+            if _nm_kind(coll_rec) != _NM_PORT_COLLECTION_KIND:
                 continue
             for port_oid, prec in self._cur.execute(
                     "SELECT object_id, record FROM nameless WHERE parent_id=?",
                     (coll_oid,)).fetchall():
                 if prec is None:
                     continue
-                prec = bytes(prec)
+                prec = sp_decrypt_nameless_element(bytes(prec))
                 if _nm_kind(prec) != _NM_PORT_KIND:
                     continue
                 poff = _nm_payload_off(prec)
@@ -1270,7 +1277,7 @@ class ModuleBuilder(L5xElementBuilder):
                 # The bus must be the child of the port that pointed at it.
                 if row is None or row[0] != port_oid or row[1] is None:
                     continue
-                brec = bytes(row[1])
+                brec = sp_decrypt_nameless_element(bytes(row[1]))
                 if _nm_kind(brec) not in _NM_SIZED_BUS_KINDS:
                     continue
                 boff = _nm_payload_off(brec)
@@ -1377,6 +1384,7 @@ class ModuleBuilder(L5xElementBuilder):
             addr = a.get("Addr")
             upstream = "false" if a.get("Ups") == "False" else "true"
             bus = None
+            baud = None
             if m.group(2) != "/":
                 rest = blob[m.end():]
                 nxt = _re.search(r'<Port\b|</in>', rest)
@@ -1385,6 +1393,12 @@ class ModuleBuilder(L5xElementBuilder):
                 if bm:
                     ba = dict(_re.findall(r'(\w+)=["\']([^"\']*)["\']', bm.group(1)))
                     bus = ba.get("Size") if ba.get("Size") is not None else ""
+                    # A RIO bus carries a Baud rate (e.g. "57.6K") instead of a
+                    # Size; OEM renders it as Baud with the trailing K stripped.
+                    if ba.get("Size") is None:
+                        _bd = ba.get("Baud", "")
+                        if _re.fullmatch(r'\d+(\.\d+)?K', _bd):
+                            baud = _bd[:-1]
             if bus is None and upstream == "false" and ptype == "Ethernet":
                 bus = ""
             # A CompactLogix embedded-CPU backplane port (the full-catalog type names
@@ -1428,6 +1442,8 @@ class ModuleBuilder(L5xElementBuilder):
                     f'Upstream="{upstream}"{w_attr}{sn_attr}')
             if bus is None:
                 ports.append((_pidi, f"{head}/>\n"))
+            elif baud is not None:
+                ports.append((_pidi, f'{head}>\n<Bus Baud="{baud}"/>\n</Port>\n'))
             elif bus == "":
                 ports.append((_pidi, f"{head}>\n<Bus/>\n</Port>\n"))
             else:
