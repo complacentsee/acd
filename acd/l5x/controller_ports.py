@@ -216,10 +216,10 @@ def build_ethernet_ports(cur: Cursor, controller_oid: int, short_header: bool,
         return ""
 
 
-# InternetProtocol config codes: only the reference-verified code decodes (an
-# unseen code omits the element). Code 1 = a manually configured static
-# address; the unconfigured comps (address block all zero) carry 0 here.
-_IP_CONFIG_TYPE = {1: "Manual"}
+# InternetProtocol config codes: only the reference-verified codes decode (an
+# unseen code omits the element). Code 1 = a manually configured static address;
+# code 0 = BOOTP (the address block is all zero, so Studio emits a bare element).
+_IP_CONFIG_TYPE = {0: "BOOTP", 1: "Manual"}
 
 # The InternetProtocol address block in the record's 0x1 ext-attr value:
 # five little-endian IPv4 words at IPAddress=142, SubnetMask=146, Gateway=150,
@@ -252,8 +252,14 @@ def build_internet_protocol(cur: Cursor, controller_oid: int,
         v = attrs.get(0x1, b"")
         if len(v) < _IP_BLOCK + 20:
             return ""
+        ct = _IP_CONFIG_TYPE.get(v[0])
+        if ct is None:
+            return ""
+        if v[0] != 1:
+            # BOOTP: no static address block (it is all zero), bare element.
+            return f'<InternetProtocol ConfigType="{ct}"/>'
         return (
-            f'<InternetProtocol ConfigType="{_IP_CONFIG_TYPE[v[0]]}"'
+            f'<InternetProtocol ConfigType="{ct}"'
             f' IPAddress="{_ipv4_le(v, _IP_BLOCK)}"'
             f' SubnetMask="{_ipv4_le(v, _IP_BLOCK + 4)}"'
             f' Gateway="{_ipv4_le(v, _IP_BLOCK + 8)}"'
