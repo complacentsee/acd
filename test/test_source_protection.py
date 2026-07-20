@@ -57,6 +57,25 @@ def _build_rung(text: str, config: int = 7, trailer: bytes = b"") -> bytes:
     return bytes(rbuf) + ct + trailer
 
 
+# --- test-only graphical-element builder -------------------------------------
+# The READ path never builds buffers; this mirrors the config-on-the-wire framing
+# a source-protected FBD/SFC nameless element record carries (marker just past the
+# plaintext kind word @16, u32 plaintext length @marker+12, config @marker+17).
+def _build_element(body: bytes, kind: int = 0x0e, config: int = 7) -> bytes:
+    key = dict(sp._SP_KEYS)[config]
+    ct = _cbc_encrypt_pkcs7(body, AES(key))
+    header = bytearray(range(20))            # arbitrary 20-byte record header
+    struct.pack_into("<H", header, 16, kind)  # kind word stays plaintext
+    frame = bytearray(18)                    # marker .. ciphertext start
+    frame[0:4] = sp._SP_MARKER
+    frame[6:8] = b"\x00\xa0"                 # cosmetic framing bytes
+    frame[9:12] = b"\x55\x69\x55"            # 'Ui U' scaffold at marker+9
+    struct.pack_into("<I", frame, 12, len(body))  # marker+12: plaintext length
+    frame[16] = 0x00                         # legacy framing discriminator
+    frame[17] = config                       # marker+17: EncryptionConfig
+    return bytes(header) + bytes(frame) + ct
+
+
 # --- vendored AES primitive --------------------------------------------------
 def test_aes256_fips197_kat():
     key = bytes.fromhex(
@@ -185,6 +204,61 @@ def test_declared_length_mismatch_fails_closed():
     rbuf = bytearray(_build_rung("XIO(@1f9611fa@)OTE(@9db369e9@);"))
     struct.pack_into("<I", rbuf, 13, 4)  # lie about the plaintext length
     assert sp.decode_rung(bytes(rbuf)) is None
+
+
+# --- graphical (FBD/SFC) nameless element decrypt ----------------------------
+def test_element_decrypts_and_reconstructs_plaintext():
+    # An IRef body: X=100, Y=160 then the operand tail. The decrypt reconstructs
+    # header + ffffffff + body so the graphical decoder parses it as plaintext,
+    # landing X/Y at the long-header base (24/28) and preserving the kind word.
+    body = struct.pack("<II", 100, 160) + b"\xff\xfe\xff\x0a@3f73155b@"
+    rec = _build_element(body, kind=0x0e, config=7)
+    out = sp.sp_decrypt_nameless_element(rec)
+    assert out == rec[:20] + b"\xff\xff\xff\xff" + body
+    assert struct.unpack_from("<H", out, 16)[0] == 0x0e
+    assert struct.unpack_from("<I", out, 24)[0] == 100
+    assert struct.unpack_from("<I", out, 28)[0] == 160
+
+
+def test_element_config_is_read_from_the_wire():
+    # Two configs, same body: the marker+17 byte selects the key both times.
+    body = struct.pack("<II", 7, 9)
+    for config in (5, 7):
+        rec = _build_element(body, config=config)
+        assert sp.sp_decrypt_nameless_element(rec) == rec[:20] + b"\xff\xff\xff\xff" + body
+
+
+def test_element_plaintext_record_passes_through_unchanged():
+    # A modern/unprotected record carries no marker -> byte-for-byte no-op.
+    rec = bytes(range(20)) + b"\x64\x00\x00\x00\xa0\x00\x00\x00" + b"\xff\xfe\xff\x00"
+    assert sp.sp_decrypt_nameless_element(rec) == rec
+    assert sp._SP_MARKER not in rec  # guard: the fixture really is marker-free
+
+
+def test_element_unknown_config_fails_closed():
+    rec = bytearray(_build_element(struct.pack("<II", 1, 2), config=7))
+    rec[37] = 0x0B  # marker+17: no key material for this config
+    assert sp.sp_decrypt_nameless_element(bytes(rec)) == bytes(rec)
+
+
+def test_element_declared_length_mismatch_fails_closed():
+    rec = bytearray(_build_element(struct.pack("<II", 100, 160), config=7))
+    struct.pack_into("<I", rec, 32, 999)  # lie about the plaintext length (marker+12)
+    assert sp.sp_decrypt_nameless_element(bytes(rec)) == bytes(rec)
+
+
+def test_element_missing_scaffold_fails_closed():
+    # A stray marker without the 'Ui U' scaffold (e.g. a coincidental byte run in
+    # plaintext content) must not be treated as protected.
+    rec = bytearray(_build_element(struct.pack("<II", 1, 2), config=7))
+    rec[29] = 0x00  # corrupt the marker+9 scaffold byte
+    assert sp.sp_decrypt_nameless_element(bytes(rec)) == bytes(rec)
+
+
+def test_element_config9_discriminator_fails_closed():
+    rec = bytearray(_build_element(struct.pack("<II", 1, 2), config=7))
+    rec[36] = 0x01  # marker+16 low byte 1 -> config-9 framing, no key material
+    assert sp.sp_decrypt_nameless_element(bytes(rec)) == bytes(rec)
 
 
 # --- end-to-end against the embedded v21_gm_FuncGen corpus -------------------

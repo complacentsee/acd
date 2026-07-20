@@ -198,6 +198,62 @@ def sp_decrypt_framed(buf: bytes, marker_index: int) -> Optional[bytes]:
 
 
 # ---------------------------------------------------------------------------
+# graphical (FBD/SFC) nameless element records
+# ---------------------------------------------------------------------------
+# A source-protected project also encrypts each graphical routine's nameless
+# element records -- the IRef/ORef/Block/wire/attachment/sheet/connector-name
+# subtree the FBD (and SFC) decoders walk -- at rest behind the SAME
+# config-on-the-wire framing the SbRegion rung buffer uses (NOT the AOI-nameless
+# marker+4 framing).  The marker sits just past the plaintext kind word, the u32
+# plaintext length is at marker+12, the EncryptionConfig is the byte at
+# marker+17, and the ciphertext (PKCS7-padded, block aligned, no trailing
+# slot-fill) starts at marker + _SP_CT_OFFSET.  A non-protected record has no
+# marker and flows through untouched, so modern/plaintext routines are a no-op.
+#
+# The plaintext is the ordinary element body -- X (u32) then Y (u32) then the
+# element's fffeff operand string, etc. -- that would normally follow the record
+# header's 0xffffffff sentinel.  Reconstructing header + ffffffff + plaintext
+# yields a record the graphical decoder parses byte-for-byte as if it were never
+# protected, exactly as :func:`acd.record.comps.decrypt_sp_nameless` does for
+# AOI metadata.
+_ELEM_MARKER_MIN = 18             # the marker follows the plaintext kind word (u16 @ 16)
+_ELEM_SCAFFOLD = b"\x55\x69\x55"  # fixed 'Ui U' framing bytes at marker+9
+
+
+def sp_decrypt_nameless_element(record: bytes) -> bytes:
+    """Decrypt a source-protected graphical element record, or return it unchanged.
+
+    ``record`` is a raw ``nameless`` record buffer.  When it carries the
+    config-on-the-wire source-protection framing described above, return the
+    reconstructed PLAINTEXT record (``header + ffffffff + decrypted body``) the
+    graphical decoders can parse as if it were never protected; otherwise return
+    ``record`` unchanged.
+
+    Fail-closed -- a record with no marker, a missing framing scaffold, a
+    non-legacy (config-9) discriminator, an unknown EncryptionConfig, a
+    ciphertext that is not wholly present or not block aligned, an invalid PKCS7
+    pad, or a recovered length that disagrees with the declared u32 length all
+    return ``record`` unchanged.  A genuinely protected record whose key is
+    unknown therefore stays unreadable and its routine keeps failing closed
+    (element_missing) rather than emit a wrong or partial sheet; a wrong decrypt
+    is never returned.
+    """
+    midx = record.find(_SP_MARKER, _ELEM_MARKER_MIN)
+    if midx < 0 or len(record) <= midx + 17:
+        return record
+    # The 'Ui U' scaffold and a zero discriminator low byte together identify the
+    # legacy config-on-wire framing; genuine plaintext element bytes never carry
+    # them, and config-9 framing (low byte 1, no key material, different
+    # ciphertext offset) is left encrypted.
+    if record[midx + 9:midx + 12] != _ELEM_SCAFFOLD or record[midx + 16] != 0:
+        return record
+    pt = sp_decrypt_framed(record, midx)
+    if pt is None:
+        return record
+    return record[:midx] + b"\xff\xff\xff\xff" + pt
+
+
+# ---------------------------------------------------------------------------
 # rung framing
 # ---------------------------------------------------------------------------
 _RUNG_MARKER_OFF = 1                             # marker index within rbuf

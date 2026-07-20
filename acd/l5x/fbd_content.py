@@ -17,6 +17,8 @@ import struct
 import re
 from xml.sax.saxutils import quoteattr
 
+from acd.record.source_protection import sp_decrypt_nameless_element
+
 IREF, OREF, TEXTBOX, WIRE, ATTACH = 0x0e, 0x0d, 0x81, 0x11, 0x88
 # On-sheet AOI call, wire connectors and the connector-name record they point at
 AOICALL, ICON, OCON, CONNNAME = 0x8a, 0x0f, 0x10, 0x71
@@ -29,8 +31,8 @@ KIND2TYPE = {
     0x1d: 'SRTP', 0x21: 'BAND', 0x22: 'BOR', 0x24: 'BNOT', 0x26: 'LPF',
     0x2e: 'SSUM', 0x39: 'RLIM', 0x3a: 'DERV', 0x3b: 'MINC', 0x3d: 'OSRI',
     0x44: 'RAD', 0x48: 'ABS', 0x4d: 'COS', 0x4f: 'DIV', 0x52: 'MUL',
-    0x55: 'SUB', 0x5b: 'TONR', 0x5d: 'GEQ', 0x5e: 'GRT', 0x5f: 'LEQ',
-    0x63: 'NEQ',
+    0x55: 'SUB', 0x5b: 'TONR', 0x5c: 'EQU', 0x5d: 'GEQ', 0x5e: 'GRT',
+    0x5f: 'LEQ', 0x63: 'NEQ',
     # pin-space types: wide datatype-derived mask, not the VISIBLE_PIN_BITS u32
     0x0b: 'TOT', 0x1b: 'PIDE', 0x29: 'PI', 0x58: 'CTUD',
     0x18: 'FGEN', 0x1a: 'MAVE',
@@ -81,6 +83,9 @@ VISIBLE_PIN_BITS = {
     'COS': {10: 'Source', 12: 'Dest'},
     'DERV': {11: 'In', 13: 'ByPass', 20: 'Out'},
     'DIV': {10: 'SourceA', 11: 'SourceB', 13: 'Dest'},
+    # EQU shares the comparison-block pin layout (EnableIn@9, SourceA@10,
+    # SourceB@11, Dest@13); EnableIn is corpus-attested for the GEQ/LEQ siblings.
+    'EQU': {9: 'EnableIn', 10: 'SourceA', 11: 'SourceB', 13: 'Dest'},
     'GEQ': {9: 'EnableIn', 10: 'SourceA', 11: 'SourceB', 13: 'Dest'},
     'GRT': {10: 'SourceA', 11: 'SourceB', 13: 'Dest'},
     'HLL': {11: 'In', 12: 'HighLimit', 13: 'LowLimit', 17: 'Out'},
@@ -300,7 +305,11 @@ def _pide_autotune(cur, eo):
 
 
 def _rows(cur, pid):
-    return [(o, bytes(r)) for (o, r) in cur.execute(
+    # A source-protected project encrypts each graphical element record at rest
+    # (config-on-the-wire framing); decrypt transparently so the walk below sees
+    # a normal element. Plaintext records carry no marker and pass through
+    # unchanged, so unprotected routines are a byte-for-byte no-op.
+    return [(o, sp_decrypt_nameless_element(bytes(r))) for (o, r) in cur.execute(
         "SELECT object_id, record FROM nameless WHERE parent_id=?", (pid,)).fetchall()]
 
 
@@ -558,7 +567,9 @@ def _decode(cur, oid, sh, size, orient, tbtext, tbtext_v20):
                         (nref,)).fetchone()
                     if not nrow:
                         return None
-                    nrec = bytes(nrow[0])
+                    # The connector-name record is fetched outside _rows, so it
+                    # needs the same transparent SP decrypt (a no-op on plaintext).
+                    nrec = sp_decrypt_nameless_element(bytes(nrow[0]))
                     nm = _rawtext(nrec) if _kind(nrec) == CONNNAME else None
                     if not nm or "@" in nm:
                         return None
