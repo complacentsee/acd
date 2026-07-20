@@ -291,6 +291,36 @@ def _is_valid_operand(op: str) -> bool:
     return bool(op) and ".!" not in op and bool(_OPERAND_RE.match(op))
 
 
+# Single-slot memo of the file-global comment epoch, keyed by cursor identity.
+# One export == one cursor (the gauntlet/one.py run each file in its own process),
+# so the slot is cleared on every miss to prevent a reused id returning a stale
+# value from a different file.
+_COMMENT_EPOCH_CACHE: Dict[int, int] = {}
+
+
+def _file_comment_epoch(cur) -> int:
+    """Highest operand-comment revision stamped in the file (the save epoch).
+
+    Studio re-stamps every LIVE operand-comment row with the project's current
+    edit revision on save; a row left below that maximum belongs to a comment
+    that was deleted in a later edit, and the reference exports its operand as an
+    EMPTY <Comment>. This file-global maximum lets a tag whose comments were ALL
+    deleted (so its per-tag maximum equals its own stale revision) still be
+    recognised as stale. Zero when no epoch is stamped (short-header projects).
+    """
+    key = id(cur)
+    epoch = _COMMENT_EPOCH_CACHE.get(key)
+    if epoch is None:
+        row = cur.execute(
+            "SELECT MAX(revision) FROM comments "
+            "WHERE tag_reference!='' AND tag_reference!='__REVISION_NOTE__' "
+            "AND record_string!='' AND revision>0").fetchone()
+        epoch = int(row[0]) if row and row[0] else 0
+        _COMMENT_EPOCH_CACHE.clear()
+        _COMMENT_EPOCH_CACHE[key] = epoch
+    return epoch
+
+
 # ---- AXIS_VIRTUAL <Data Format="Axis"> renderer ------------------------- #
 # The value image is attr 0x01 of the tag's cip-0x6a backing (body_mode). It is
 # the axis CONFIG serialization, which is a flat fixed-offset struct -- and,
@@ -2640,6 +2670,10 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
                     _prev = _best.get(_k)
                     if _prev is None or (op_rev or 0) > _prev[0]:
                         _best[_k] = (op_rev or 0, op_text)
+                # A tag whose comments were ALL deleted has a per-tag maximum equal
+                # to its own stale revision, so raise the staleness threshold to the
+                # file-global save epoch to catch it too.
+                _gen_max = max(_gen_max, _file_comment_epoch(self._cur))
                 for (op_ref, op_kind), (_op_rev, op_text) in _best.items():
                     if op_kind == 0x05:
                         eng_units.append((op_ref, op_text))
@@ -2652,13 +2686,14 @@ class TagBuilder(TagAliasResolver, L5xElementBuilder):
                         # at the project's new edit revision; a row left at an
                         # older revision was deleted in that edit, and the
                         # reference export lists its operand with EMPTY text.
-                        # Blank (don't drop) a winner older than the tag's
-                        # newest comment revision. Value/EngUnit kinds keep
-                        # their text (separate blocks, no observed blanking);
-                        # revision is 0 across a short-header project, where
-                        # this is a no-op.
+                        # Blank (don't drop) a winner older than the file save
+                        # epoch. Value/EngUnit kinds keep their text (separate
+                        # blocks, no observed blanking). A row with no epoch stamp
+                        # (revision 0 -- short-header or an unepoch'd layout) is
+                        # never blanked, so those projects stay a no-op.
+                        _blank = _op_rev < _gen_max and _op_rev > 0
                         operand_comments.append(
-                            (op_ref, op_text if _op_rev >= _gen_max else ""))
+                            (op_ref, "" if _blank else op_text))
             except Exception:
                 operand_comments = []
                 eng_units = []
