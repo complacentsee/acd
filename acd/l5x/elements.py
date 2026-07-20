@@ -4696,9 +4696,16 @@ def _safety_signature_attr_value(cur, rec):
             nr = bytes(nr)
             if len(nr) < 24 or nr[8:16] != bytes.fromhex("948fc2c747add9f3"):
                 continue
-            sighex = "%08X" % struct.unpack_from("<I", nr, 20)[0]
+            _sigword = struct.unpack_from("<I", nr, 20)[0]
             date, nx = _utf16z(nr, 24)
             tm, _ = _utf16z(nr, nx)
+            if _sigword == 0 and not date and not tm:
+                # An unsigned project stores an all-zero signature record; Studio
+                # omits @SafetySignature entirely there (never "00000000, , ").
+                # Return None from inside the loop so the long-header regex
+                # fallback below is not reached for this record.
+                return None
+            sighex = "%08X" % _sigword
             return f"{sighex}, {date}, {tm}"
     except Exception:
         pass
@@ -4730,8 +4737,12 @@ def _safety_info_attr_string(cur, short_header):
         attrs["SafetyLocked"] = "true" if rec[anch + 78] == 1 else "false"
         attrs["ConfigureSafetyIOAlways"] = "true" if rec[anch + 80] == 1 else "false"
         attrs["SignatureRunModeProtect"] = "false"
-    if not short_header:
-        attrs["SafetyLevel"] = "SIL2/PLd"
+    if not short_header and anch >= 0 and len(rec) > anch + 214:
+        # SafetyLevel is a u8 enum at anchor+214 (2 = SIL2/PLd, 3 = SIL3/PLe);
+        # fail closed (omit) on any other value.
+        _lvl = {2: "SIL2/PLd", 3: "SIL3/PLe"}.get(rec[anch + 214])
+        if _lvl is not None:
+            attrs["SafetyLevel"] = _lvl
     sig = _safety_signature_attr_value(cur, rec)
     if sig:
         attrs["SafetySignature"] = sig

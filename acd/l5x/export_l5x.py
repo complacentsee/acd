@@ -861,23 +861,29 @@ class ExportL5x:
                         _gss3z[_key3] = _ts
                 except UnicodeDecodeError:
                     pass
-            # Controller-level (cid 0/1) signatures, keyed by (otype, name). The hash
-            # is the last 32 bytes (robust whether or not an embedded name shifts the
-            # body); the timestamp is the paired record's ASCII stamp.
-            if _cid in (0, 1) and len(_buf) >= 33:
+            # Controller-level and named signatures, keyed by (otype, name). The
+            # hash is the last 32 bytes (robust whether or not an embedded name
+            # shifts the body); the timestamp is the paired record's ASCII stamp.
+            # An UNNAMED record is captured only at cid 0/1 (the controller-scope
+            # keys); a NAMED record (a 0x13 name after the GSS marker, e.g.
+            # 'TagMap') is captured at ANY cid, because the TagMap pair is keyed by
+            # the SafetyTask comp's comment_id, which is not 0/1 in every project.
+            if len(_buf) >= 33:
                 _smi = _buf.find(_sig_mark)
                 if _smi >= 0:
                     _nm = _gss_name(_buf, _smi + len(_sig_mark))
-                    _hh = _buf[len(_buf) - 33:len(_buf) - 1]
-                    if any(_hh):
-                        _named.setdefault((_otype, _nm), [None, None])[0] = " - ".join(
-                            "%08X" % struct.unpack_from(">I", _hh, _i * 4)[0] for _i in range(8))
+                    if _nm or _cid in (0, 1):
+                        _hh = _buf[len(_buf) - 33:len(_buf) - 1]
+                        if any(_hh):
+                            _named.setdefault((_otype, _nm), [None, None])[0] = " - ".join(
+                                "%08X" % struct.unpack_from(">I", _hh, _i * 4)[0] for _i in range(8))
                 _tmi = _buf.find(_ts_mark)
                 if _tmi >= 0:
                     _nm = _gss_name(_buf, _tmi + len(_ts_mark))
-                    _m = _ts_re.search(_buf)
-                    if _m:
-                        _named.setdefault((_otype, _nm), [None, None])[1] = _m.group().decode("ascii")
+                    if _nm or _cid in (0, 1):
+                        _m = _ts_re.search(_buf)
+                        if _m:
+                            _named.setdefault((_otype, _nm), [None, None])[1] = _m.group().decode("ascii")
         self._cur.executemany(
             "INSERT INTO safety_signatures VALUES (?,?,?,?)",
             [(k[0], k[1], v[0], v[1]) for k, v in _gss.items() if v[0]])
