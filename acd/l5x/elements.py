@@ -311,11 +311,15 @@ _AXIS_VIRTUAL_HEADER = [
     ("MaximumDecelerationJerk", 1178, "f"),
     ("DynamicsConfigurationBits", 1182, "d"),
 ]
-# Blob length -> (InterpolatedPositionConfiguration offset, AxisUpdateSchedule
-# present). The blob length is the firmware-generation discriminator, read
-# straight from the record, so this needs no external version input; an
-# unknown length falls through to today's no-<Data> behaviour (0-worse).
+# Blob length -> (InterpolatedPositionConfiguration offset | None,
+# AxisUpdateSchedule present). The blob length is the firmware-generation
+# discriminator, read straight from the record, so this needs no external
+# version input; an unknown length falls through to today's no-<Data>
+# behaviour (0-worse). An IPC offset of None marks a generation that predates
+# InterpolatedPositionConfiguration entirely (the OEM emits no such attribute),
+# so it is omitted -- the header (158..1182) is unchanged, only the tail moves.
 _AXIS_VIRTUAL_TAIL = {
+    3424: (None, False),
     3430: (3426, False),
     3654: (3426, True),
     3666: (3426, True),
@@ -355,9 +359,10 @@ def _render_axis_virtual(blob: bytes, group_name: str) -> "Union[str, None]":
             val = _axis_attr(blob, entry[1], entry[2],
                              entry[3] if len(entry) > 3 else "")
             parts.append(f'{entry[0]}="{html.escape(val, quote=True)}"')
-        ipc = _tag_value._format_int_radix(
-            "UDINT", struct.unpack_from("<I", blob, ipc_off)[0], 4, "Hex")
-        parts.append(f'InterpolatedPositionConfiguration="{ipc}"')
+        if ipc_off is not None:
+            ipc = _tag_value._format_int_radix(
+                "UDINT", struct.unpack_from("<I", blob, ipc_off)[0], 4, "Hex")
+            parts.append(f'InterpolatedPositionConfiguration="{ipc}"')
         if aus:
             parts.append('AxisUpdateSchedule="'
                          + _AXIS_ENUM["AxisUpdateSchedule"][0] + '"')
