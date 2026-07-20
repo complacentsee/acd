@@ -30,6 +30,11 @@ _ATOMIC: Dict[str, Tuple[int, str]] = {
     "UDINT": (4, "<I"),
     "LINT": (8, "<q"),
     "ULINT": (8, "<Q"),
+    # TIME is a 64-bit signed integer of microseconds — memberless, byte/bit shape
+    # (0x65=8, 0x66=64) identical to LINT in the datatype comps record. It has no
+    # TagInfo layout entry, so a UDT member typed TIME would otherwise fail the
+    # layout walk and degrade the whole tag to the zero-value placeholder block.
+    "TIME": (8, "<q"),
     "REAL": (4, "<f"),
     "LREAL": (8, "<d"),
 }
@@ -39,7 +44,7 @@ _ATOMIC: Dict[str, Tuple[int, str]] = {
 _RADIX: Dict[str, str] = {
     "BOOL": "Decimal", "SINT": "Decimal", "USINT": "Decimal",
     "INT": "Decimal", "UINT": "Decimal", "DINT": "Decimal", "UDINT": "Decimal",
-    "LINT": "Decimal", "ULINT": "Decimal",
+    "LINT": "Decimal", "ULINT": "Decimal", "TIME": "Decimal",
     "REAL": "Float", "LREAL": "Float",
 }
 
@@ -1268,7 +1273,12 @@ def _render_string_inner(layout, image: bytes, dt_name: str = "STRING"
             if _len_off is not None:
                 length = struct.unpack_from("<i", image, _len_off)[0]
                 if length < 0 or length > len(raw):
-                    length = len(raw.split(b"\x00", 1)[0])
+                    # Corrupt LEN (negative or past the DATA window): OEM emits the
+                    # WHOLE DATA window verbatim, NULs and garbage included -- the
+                    # same clamp already landed for Format="String" blocks (a census
+                    # of every out-of-range-LEN member in the OEM corpus shows the
+                    # full window, never a first-NUL clamp).
+                    length = len(raw)
             else:
                 length = len(raw.split(b"\x00", 1)[0])
             text = _ascii_string_cdata(raw[:length])

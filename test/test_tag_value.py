@@ -380,6 +380,68 @@ def test_layout_walkers_empty_string_has_no_quotes():
 
 
 # --------------------------------------------------------------------------- #
+# TIME atomic (8-byte signed LINT-shaped) and corrupt-LEN string full window
+# --------------------------------------------------------------------------- #
+
+_TIME_UDT = {
+    "U1": [("t", "TIME", 0, None, False, None)],
+    "@size@U1": 8,
+}
+_TIME_ARR = {
+    "U2": [("a", "TIME", 0, None, False, [2])],
+    "@size@U2": 16,
+}
+_STR16_LAYOUT = {
+    "S16": [
+        ("LEN", "DINT", 0, None, False, None),
+        ("DATA", "SINT", 4, None, False, [16]),
+    ],
+    "@size@S16": 20,
+}
+
+
+def test_time_atomic_is_8byte_signed_decimal():
+    # TIME is a 64-bit signed integer of microseconds (LINT-shaped).
+    assert T._atomic_text("TIME", struct.pack("<q", 0)) == "0"
+    assert T._atomic_text("TIME", struct.pack("<q", 300000)) == "300000"
+    assert T._atomic_text_decorated("TIME", struct.pack("<q", -5)) == "-5"
+
+
+def test_time_member_in_udt_renders_decimal():
+    xml = T.render_decorated_layout("U1", None, struct.pack("<q", 300000),
+                                    _TIME_UDT, {})
+    assert ('<DataValueMember Name="t" DataType="TIME" Radix="Decimal" '
+            'Value="300000"/>') in xml
+    assert T.render_l5k_layout("U1", None, struct.pack("<q", 300000),
+                               _TIME_UDT, {}) == "[300000]"
+
+
+def test_time_array_member_renders_elements():
+    xml = T.render_decorated_layout("U2", None, struct.pack("<qq", 7, -3),
+                                    _TIME_ARR, {})
+    assert 'ArrayMember Name="a" DataType="TIME" Dimensions="2" Radix="Decimal"' in xml
+    assert '<Element Index="[0]" Value="7"/>' in xml
+    assert '<Element Index="[1]" Value="-3"/>' in xml
+
+
+def test_corrupt_len_string_emits_full_data_window():
+    # Out-of-range LEN -> OEM emits the WHOLE 16-byte DATA window verbatim,
+    # NULs and garbage included, NOT a first-NUL clamp.
+    img = struct.pack("<i", 1067030938) + b"AB\x00\x00CD" + b"\x00" * 11
+    xml = T.render_decorated_layout("S16", None, img, _STR16_LAYOUT, {})
+    assert "'AB$00$00CD$00$00$00$00$00$00$00$00$00$00'" in xml
+    assert 'Value="1067030938"' in xml
+
+
+def test_valid_len_string_unchanged_by_full_window_rule():
+    # A healthy LEN clamps to exactly LEN chars (the full-window rule fires only
+    # on the out-of-range branch).
+    img = struct.pack("<i", 2) + b"AB" + b"\x00" * 14
+    xml = T.render_decorated_layout("S16", None, img, _STR16_LAYOUT, {})
+    assert "<![CDATA['AB']]>" in xml
+
+
+# --------------------------------------------------------------------------- #
 # Walker robustness on malformed layout_maps (never raise; degrade to None /
 # render the members that DO decode). These pin the entry-point contract on
 # adversarial inputs that real TagInfo extraction cannot produce -- found by
