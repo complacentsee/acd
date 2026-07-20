@@ -3654,15 +3654,16 @@ class RoutineBuilder(L5xElementBuilder):
         # FBD/SFC sheet size + orientation come from the sheet_layout tables; the
         # per-routine TextBox text from the textbox_text table (keyed by md id).
         # Without a resolved sheet both decoders fail closed (empty <Routine>).
+        # V20 (old-layout) TextBox text lives in a sibling table keyed by an FO
+        # index instead of a global md; each decoder picks the right map by
+        # detected layout. Modern files return an empty V20 map (no-op).
         _mdtext = (_textbox_texts_for(self._cur, r.comment_id)
                    if routine_type in ("FBD", "SFC") else {})
+        _mdtext_v20 = (_textbox_texts_v20_for(self._cur, r.comment_id)
+                       if routine_type in ("FBD", "SFC") else {})
         sfc_content = None
         if routine_type == "SFC":
             _sheet = _sheet_size_of(self._cur, r.comment_id, bytes(record))
-            # V20 (old-layout) TextBox text lives in a sibling table keyed by an
-            # FO index instead of a global md; the decoder picks the right map by
-            # detected layout. Modern files return an empty V20 map (no-op).
-            _mdtext_v20 = _textbox_texts_v20_for(self._cur, r.comment_id)
             sfc_content = _decode_sfc(self._cur, self._object_id,
                                       _prove_sheet=_sheet, textbox_text=_mdtext,
                                       textbox_text_v20=_mdtext_v20)
@@ -3674,7 +3675,7 @@ class RoutineBuilder(L5xElementBuilder):
                 fbd_content = _decode_fbd(
                     self._cur, self._object_id, self._short_header,
                     sheet_size=_sheet[0], sheet_orientation=_sheet[1],
-                    textbox_text=_tb)
+                    textbox_text=_tb, textbox_text_v20=_mdtext_v20)
         return Routine(name, name, routine_type, rungs, rung_ids, rung_comments,
                        description, _safety_signature=safety_sig,
                        _safety_signature_timestamp=safety_sig_ts,

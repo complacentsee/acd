@@ -426,17 +426,18 @@ def _block_arrays(cur, eo, base):
 
 
 def decode_fbd(cur, routine_oid, short_header, sheet_size=None,
-               sheet_orientation=None, textbox_text=None):
+               sheet_orientation=None, textbox_text=None, textbox_text_v20=None):
     if sheet_size is None or sheet_orientation is None:
         return None
     try:
         return _decode(cur, routine_oid, short_header, sheet_size,
-                       sheet_orientation, textbox_text or {})
+                       sheet_orientation, textbox_text or {},
+                       textbox_text_v20 or {})
     except Exception:
         return None
 
 
-def _decode(cur, oid, sh, size, orient, tbtext):
+def _decode(cur, oid, sh, size, orient, tbtext, tbtext_v20):
     fam = 'S' if sh else 'L'
     base = 20 if sh else 24
 
@@ -675,10 +676,17 @@ def _decode(cur, oid, sh, size, orient, tbtext):
             for eo, er in _rows(cur, go):
                 if _kind(er) != TEXTBOX or _has_children(cur, eo):
                     return None
-                md = struct.unpack_from("<I", er, 20)[0]
                 x = struct.unpack_from("<I", er, base)[0]
                 y = struct.unpack_from("<I", er, base + 4)[0]
-                txt = tbtext.get("MD%d" % md)
+                if sh:
+                    # old-layout (V20) files carry no global md; record[28:32]
+                    # holds the FO text index (0xFFFFFFFF = none) resolved via
+                    # the FO_<n> map -- the same mechanism SFC uses.
+                    fo = struct.unpack_from("<I", er, 28)[0]
+                    txt = None if fo == 0xFFFFFFFF else tbtext_v20.get(fo)
+                else:
+                    md = struct.unpack_from("<I", er, 20)[0]
+                    txt = tbtext.get("MD%d" % md)
                 if txt is None:
                     return None
                 elems.append([eo, 'TextBox', x, y, None, None, txt])
