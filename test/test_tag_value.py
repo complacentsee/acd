@@ -56,6 +56,34 @@ def test_fmt_real_decorated_edges():
     assert T._fmt_real_decorated(float("nan")) == "1.#QNAN"
 
 
+def _nan_from_hex(hx):
+    """Decode a stored float32 (little-endian hex) to its widened double."""
+    return struct.unpack("<f", bytes.fromhex(hx))[0]
+
+
+def test_qnan_sign_bit_prefixes_minus():
+    # A stored REAL NaN with the IEEE-754 sign bit set renders '-1.#QNAN'
+    # (MSVC CRT printf), while a sign-clear NaN stays unsigned. Observed sites:
+    # 0xFFC00001 (SUB1 EZ11:I.Data[6]) and 0xFFFFFFFF (SUB4 CF42:I.Data[6]).
+    neg1 = _nan_from_hex("0100c0ff")   # 0xFFC00001, sign bit set
+    neg2 = _nan_from_hex("ffffffff")   # 0xFFFFFFFF, sign bit set
+    pos = _nan_from_hex("0000c07f")    # 0x7FC00000, sign bit clear
+    # Decorated form
+    assert T._fmt_real_decorated(neg1) == "-1.#QNAN"
+    assert T._fmt_real_decorated(neg2) == "-1.#QNAN"
+    assert T._fmt_real_decorated(pos) == "1.#QNAN"
+    # L5K CDATA form (via the atomic text path used by the L5K block)
+    assert T._atomic_text("REAL", bytes.fromhex("0100c0ff")) == "-1.#QNAN000e+000"
+    assert T._atomic_text("REAL", bytes.fromhex("0000c07f")) == "1.#QNAN000e+000"
+    # LREAL: a sign-set double NaN mirrors the same rule.
+    neg_d = struct.unpack("<d", bytes.fromhex("000000000000f8ff"))[0]
+    pos_d = struct.unpack("<d", bytes.fromhex("000000000000f87f"))[0]
+    assert T._fmt_lreal(neg_d) == "-1.#QNAN000e+000"
+    assert T._fmt_lreal(pos_d) == "1.#QNAN000e+000"
+    assert T._fmt_lreal_decorated(neg_d) == "-1.#QNAN"
+    assert T._fmt_lreal_decorated(pos_d) == "1.#QNAN"
+
+
 def test_fmt_real_l5k_uses_exponential_form():
     # L5K/raw atomic text uses the fixed 8-digit-mantissa e+NNN form.
     assert T._atomic_text("REAL", struct.pack("<f", 1.5)) == "1.50000000e+000"

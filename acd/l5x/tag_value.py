@@ -64,6 +64,26 @@ _L5K_PINF = "1.#INF0000e+000"
 _L5K_NINF = "-1.#INF0000e+000"
 
 
+def _sign_neg(v: float) -> bool:
+    """True iff the IEEE-754 sign bit is set (negative-zero and NaN aware).
+
+    The MSVC CRT prints QNaN with a leading ``-`` when the stored sign bit is set,
+    so a stored ``0xFFC00001``/``0xFFFFFFFF`` NaN renders ``-1.#QNAN`` while a
+    sign-clear ``0x7FC00000`` renders ``1.#QNAN``. ``v < 0`` is always False for a
+    NaN, so the sign must come from the bits themselves -- the same test already
+    used for signed zero at the ``_emit9``/``_round_sig_haway`` call sites.
+    """
+    return bool(struct.pack("<d", v)[7] & 0x80)
+
+
+def _qnan_l5k(v: float) -> str:
+    return ("-" + _L5K_QNAN) if _sign_neg(v) else _L5K_QNAN
+
+
+def _qnan_decorated(v: float) -> str:
+    return "-1.#QNAN" if _sign_neg(v) else "1.#QNAN"
+
+
 def _round_sig_haway(v: float, p: int) -> Tuple[str, int, bool]:
     """Round |v| to ``p`` significant figures, ROUND-HALF-AWAY-FROM-ZERO.
 
@@ -111,7 +131,7 @@ def _fmt_real(v: float) -> str:
     sentinels, which are NOT %e output.
     """
     if v != v:
-        return _L5K_QNAN
+        return _qnan_l5k(v)
     if v == float("inf"):
         return _L5K_PINF
     if v == float("-inf"):
@@ -120,7 +140,7 @@ def _fmt_real(v: float) -> str:
     # true float32 value (callers already feed an <f-unpacked value; be defensive).
     f = struct.unpack("<f", struct.pack("<f", v))[0]
     if f != f:
-        return _L5K_QNAN
+        return _qnan_l5k(f)
     if f == float("inf"):
         return _L5K_PINF
     if f == float("-inf"):
@@ -170,7 +190,7 @@ def _fmt_lreal(v: float) -> str:
     this is the by-analogy shared base rule; sentinels and signed zero are identical.
     """
     if v != v:
-        return _L5K_QNAN
+        return _qnan_l5k(v)
     if v == float("inf"):
         return _L5K_PINF
     if v == float("-inf"):
@@ -287,7 +307,7 @@ def _fmt_real_decorated(v: float) -> str:
     import math
     f = struct.unpack("<f", struct.pack("<f", v))[0]
     if f != f:                      # NaN -> Logix Decorated form
-        return "1.#QNAN"
+        return _qnan_decorated(f)
     if f == float("inf"):
         return "1.$"
     if f == float("-inf"):
@@ -327,7 +347,7 @@ def _fmt_lreal_decorated(v: float) -> str:
     import math
     f = v
     if f != f:
-        return "1.#QNAN"
+        return _qnan_decorated(f)
     if f == float("inf"):
         return "1.$"
     if f == float("-inf"):
