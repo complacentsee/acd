@@ -675,14 +675,17 @@ def _render_value_blocks(element: str,
                       if len(value_bytes) >= 4 else 0)
         except Exception:
             length = 0
-        if length + 4 > len(value_bytes):
-            # Malformed/garbage LEN: the reference clamps to the DATA
-            # capacity and emits those bytes verbatim (the garbage bytes are
-            # in the stored image), so mirror min(LEN, capacity).
-            text = _tag_value._ascii_string_cdata(
-                value_bytes[4:] if len(value_bytes) > 4 else b"")
-        else:
-            text = _tag_value._ascii_string_cdata(value_bytes[4:4 + length])
+        # The block renders element [0] only, so the DATA window is bounded
+        # by ONE element's image (the whole image for a scalar, image over
+        # the dim product for an array). A malformed/garbage LEN clamps to
+        # the element's remaining bytes verbatim -- DATA capacity plus
+        # trailing pad, garbage included -- and never runs into element [1].
+        total_elems, _ = _tag_value._dims_total(dimensions)
+        elem_size = (len(value_bytes) // total_elems
+                     if total_elems > 0 else len(value_bytes))
+        cap = max(elem_size - 4, 0)
+        n = length if length <= cap else cap
+        text = _tag_value._ascii_string_cdata(value_bytes[4:4 + n])
         string_block = (
             f'<{element} Format="String" Length="{length}">\n'
             f"<![CDATA['{text}']]>\n</{element}>"
