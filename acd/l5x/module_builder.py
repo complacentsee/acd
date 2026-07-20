@@ -249,12 +249,6 @@ class Module(L5xElement):
     # backing output tag, so its connections' OutputTag stubs are suppressed. An
     # unresolved entry leaves this False (keeps today's emission -- fail-safe).
     _io_no_output: bool = field(default=False)
-    # PrimCxn/SecCxn connection sizes stored directly on the module record as
-    # ext-attrs 0x141/0x142/0x143 (u32 LE). None when the attr is absent; used for
-    # a generic-profile module (e.g. a PT-24 HMI) the connection-name gate misses.
-    _primcxn_in: Union[int, None] = field(default=None)
-    _primcxn_out: Union[int, None] = field(default=None)
-    _seccxn_in: Union[int, None] = field(default=None)
     # True when the module owns >= 1 live produced-tag connection (the modern-Local
     # Communications rule; computed at build time where the DB cursor is available).
     _local_produced_conn: bool = field(default=False)
@@ -625,18 +619,6 @@ class Module(L5xElement):
                     )
                     if sec is not None:
                         primcxn_attrs += f' SecCxnInputSize="{sec["in_size"]}"'
-            elif self._primcxn_in is not None and self._primcxn_out is not None:
-                # A generic-profile module (e.g. a PT-24 HMI) the PT-table gate
-                # above does not cover: its sizes are stored on the module record
-                # as ext-attrs 0x141/0x142/0x143. SecCxnInputSize is emitted only
-                # when nonzero (a single-connection module stores 0 there and OEM
-                # omits the attribute).
-                primcxn_attrs = (
-                    f' PrimCxnInputSize="{self._primcxn_in}"'
-                    f' PrimCxnOutputSize="{self._primcxn_out}"'
-                )
-                if self._seccxn_in:
-                    primcxn_attrs += f' SecCxnInputSize="{self._seccxn_in}"'
             cm_attr = (f' CommMethod="{self._comm_method}"'
                        if self._comm_method is not None else '')
             comm_xml = (
@@ -2224,24 +2206,6 @@ class ModuleBuilder(L5xElementBuilder):
         except Exception:
             _dxid = None
 
-        # PrimCxn/SecCxn sizes stored on the module record (ext-attrs 0x141/0x142/
-        # 0x143, u32 LE). Read them so a generic-profile module whose connection
-        # names the PT-table gate does not cover can still emit its sizes.
-        _primcxn_in = _primcxn_out = _seccxn_in = None
-        try:
-            _mattrs = CompsRecord.record_attrs(
-                self._cur, self._object_id, self._short_header)
-            _v141 = _mattrs.get(0x141, b"")
-            _v142 = _mattrs.get(0x142, b"")
-            _v143 = _mattrs.get(0x143, b"")
-            if len(_v141) >= 4 and len(_v142) >= 4:
-                _primcxn_in = struct.unpack_from("<I", _v141, 0)[0]
-                _primcxn_out = struct.unpack_from("<I", _v142, 0)[0]
-                if len(_v143) >= 4:
-                    _seccxn_in = struct.unpack_from("<I", _v143, 0)[0]
-        except Exception:
-            _primcxn_in = _primcxn_out = _seccxn_in = None
-
         # The modern-Local Communications rule needs the produced-connection check
         # (only class 0x900 uses it, so skip the DB walk for every other module).
         _local_produced = (class_word == 0x900
@@ -2290,9 +2254,6 @@ class ModuleBuilder(L5xElementBuilder):
             _status_inner=status_inner,
             _io_suffix_map=io_suffix_map,
             _io_no_output=io_no_output,
-            _primcxn_in=_primcxn_in,
-            _primcxn_out=_primcxn_out,
-            _seccxn_in=_seccxn_in,
             _local_produced_conn=_local_produced,
             _rack_has_input=rack_has_input,
             _rack_has_output=rack_has_output,
