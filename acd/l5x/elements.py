@@ -237,6 +237,48 @@ try:
 except ValueError:
     _DECORATED_MAX_BYTES = 16384
 
+# Decorated-tree ELEMENT COUNT at/above which Studio omits the Decorated <Data>
+# block (keeping only the flat first block). This is the L5K-first exporter's
+# expression of the same "value too large to spell out" policy the raw-hex byte
+# ceiling above captures: in the L5K-first era the flat block is a compact CDATA
+# literal, so the size shows only in the (much larger) Decorated tree, and the
+# ceiling Studio applies is on the number of Decorated elements, not the raw
+# byte image (byte size overlaps between kept and omitted -- element count does
+# not). A single global export constant (2^15), NOT keyed by catalog/type;
+# validated 0 wrong-suppress over the OEM corpus (max element count among tags
+# OEM KEEPS Decorated is 28612, comfortably below the ceiling). Overridable via
+# ACD_DECORATED_MAX_ELEMS so a later corpus that shifts the ceiling needs no
+# code edit.
+try:
+    _DECORATED_MAX_ELEMS = int(os.environ.get("ACD_DECORATED_MAX_ELEMS", "32768"))
+except ValueError:
+    _DECORATED_MAX_ELEMS = 32768
+
+# Conservative lower bound on the character length of one serialised Decorated
+# element (the tersest is an <Element Index="[N]" Value="V"/>, ~28 chars). Used
+# only to skip the element count entirely for bodies too short to possibly
+# exceed the ceiling -- a body with more than _DECORATED_MAX_ELEMS elements is
+# necessarily longer than this many characters, so the pre-gate never skips a
+# body that could cross the threshold.
+_MIN_DECORATED_ELEM_CHARS = 10
+
+# CDATA sections in a Decorated body (string-member DATA) may contain literal
+# '<' characters, which must not be counted as element start tags.
+_CDATA_RE = re.compile(r"<!\[CDATA\[.*?\]\]>", re.S)
+
+
+def _decorated_elem_count(body: str) -> int:
+    """Number of element start tags in a generated Decorated body.
+
+    Counts start tags (``<Name...``) minus end tags (``</Name>``), i.e. the
+    Decorated tree's descendant-element count -- the same metric Studio gates
+    the Decorated-block omission on. CDATA text (which may hold raw '<') is
+    stripped first so string values cannot inflate the count.
+    """
+    if "<![CDATA[" in body:
+        body = _CDATA_RE.sub("", body)
+    return body.count("<") - body.count("</")
+
 # A valid L5X tag-comment Operand is a member/bit/index path relative to the tag:
 # it starts with '.' or '[' and contains only identifier/index characters (the
 # comma separates a multi-dimension array index, e.g. "[4,1]"). Module
@@ -707,6 +749,17 @@ def _render_value_blocks(element: str,
         # edit (env override) if a later corpus shifts it.
         if (ok_first and raw_hex_first
                 and len(value_bytes) >= _DECORATED_MAX_BYTES):
+            return first + force_xml
+        # L5K-first era: the flat block is a compact CDATA literal, so a very
+        # large value shows only in the Decorated tree's element count. Studio
+        # omits the Decorated block once that count crosses a global ceiling
+        # (_DECORATED_MAX_ELEMS). Count the generated body (so the metric is
+        # exactly what would be emitted); the length pre-gate keeps this off the
+        # hot path for the overwhelming majority of small tags.
+        if (ok_first and decorated_inner is not None
+                and len(decorated_inner)
+                >= _DECORATED_MAX_ELEMS * _MIN_DECORATED_ELEM_CHARS
+                and _decorated_elem_count(decorated_inner) > _DECORATED_MAX_ELEMS):
             return first + force_xml
         if ok_first and decorated_inner is not None:
             return (first + force_xml
