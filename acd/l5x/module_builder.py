@@ -110,6 +110,20 @@ def _nm_payload_off(rec: bytes) -> int:
     return off
 
 
+def _inner_for_suffix(suffix_map, suffix, default):
+    """The I/O tag inner for a connection's decoded backing-tag suffix.
+
+    A module owning several I/O families (e.g. a robot adapter with both a
+    standard :I1 and a safety :SI backing tag) needs each connection's InputTag /
+    OutputTag rendered from that connection's own suffix. Single-family modules,
+    and any connection whose suffix is absent or unmapped, fall back to the merged
+    default (fail-open) so their output is unchanged.
+    """
+    if suffix_map and suffix and suffix_map.get(suffix) is not None:
+        return suffix_map[suffix]
+    return default
+
+
 @dataclass
 class Module(L5xElement):
     """Represents a Logix hardware module (<Module> in L5X)."""
@@ -195,6 +209,13 @@ class Module(L5xElement):
     # The module's status (:S) tag inner, used by a Status/MotionDiagnostics
     # connection's <InputTag> (the others use _input_inner / the :I tag).
     _status_inner: Union[str, None] = field(default=None)
+    # Per-suffix I/O tag inners keyed by the exact backing-tag suffix
+    # (I/SI/I1/I2/O/O1/O2/SO). A module usually owns one input family, but some
+    # (e.g. a robot adapter carrying both a standard :I1 and a safety :SI) own
+    # several; each connection selects its own inner by InputTag/OutputTagSuffix.
+    # A connection whose suffix is absent falls back to the merged _input_inner /
+    # _output_inner, so single-family modules are unchanged.
+    _io_suffix_map: Union[dict, None] = field(default=None)
     # Whether the module owns an :I / :O tag (a rack card's input :I tag carries no
     # design-value image, so _input_inner can be None even when the card has input);
     # used to decide a <RackConnection>'s InAliasTag / OutAliasTag presence.
@@ -388,9 +409,12 @@ class Module(L5xElement):
                 if not c.get("is_motion", False):
                     if c.get("has_input", True):
                         cn = c["name"]
-                        inner = (self._status_inner
-                                 if ("Status" in cn or "MotionDiagnostics" in cn)
-                                 else self._input_inner)
+                        if "Status" in cn or "MotionDiagnostics" in cn:
+                            inner = self._status_inner
+                        else:
+                            inner = _inner_for_suffix(
+                                self._io_suffix_map, c.get("InputTagSuffix"),
+                                self._input_inner)
                         tag_stubs += _io_tag("InputTag", inner)
                     if c.get("has_output", True):
                         # A safety output connection's <OutputTag> reuses the
@@ -403,6 +427,9 @@ class Module(L5xElement):
                         if ("Safety" in c.get("type", "")
                                 and self._safety_output_inner is not None):
                             out_inner = self._safety_output_inner
+                        # Per-suffix override for multi-family modules (fail-open).
+                        out_inner = _inner_for_suffix(
+                            self._io_suffix_map, c.get("OutputTagSuffix"), out_inner)
                         tag_stubs += _io_tag("OutputTag", out_inner)
                 # Connection point / size attributes, present only when OEM emits
                 # them (a generic/drive Output connection, or a data-driven one).
@@ -1764,6 +1791,7 @@ class ModuleBuilder(L5xElementBuilder):
         output_inner = None
         safety_output_inner = None
         status_inner = None
+        io_suffix_map = None
         rack_has_input = False
         rack_has_output = False
         rack_in_alias_inner = None
@@ -1793,13 +1821,20 @@ class ModuleBuilder(L5xElementBuilder):
             cfg = entry.get("C")
             if cfg is not None:
                 config_inner, config_size = cfg
-            # A module owns one input family: plain :I, safety :SI, or IO-Link :I1
-            # (never mixed). A standard output uses :O/:O1; a safety output uses the
-            # separate :SO tag (chosen per-connection in Module.to_xml by type).
+            # Most modules own one input family (plain :I, safety :SI, or IO-Link
+            # :I1); this merged pick is the default. A standard output uses :O/:O1;
+            # a safety output uses the separate :SO tag. Modules that own several
+            # families (e.g. a robot adapter with both :I1 and :SI) resolve each
+            # connection's tag by its own suffix via io_suffix_map (Module.to_xml).
             input_inner = entry.get("I") or entry.get("SI") or entry.get("I1")
             output_inner = entry.get("O") or entry.get("O1")
             safety_output_inner = entry.get("SO")
             status_inner = entry.get("S")
+            io_suffix_map = {
+                k: entry[k]
+                for k in ("I", "SI", "I1", "I2", "O", "O1", "O2", "SO")
+                if isinstance(entry.get(k), str)
+            } or None
             rack_has_input = bool(entry.get("has_I"))
             rack_has_output = bool(entry.get("has_O"))
             rack_in_alias_inner = entry.get("alias_inner_I")
@@ -2160,6 +2195,7 @@ class ModuleBuilder(L5xElementBuilder):
             _output_inner=output_inner,
             _safety_output_inner=safety_output_inner,
             _status_inner=status_inner,
+            _io_suffix_map=io_suffix_map,
             _rack_has_input=rack_has_input,
             _rack_has_output=rack_has_output,
             _rack_in_alias_inner=rack_in_alias_inner,
