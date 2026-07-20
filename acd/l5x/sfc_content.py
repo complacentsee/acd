@@ -25,8 +25,9 @@ branches+legs, stops, textboxes); links/attachments reference them by hash.
 The document emits Stops AFTER the Branch elements (matching the reference)
 even though Stop IDs precede the TextBox range. Branches sort by Y; a shared
 Y is ordered by the per-element creation counter modern-layout (d == 0)
-records persist at offset 20 (old-layout records store no counter there, so
-their ties fail closed). TextBoxes sort by (X, Y).
+records persist at offset 20, or -- for old-layout (d == -4) files that store
+no counter -- by replaying the exporter's unstable introsort over the whole
+language-element collection (see ``sfc_order``). TextBoxes sort by (X, Y).
 
 Fail-closed: any unrecognised record, an unresolved operand, a hash that does not
 map to an emitted element, or an ambiguous base shift returns None, so the
@@ -43,6 +44,8 @@ rather than risk a wrong SheetSize.
 import struct
 import re
 from xml.sax.saxutils import escape
+
+from acd.l5x.sfc_order import Elem as _Elem, order_branches as _order_branches
 
 _MARK = b"\xff\xfe\xff"
 _AT = re.compile(r"@([0-9a-fA-F]+)@")
@@ -423,29 +426,38 @@ def decode_sfc(cur, routine_oid, _prove_sheet=None, textbox_text=None):
         T.sort(key=lambda t: t["op"])
         P.sort(key=lambda p: p["op"])
         # Branch bars can legitimately share a Y (side-by-side parallel
-        # structures). Modern-layout (d == 0) records persist a per-element
-        # creation counter in the u32 at offset 20 -- the very field whose
-        # presence IS the d shift -- and the reference orders same-Y bars by
-        # it, ascending (a stable Y-sort over creation order). The old layout
-        # (d == -4) does not store the counter (offset 20 holds a constant),
-        # so an old-layout tie stays fail-closed.
-        by_y = {}
-        for b in B:
-            by_y.setdefault(b["Y"], []).append(b)
-        ordered = []
-        for y in sorted(by_y):
-            grp = by_y[y]
-            if len(grp) > 1:
-                if d != 0:
-                    return None
-                uids = [u32(subtree[bo], 20) for bo in
-                        (byhash[b["hash"]] for b in grp)]
-                if len(set(uids)) != len(uids):
-                    return None
-                grp = [b for _u, b in
-                       sorted(zip(uids, grp), key=lambda t: t[0])]
-            ordered.extend(grp)
-        B = ordered
+        # structures), and the exporter's order for a tied group differs by
+        # firmware layout:
+        #   * modern layout (d == 0) persists a per-element creation counter in
+        #     the u32 at offset 20 -- the field whose presence IS the d shift --
+        #     and the reference orders same-Y bars by it, ascending.
+        #   * old layout (d == -4) stores no such counter; the tie order is the
+        #     emergent result of the exporter running the routine's whole
+        #     language-element collection through an unstable introsort. We
+        #     replay that byte-exact (sfc_order), keyed on the record self-hash
+        #     enumeration order -- see acd/l5x/sfc_order.py.
+        if d == 0:
+            by_y = {}
+            for b in B:
+                by_y.setdefault(b["Y"], []).append(b)
+            ordered = []
+            for y in sorted(by_y):
+                grp = by_y[y]
+                if len(grp) > 1:
+                    uids = [u32(subtree[bo], 20) for bo in
+                            (byhash[b["hash"]] for b in grp)]
+                    if len(set(uids)) != len(uids):
+                        return None
+                    grp = [b for _u, b in
+                           sorted(zip(uids, grp), key=lambda t: t[0])]
+                ordered.extend(grp)
+            B = ordered
+        else:
+            elems = [_Elem(1003, s["hash"], s["X"], s["Y"], s["op"], s) for s in S]
+            elems += [_Elem(1006, t["hash"], t["X"], t["Y"], t["op"], t) for t in T]
+            elems += [_Elem(1021, p["hash"], p["X"], p["Y"], p["op"], p) for p in P]
+            elems += [_Elem(1017, b["hash"], 0, b["Y"], "", b) for b in B]
+            B = _order_branches(elems)
         if len({(t["X"], t["Y"]) for t in TB}) != len(TB):
             return None
         TB.sort(key=lambda t: (t["X"], t["Y"]))
