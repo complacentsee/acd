@@ -333,10 +333,14 @@ class CommentsRecord:
           [0:4]   u32 member_ref    (0 for the component's own description,
                                       nonzero for a sub-element description)
           [4:8]   u32 rung_content  (nonzero for rung-level comments)
-          [8:15]  7 bytes (object_id/pad region)
-          [15:]   UTF-16LE NUL-terminated description text (CR/LF kept)
+          [8:14 or 8:15]  pad region (6 bytes "even" form / 7 bytes "odd" form)
+          [14 or 15:]     UTF-16LE NUL-terminated description text (CR/LF kept)
 
-        The description text starts at body offset 15 (odd within the record).
+        The text starts at body offset 15 in the common "odd" form, but at 14 in
+        an "even" form (older V7/V15 records) whose pad is one byte shorter. The
+        start is derived from the bytes (the first ASCII code unit has a zero high
+        byte) -- hardcoding 15 read the even form one byte late and produced
+        mojibake (every char shifted, the first char dropped).
         Returns the 9-tuple matching the comments table schema, or None.
 
         Keying: the comment is stored with ``parent == comment_id`` (the raw
@@ -359,7 +363,9 @@ class CommentsRecord:
         member_ref = struct.unpack_from("<I", body, 0)[0]
         rung_content = struct.unpack_from("<I", body, 4)[0]
 
-        pos = 15
+        # "even" form (one shorter pad): first UTF-16LE unit at 14 (non-zero low
+        # byte, zero high byte); otherwise the common "odd" form starts at 15.
+        pos = 14 if (body[14] != 0 and body[15] == 0) else 15
         cus = []
         while pos + 1 < len(body):
             cu = struct.unpack_from("<H", body, pos)[0]

@@ -165,7 +165,8 @@ def build_comm_ports(cur: Cursor, controller_oid: int,
 
 
 def build_ethernet_ports(cur: Cursor, controller_oid: int, short_header: bool,
-                         major_rev: Union[str, None]) -> str:
+                         major_rev: Union[str, None],
+                         processor_type: Union[str, None] = None) -> str:
     """<EthernetPorts> with one <EthernetPort> per EthernetPortN comp, or ""
     when the controller has none. The attribute form follows the controller
     firmware major revision (the emitted MajorRev): <=24 uses
@@ -176,8 +177,6 @@ def build_ethernet_ports(cur: Cursor, controller_oid: int, short_header: bool,
             ane_form = int(major_rev) <= 24
         except (TypeError, ValueError):
             ane_form = False
-        has_ip2 = _rcc_child(
-            cur, controller_oid, "InternetProtocol2", short_header) is not None
         ports = []
         for n in (1, 2):
             attrs = _attrs(
@@ -196,8 +195,16 @@ def build_ethernet_ports(cur: Cursor, controller_oid: int, short_header: bool,
                         label = blk[8:8 + ln].decode("ascii", errors="replace")
             if label is None:
                 # No stored label: the reference defaults to the port number,
-                # "A"-prefixed on the dual-IP (InternetProtocol2) generation.
-                label = f"A{n}" if has_ip2 else str(n)
+                # "A"-prefixed on the 5069 CompactLogix/Compact GuardLogix 5380
+                # family (dual front-panel Ethernet ports silkscreened A1/A2),
+                # bare "n" on every other family. The "A" prefix is EDS/front-
+                # panel data not stored in the ACD, so it is keyed on the
+                # controller catalog family (corpus: 5069-* -> "A"+n in 46/46;
+                # 1756-/1769-* -> "n"). USER-APPROVED per-family constant, the
+                # same class of scoped exception as the EncryptionConfig version
+                # hardcode; NOT derivable from the record.
+                is_5069 = bool(processor_type) and processor_type.startswith("5069-")
+                label = f"A{n}" if is_5069 else str(n)
             attrs_out = f'Port="{n}"'
             if ane_form:
                 if enabled is not None:

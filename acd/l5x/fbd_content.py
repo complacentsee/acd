@@ -9,9 +9,11 @@ name resolution. ``decode_fbd`` walks it and renders ``<FBDContent>``; the sheet
 size/orientation are supplied by the caller (from acd.l5x.sheet_layout).
 
 Fully fail-closed: an untabled block kind, an unresolved operand, a duplicate
-element key, a wire/attachment referencing an unknown element, a textbox with no
-resolved text, or a missing sheet size all return None, so the routine keeps its
-empty ``<Routine>`` (element_missing) rather than emit a wrong or partial sheet.
+element key, a wire/attachment referencing an unknown element, or a missing
+sheet size all return None, so the routine keeps its empty ``<Routine>``
+(element_missing) rather than emit a wrong or partial sheet. A textbox with no
+resolved text is NOT a failure -- it renders self-closing (``<TextBox .../>``),
+exactly as Studio's own exporter and the sibling SFC renderer do.
 """
 import struct
 import re
@@ -698,8 +700,11 @@ def _decode(cur, oid, sh, size, orient, tbtext, tbtext_v20):
                 else:
                     md = struct.unpack_from("<I", er, 20)[0]
                     txt = tbtext.get("MD%d" % md)
-                if txt is None:
-                    return None
+                # A textbox with no resolved text is legal: Studio's own exporter
+                # self-closes it (<TextBox .../> with no <Text>). Carry txt=None
+                # and emit the self-closing form in pass 2 -- mirrors the SFC
+                # renderer (sfc_content._decode). Killing the whole sheet here
+                # (the old `if txt is None: return None`) dropped valid FBDContent.
                 elems.append([eo, 'TextBox', x, y, None, None, txt])
 
         if not elems:
@@ -767,8 +772,12 @@ def _decode(cur, oid, sh, size, orient, tbtext, tbtext_v20):
                 else:
                     el_xml.append('%s/>' % head)
             elif typ == 'TextBox':
-                el_xml.append('<TextBox ID="%d" X="%d" Y="%d" Width="0"><Text><![CDATA[%s]]></Text></TextBox>'
-                              % (i, e[2], e[3], e[6]))
+                if e[6] is None:
+                    el_xml.append('<TextBox ID="%d" X="%d" Y="%d" Width="0"/>'
+                                  % (i, e[2], e[3]))
+                else:
+                    el_xml.append('<TextBox ID="%d" X="%d" Y="%d" Width="0"><Text><![CDATA[%s]]></Text></TextBox>'
+                                  % (i, e[2], e[3], e[6]))
 
         wires = []
         for go in wgs:

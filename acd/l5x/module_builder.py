@@ -178,6 +178,12 @@ class Module(L5xElement):
     _backplane_slot: Union[int, None] = field(default=None)
     _chassis_size: Union[int, None] = field(default=None)
     _port_child_counts: Dict[int, int] = field(default_factory=dict)
+    # True when the module's entire ancestry to the root traverses NO Ethernet
+    # port (a pure-backplane path): @Unicast is then suppressed on its
+    # connections (unicast/multicast is meaningless without an EtherNet/IP hop,
+    # so the reference omits it). Set fail-closed by the module builder's 4th
+    # pass -- False (today's behaviour) whenever the ancestry cannot be resolved.
+    _no_ethernet_ancestry: bool = field(default=False)
     # Pre-rendered <Ports> XML decoded from the module's RxDataCollection topology
     # blob (see ModuleBuilder._ports_from_data_collection). When set it replaces
     # the static PORT_STRUCTURES path; None falls back to that path.
@@ -500,8 +506,13 @@ class Module(L5xElement):
                     if a in c
                 )
                 # Unicast is rendered only on connection types that carry it
-                # (safety always; plain Input/Output only when point-to-point).
-                uni = f' Unicast="{c["unicast"]}"' if c.get("unicast_present", True) else ""
+                # (safety always; plain Input/Output only when point-to-point),
+                # AND only when the module's ancestry reaches the root through an
+                # EtherNet/IP hop -- a pure-backplane module (e.g. a local-chassis
+                # DH+/RIO bridge) has no unicast/multicast choice, so OEM omits it.
+                uni = (f' Unicast="{c["unicast"]}"'
+                       if c.get("unicast_present", True)
+                       and not self._no_ethernet_ancestry else "")
                 conn_parts.append(
                     f'<Connection Name="{safe_name}" RPI="{c["rpi"]}" Type="{c["type"]}"'
                     f'{extra}'
@@ -600,13 +611,26 @@ class Module(L5xElement):
             # sizes; a two-connection scanner also states its secondary "Status"
             # Input connection's input size (SecCxnInputSize only).
             primcxn_attrs = ""
-            if self.vendor == 1 and self.product_type in (0, 12, 123):
-                prim = next(
-                    (c for c in self._connections
-                     if c.get("name") == "Standard" and c.get("type") == "Output"
-                     and "in_size" in c),
-                    None,
-                )
+            if self.vendor == 1 and self.product_type in (0, 12, 24, 123):
+                if self.product_type == 24:
+                    # The lone corpus PT=24 module (a 2713P PanelView HMI) names
+                    # its primary connection "Output", not "Standard". USER-
+                    # APPROVED single-instance rule (Pool A only -- no PT=24 module
+                    # exists in Pool B, so the 0-worse invariant holds by
+                    # construction). HEURISTIC: rests on n=1; a future PT=24
+                    # catalog with a non-Output primary could misfire.
+                    prim = next(
+                        (c for c in self._connections
+                         if c.get("type") == "Output" and "in_size" in c),
+                        None,
+                    )
+                else:
+                    prim = next(
+                        (c for c in self._connections
+                         if c.get("name") == "Standard" and c.get("type") == "Output"
+                         and "in_size" in c),
+                        None,
+                    )
                 if prim is not None:
                     primcxn_attrs = (
                         f' PrimCxnInputSize="{prim["in_size"]}"'

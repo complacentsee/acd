@@ -44,7 +44,7 @@ from acd.l5x.base import (
 )
 from acd.l5x.encoded_data import (
     _WRAPPED_KEY_VERSION,
-    aoi_seal_signature_id,
+    aoi_seal_trailer,
     encoded_aoi,
     encoded_routine,
     encryption_config_for_version,
@@ -306,6 +306,9 @@ def _decorated_elem_count(body: str) -> int:
 # connection-point comments instead carry a raw binary key that decodes to junk
 # (e.g. CJK from a UTF-16 misread); those must not leak in as tag operand comments.
 _OPERAND_RE = re.compile(r"^[.\[][A-Za-z0-9_.,\[\]]*$")
+# <Port Id="N" ... Type="T"> -> (N, T); used to read a module's port types back
+# out of its rendered <Ports> XML for the Unicast ancestry walk.
+_PORT_ID_TYPE_RE = re.compile(r'<Port Id="(\d+)"[^>]*?Type="([^"]+)"')
 
 
 def _is_valid_operand(op: str) -> bool:
@@ -358,8 +361,8 @@ def _file_comment_epoch(cur) -> int:
 # AverageVelocityTimebase are read, not hardcoded). The int->label tables are
 # reference-invariant Logix motion-schema constants (same class as radix_enum).
 # Only ONE field shifts by generation: the record grows in the middle, moving
-# the tail InterpolatedPositionConfiguration (+ whether AxisUpdateSchedule is
-# appended). That shift is keyed on the blob LENGTH -- an intrinsic property of
+# the tail InterpolatedPositionConfiguration + AxisUpdateSchedule (both read at
+# length-keyed offsets). That shift is keyed on the blob LENGTH -- a property of
 # the bytes, so it cannot disagree with the layout it selects (a MajorRev key
 # could, since the two probe passes disagreed on whether firmware rev or the
 # container version drives it). An unrecognised length returns None -> no
@@ -377,7 +380,7 @@ _AXIS_ENUM: Dict[str, Dict[int, str]] = {
                       2: "Uni-directional Reverse", 3: "Bi-directional Reverse"},
     "HomeSequence": {0: "Immediate", 1: "Switch", 2: "Marker"},
     "ProgrammedStopMode": {0: "Fast Stop", 1: "Fast Disable"},
-    "AxisUpdateSchedule": {0: "Base"},
+    "AxisUpdateSchedule": {0: "Base", 1: "Alternate 1", 2: "Alternate 2"},
 }
 # Fixed header attrs (name, offset, kind[, enum]); kind: f real, d u32-dec,
 # h u32-hex (16#XXXX_XXXX), s u16-len-prefixed UTF-8, e u8 enum.
@@ -405,20 +408,24 @@ _AXIS_VIRTUAL_HEADER = [
     ("DynamicsConfigurationBits", 1182, "d"),
 ]
 # Blob length -> (InterpolatedPositionConfiguration offset | None,
-# AxisUpdateSchedule present). The blob length is the firmware-generation
-# discriminator, read straight from the record, so this needs no external
-# version input; an unknown length falls through to today's no-<Data>
+# AxisUpdateSchedule byte offset | None). The blob length is the firmware-
+# generation discriminator, read straight from the record, so this needs no
+# external version input; an unknown length falls through to today's no-<Data>
 # behaviour (0-worse). An IPC offset of None marks a generation that predates
 # InterpolatedPositionConfiguration entirely (the OEM emits no such attribute),
 # so it is omitted -- the header (158..1182) is unchanged, only the tail moves.
+# The AxisUpdateSchedule value is a u8 enum READ at ipc_off+14 (the same offset
+# axis_cip_data.json declares for the identical blob lengths of the sibling
+# AXIS_CIP_DRIVE/AXIS_SERVO_DRIVE profile); None means the attribute does not
+# exist at that generation. It was previously hardcoded to enum index 0 ("Base").
 _AXIS_VIRTUAL_TAIL = {
-    3424: (None, False),
-    3430: (3426, False),
-    3654: (3426, True),
-    3666: (3426, True),
-    5476: (3474, True),
-    5843: (3506, True),
-    5965: (3506, True),
+    3424: (None, None),
+    3430: (3426, None),
+    3654: (3426, 3440),
+    3666: (3426, 3440),
+    5476: (3474, 3488),
+    5843: (3506, 3520),
+    5965: (3506, 3520),
 }
 
 
@@ -445,7 +452,7 @@ def _render_axis_virtual(blob: bytes, group_name: str) -> "Union[str, None]":
     tail = _AXIS_VIRTUAL_TAIL.get(len(blob))
     if tail is None:
         return None
-    ipc_off, aus = tail
+    ipc_off, aus_off = tail
     try:
         parts = [f'MotionGroup="{html.escape(group_name, quote=True)}"']
         for entry in _AXIS_VIRTUAL_HEADER:
@@ -456,9 +463,11 @@ def _render_axis_virtual(blob: bytes, group_name: str) -> "Union[str, None]":
             ipc = _tag_value._format_int_radix(
                 "UDINT", struct.unpack_from("<I", blob, ipc_off)[0], 4, "Hex")
             parts.append(f'InterpolatedPositionConfiguration="{ipc}"')
-        if aus:
-            parts.append('AxisUpdateSchedule="'
-                         + _AXIS_ENUM["AxisUpdateSchedule"][0] + '"')
+        if aus_off is not None:
+            sched = _AXIS_ENUM["AxisUpdateSchedule"].get(blob[aus_off])
+            if sched is None:
+                return None  # unmodelled schedule code -> withhold, never guess
+            parts.append(f'AxisUpdateSchedule="{sched}"')
     except Exception:
         return None
     # OEM joins attrs with a single space, breaking to a newline+space after
@@ -2025,21 +2034,54 @@ class Controller(L5xElement):
             f'<RedundancyInfo Enabled="{redundancy_enabled_str}" '
             f'KeepTestEditsOnSwitchOver="false"{pad_attrs}/>'
         )
+        # The reference omits @ChangesToDetect on the pre-V20 save format and
+        # emits the fixed all-ones mask from V20 on. Gate on our own MajorRev;
+        # strip only when it is CONFIDENTLY pre-V20, else keep the attribute
+        # (fail-closed: an unknown version keeps today's output).
+        security_xml = (
+            '<Security Code="0"/>'
+            if str(self.major_rev).isdigit() and int(self.major_rev) < 20
+            else '<Security Code="0" ChangesToDetect="16#ffff_ffff_ffff_ffff"/>')
+        # Studio's L5X import validates the <Controller> child ORDER against the
+        # schema sequence and ABORTS on a wrong order -- invisible to the fidelity
+        # comparator (order-insensitive), but it makes the L5X non-importable.
+        # The canonical order (derived corpus-wide from the OEM exports) is:
+        # RedundancyInfo, Security, SafetyInfo, DataTypes, Modules,
+        # AddOnInstructionDefinitions, AlarmDefinitions, Tags, Programs, Tasks,
+        # ... The base renders `inner` in field order (DataTypes, Modules, Tags,
+        # Programs, Tasks, AddOnInstructionDefinitions), so move the AOI section
+        # from the end of inner to right after </Modules>, followed immediately by
+        # AlarmDefinitions (corpus-proven: AOIDefs < AlarmDefinitions < Tags), and
+        # emit the RedundancyInfo/Security/SafetyInfo stubs BEFORE inner.
+        alarm = self._alarm_definitions
+        has_modules_close = '</Modules>' in inner
+        _aoi = re.search(
+            r'<AddOnInstructionDefinitions(?:\s[^>]*)?>.*'
+            r'</AddOnInstructionDefinitions>|<AddOnInstructionDefinitions\s*/>',
+            inner, re.S)
+        if _aoi:
+            inner = (inner[:_aoi.start()] + inner[_aoi.end():]).replace(
+                '</Modules>', '</Modules>' + _aoi.group(0) + alarm, 1)
+            if has_modules_close:
+                alarm = ""
+        elif alarm and has_modules_close:
+            inner = inner.replace('</Modules>', '</Modules>' + alarm, 1)
+            alarm = ""
         return (
             open_tag
-            + inner
             + redundancy_info
-            # The reference omits @ChangesToDetect on the pre-V20 save format and
-            # emits the fixed all-ones mask from V20 on. Gate on our own MajorRev;
-            # strip only when it is CONFIDENTLY pre-V20, else keep the attribute
-            # (fail-closed: an unknown version keeps today's output).
-            + ('<Security Code="0"/>'
-               if str(self.major_rev).isdigit() and int(self.major_rev) < 20
-               else '<Security Code="0" ChangesToDetect="16#ffff_ffff_ffff_ffff"/>')
+            + security_xml
             + self._safety_info_xml()
-            + self._alarm_definitions
-            + self._comm_ports_xml
+            + inner
+            + alarm
+            # ParameterConnections MUST precede CommPorts: proven by Studio
+            # import (a controller with CommPorts before ParameterConnections
+            # aborts with XMLSrv_E_IMPORT_ABORTED_NO_CHANGES; the reverse imports).
+            # They never co-occur in the OEM corpus (serial CommPorts is legacy,
+            # dropped on the L8x controllers that use ParameterConnections), so
+            # this is order-only with no current fidelity effect.
             + self._parameter_connections_xml
+            + self._comm_ports_xml
             + f'<CST MasterID="{self._cst_master_id}"/>'
             + (f'<WallClockTime LocalTimeAdjustment='
                f'"{self._wct_local_time_adjustment}" '
@@ -5685,6 +5727,43 @@ def _build_short_routine_descriptions(cur) -> Dict[int, str]:
     return out
 
 
+def _topo_sort_modules(modules):
+    """Order modules parent-before-child so Studio's L5X import can resolve each
+    module's ParentModule reference (Studio processes <Module> elements in
+    document order and aborts when a child precedes its parent). Order-only: the
+    fidelity comparator matches modules by name, so this is a 0-score change --
+    but a child emitted before its parent makes the whole L5X non-importable into
+    Studio. A missing or cyclic parent falls back to the module's original slot.
+
+    Tracked by OBJECT IDENTITY, never by name: the corpus has multiple name-less
+    modules (drive-peripheral expansion cards with no Name attribute), so a
+    name-keyed set would collapse them and DROP all but one. ParentModule always
+    names a real (named) parent, so name->module is used only for parent lookup."""
+    by_name = {}
+    for m in modules:
+        nm = getattr(m, "name", None)
+        if nm and nm not in by_name:
+            by_name[nm] = m
+    ordered = []
+    placed = set()
+
+    def place(m, stack):
+        if id(m) in placed:
+            return
+        pm = getattr(m, "parent_module", None)
+        nm = getattr(m, "name", None)
+        parent = by_name.get(pm) if (pm and pm != nm) else None
+        if (parent is not None and id(parent) not in placed
+                and id(parent) not in stack):
+            place(parent, stack | {id(m)})
+        ordered.append(m)
+        placed.add(id(m))
+
+    for m in modules:
+        place(m, set())
+    return ordered
+
+
 @dataclass
 class ControllerBuilder(L5xElementBuilder):
     # True for V10..V21 short-header projects (set by ExportL5x). Routes the
@@ -6558,15 +6637,22 @@ class ControllerBuilder(L5xElementBuilder):
                 # nothing rather than a plaintext def OEM never wrote. Recovery mode
                 # always keeps the decoded plaintext definition.
                 a1 = _ext_attr01(rec)
-                sid = aoi_seal_signature_id(a1)
-                if sid is not None:
+                seal = aoi_seal_trailer(a1)
+                if seal is not None:
                     # Sealed AOI: OEM force-encodes it; its interface is plaintext, so
-                    # the decoded definition carries the real parameters. The seal
-                    # epoch has no readable descriptor, so the config follows the
-                    # Studio version.
+                    # the decoded definition carries the real parameters. The cfg8/9
+                    # seal epochs have no readable descriptor (config follows the Studio
+                    # version); the cfg3 (V20) seal has a readable descriptor, and its
+                    # export omits SignatureID/SafetySignatureID entirely.
+                    sid, ssid, _seal_ts = seal
+                    _cfg = (encryption_config_for_version(self._acd_major)
+                            or source_protection_config(rec, a1, _AOI_KEYHASH_OFF,
+                                                        self._acd_major))
+                    if _cfg == 3:
+                        sid = ssid = None
                     _aoi._encoded = encoded_aoi(
-                        _aoi, encryption_config_for_version(self._acd_major),
-                        sid, _aoi.edited_date)
+                        _aoi, _cfg, sid, _aoi.edited_date,
+                        safety_signature_id=ssid)
                     if _aoi._encoded is None:
                         # A seal OEM force-encodes but whose interface we could not
                         # rebuild (e.g. a PackMLv3 library seal whose wrapped key is
@@ -6751,6 +6837,43 @@ class ControllerBuilder(L5xElementBuilder):
                     for port_id in range(1, 20)
                     if (m.name, port_id) in child_counts
                 }
+
+            # Fourth pass: suppress Connection @Unicast on a module whose entire
+            # ancestry to the root traverses NO Ethernet port (unicast/multicast is
+            # meaningless on a pure-backplane path -- OEM omits @Unicast there).
+            # FAIL-CLOSED: any unresolved hop (missing parent, unknown parent-port
+            # type, or a cycle) leaves the flag False and keeps today's behaviour,
+            # so a wrong topology never suppresses a real Unicast.
+            _parent = {m.name: (m.parent_module, m.parent_mod_port_id)
+                       for m in modules}
+            _ptypes = {
+                m.name: {int(pid): typ for pid, typ
+                         in _PORT_ID_TYPE_RE.findall(m._build_ports_xml())}
+                for m in modules
+            }
+
+            def _has_eth_ancestry(name):
+                seen = set()
+                cur = name
+                while True:
+                    if cur in seen:
+                        return None                     # cycle -> unresolved
+                    seen.add(cur)
+                    pm, ppid = _parent.get(cur, (None, None))
+                    if pm is None:
+                        return None                     # dangling parent
+                    if pm == cur:
+                        return False                    # root reached, no Eth hop
+                    pts = _ptypes.get(pm)
+                    if pts is None or ppid not in pts:
+                        return None                     # unknown parent port
+                    if pts[ppid] == "Ethernet":
+                        return True
+                    cur = pm
+
+            for m in modules:
+                if not m._is_root:
+                    m._no_ethernet_ancestry = _has_eth_ancestry(m.name) is False
         # Stash the modid->name map for the post-build axis pass (CIP-drive
         # MotionModule resolution reads it).
         self._modid_to_name = modid_to_name
@@ -7257,7 +7380,14 @@ class ControllerBuilder(L5xElementBuilder):
             _comment_parent = (r.comment_id * 0x10000) + r.cip_type
         except Exception:
             r = None
-            extended_records = {}
+            # The kaitai parse also fails when the controller root is source-
+            # protected-at-rest (the SP marker at body+78 replaces the ext-attr
+            # count): recover the ext-attr table via the SP-aware reader so the
+            # dates (0x65/0x66) and ProjectSN (0x75) resolve instead of degrading
+            # to placeholders. It returns {} when there is no marker (the V10..V21
+            # opaque-body case), so those still degrade to defaults as before.
+            extended_records = CompsRecord.read_ext_attrs_from_record(
+                results[0][4], full=True) or {}
             _comment_parent = None
 
         controller_description = self._pass_own_description(results, _comment_parent)
@@ -7297,7 +7427,7 @@ class ControllerBuilder(L5xElementBuilder):
             self._pass_programs(data_types_map, redundancy_enabled, alarm_map, short_routine_desc)
         tasks = self._pass_tasks(comment_id_to_program)
         aois = self._pass_aois(data_types_map, short_routine_desc)
-        modules = self._pass_modules(io_data_map)
+        modules = _topo_sort_modules(self._pass_modules(io_data_map))
         processor_type, major_rev, minor_rev, comm_path = \
             self._pass_processor_identity(modules, _comm_path_prefix, _ctlattrs)
         comm_ports_xml = build_comm_ports(
@@ -7305,7 +7435,8 @@ class ControllerBuilder(L5xElementBuilder):
         internet_protocol_xml = build_internet_protocol(
             self._cur, self._object_id, self._short_header, major_rev)
         ethernet_ports_xml = build_ethernet_ports(
-            self._cur, self._object_id, self._short_header, major_rev)
+            self._cur, self._object_id, self._short_header, major_rev,
+            processor_type)
         ethernet_network_xml = build_ethernet_network(
             self._cur, self._object_id, self._short_header)
         opc_ua_info_xml = build_opc_ua_info(

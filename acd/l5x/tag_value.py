@@ -332,10 +332,18 @@ def _fmt_real_decorated(v: float) -> str:
         elif Decimal(a) < Decimal(10) ** exp:
             exp -= 1
         p = _shortest_sig(f)
-        sci = (exp >= 9) or (p - 1 - exp >= 10)
+        # A p-digit half-away rounding can carry a decade (e.g. float32(1e-9) =
+        # 9.99999972e-10 rounds at p=1 to 1e-9), moving the leading-digit
+        # exponent. The fixed-vs-scientific band AND the fixed render must be
+        # judged on the digits actually emitted -- the POST-rounding exponent
+        # e2 -- not the pre-rounding exp. Confined to the p==1 decade-carry case
+        # (only +-float32(1e-9) diverge corpus-wide); every other value has
+        # e2 == exp, so its output is unchanged.
+        _dig, e2, _neg = _round_sig_haway(f, p)
+        sci = (e2 >= 9) or (p - 1 - e2 >= 10)
         if sci:
             return _fmt_real(f)                         # 9-sig scientific (L5K form)
-        return _decorated_fixed(f, p, exp, f < 0.0)
+        return _decorated_fixed(f, p, e2, f < 0.0)
 
 
 def _fmt_lreal_decorated(v: float) -> str:
@@ -924,6 +932,10 @@ def _emit_l5k(node) -> Optional[str]:
         # Storage form: installed forces are a runtime overlay, never part of
         # the L5K design-value image, so the node's force field is dropped here.
         _kind, mdt, _dims, vals, _radix, _fvals = node
+        if mdt in ("BOOL", "BIT"):
+            # OEM writes each packed BOOL/BIT array element as the binary literal
+            # 2#0 / 2#1 -- matching render_l5k's top-level BOOL-array form.
+            return "[" + ",".join("2#%d" % v for v in vals) + "]"
         return "[" + ",".join(_l5k_value(mdt, v) for v in vals) + "]"
     if kind == "sarr":
         _kind, _mdt, _dims, walk_elem, total, _layout_ok = node

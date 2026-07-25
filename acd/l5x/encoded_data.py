@@ -446,41 +446,74 @@ def encoded_routine(routine, a1: Optional[bytes], keyhash_off: int,
 # decoded AOI carries no parameters).
 _AOI_ENCODED_TYPE = "AddOnInstructionDefinition"
 
-# The AOI seal trailer inside ext-attr 0x1 ends with a u16 format-version word, the
-# u32 SignatureID, then zero padding to the attribute's end. These are the observed
-# seal versions; version 4 is a different (non-seal) descriptor and must not be read
-# as a signature. An unsealed definition carries the same trailer with a zero ID.
-_AOI_SEAL_VERSIONS = frozenset({5, 6})
+# The AOI seal trailer sits at the END of ext-attr 0x1:
+#   [u64 EditedDate microseconds-since-1970][u32 SignatureID]([u32 SafetySignatureID])
+#   [zero pad to the attribute end]
+# The u64 IS the definition's EditedDate; the OEM export projects SignatureID (and,
+# for a safety AOI, the following SafetySignatureID) onto the <EncodedData> wrapper.
+# The trailer is located by that timestamp -- a millisecond-aligned microsecond value
+# in a plausible date window -- NOT by a byte-position walk (walking back to a
+# zero-tailed u32 without validating the timestamp over-fires, grabbing an unsealed
+# definition's own tail bytes as a signature). A zero SignatureID is the unsealed
+# shape and reads as None. (What earlier looked like a u16 "seal version" 5/6 was the
+# high word of this microsecond timestamp -- an accidental 2014..2032 date bucket that
+# missed cfg3 seals edited before 2014 and every safety AOI, whose SignatureID ends
+# one u32 early because a SafetySignatureID follows it.)
+_SEAL_TS_LO = 788918400_000000     # 1995-01-01 UTC, microseconds since 1970
+_SEAL_TS_HI = 2051222400_000000    # 2035-01-01 UTC, microseconds since 1970
 
 
-def aoi_seal_signature_id(a1: Optional[bytes]) -> Optional[str]:
-    """The AOI's seal @SignatureID (8 uppercase hex chars), or None if unsealed.
+def _seal_at(a1: bytes, sid_pos: int, ssid_pos: Optional[int]):
+    """Read + validate a seal trailer whose SignatureID is at ``sid_pos``.
 
-    Located structurally, never by a fixed offset (the trailer sits at a
-    file-dependent position): the seal is ``[u16 version][u32 SignatureID][zero pad]``
-    at the end of ext-attr 0x1, with the version in ``_AOI_SEAL_VERSIONS``. A zero
-    SignatureID (the shape an unsealed definition carries) reads as None, so this
-    doubles as the sealed / not-sealed discriminator. A safety-signed AOI carries a
-    different (non-zero-tail) trailer and reads as None too -- correctly withheld,
-    since its wrapper would also need SafetySignature attributes we do not derive.
+    Returns ``(SignatureID hex, SafetySignatureID hex | None, timestamp_us)`` when the
+    preceding u64 is a millisecond-aligned timestamp in range and the SignatureID is
+    non-zero, else None.
+    """
+    if sid_pos < 8:
+        return None
+    ts = int.from_bytes(a1[sid_pos - 8:sid_pos], "little")
+    if ts % 1000 or not (_SEAL_TS_LO <= ts <= _SEAL_TS_HI):
+        return None
+    sid = int.from_bytes(a1[sid_pos:sid_pos + 4], "little")
+    if sid == 0:
+        return None
+    ssid = None
+    if ssid_pos is not None:
+        s = int.from_bytes(a1[ssid_pos:ssid_pos + 4], "little")
+        ssid = f"{s:08X}" if s else None
+    return f"{sid:08X}", ssid, ts
+
+
+def aoi_seal_trailer(a1: Optional[bytes]):
+    """The AOI seal ``(SignatureID, SafetySignatureID | None, timestamp_us)`` or None.
+
+    Located structurally by the trailing ``[u64 timestamp][u32 SignatureID]`` (with an
+    optional ``[u32 SafetySignatureID]``) and a zero pad to the end of ext-attr 0x1.
+    The last non-zero field ends at or after the last non-zero byte (its high bytes may
+    be zero), so the final field's start is tried across a small window; the two
+    trailer shapes -- SignatureID last, or SafetySignatureID last -- are both tried,
+    SignatureID-last first. The millisecond-aligned in-range timestamp anchor is what
+    keeps a plaintext definition's tail from masquerading as a seal, and a zero
+    SignatureID (the unsealed shape) returns None, so this doubles as the sealed
+    discriminator.
     """
     if a1 is None:
         return None
     end = len(a1)
     while end > 0 and a1[end - 1] == 0:
         end -= 1
-    # The SignatureID's high bytes may be zero, so its 4 bytes can end at or after
-    # the last non-zero byte; try each start whose preceding word is a seal version
-    # and whose following bytes are all zero.
-    for pos in range(end - 4, end + 1):
-        if pos < 2 or pos + 4 > len(a1):
+    for p in range(max(end - 4, 0), end + 1):
+        if p + 4 > len(a1) or any(a1[p + 4:]):
             continue
-        if int.from_bytes(a1[pos - 2:pos], "little") not in _AOI_SEAL_VERSIONS:
-            continue
-        if any(a1[pos + 4:]):
-            continue
-        sid = int.from_bytes(a1[pos:pos + 4], "little")
-        return f"{sid:08X}" if sid else None
+        # shape A: p is the SignatureID (final field, no SafetySignatureID)
+        r = _seal_at(a1, p, None)
+        if r:
+            return r
+        # shape B: p is the SafetySignatureID (final field), SignatureID one u32 back
+        r = _seal_at(a1, p - 4, p)
+        if r:
+            return r
     return None
 
 
@@ -508,7 +541,8 @@ def encryption_config_for_version(major: int) -> Optional[int]:
 def encoded_aoi(aoi, config: Optional[int], signature_id: Optional[str],
                 signature_timestamp: Optional[str],
                 safety_signature: Optional[str] = None,
-                safety_signature_timestamp: Optional[str] = None
+                safety_signature_timestamp: Optional[str] = None,
+                safety_signature_id: Optional[str] = None
                 ) -> Optional[str]:
     """The <EncodedData EncodedType="AddOnInstructionDefinition"> for a source-
     protected AOI, or None to withhold.
@@ -544,6 +578,11 @@ def encoded_aoi(aoi, config: Optional[int], signature_id: Optional[str],
         attrs.append(f'SignatureID="{signature_id}"')
         if signature_timestamp:
             attrs.append(f'SignatureTimestamp="{esc(signature_timestamp)}"')
+        # A safety AOI's seal carries a SafetySignatureID (a u32 right after the
+        # SignatureID in the trailer), emitted between SignatureTimestamp and
+        # EditedDate. Absent on a standard AOI.
+        if safety_signature_id is not None:
+            attrs.append(f'SafetySignatureID="{safety_signature_id}"')
     attrs.append(f'EditedDate="{esc(aoi.edited_date)}"')
     attrs.append(f'SoftwareRevision="{esc(aoi.software_revision)}"')
     attrs.append(f'EncryptionConfig="{config}"')

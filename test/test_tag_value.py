@@ -56,6 +56,18 @@ def test_fmt_real_decorated_edges():
     assert T._fmt_real_decorated(float("nan")) == "1.#QNAN"
 
 
+def test_fmt_real_decorated_1e9_decade_carry():
+    # float32(1e-9) = 9.99999972e-10 rounds at p=1 to 1e-9, carrying a decade.
+    # The Decorated form must use the POST-rounding exponent -> fixed-point
+    # "0.000000001" (OEM), while the L5K CDATA form stays 9-sig scientific.
+    e9 = struct.unpack("<f", struct.pack("<f", 1e-9))[0]
+    assert T._fmt_real_decorated(e9) == "0.000000001"
+    assert T._fmt_real(e9) == "9.99999972e-010"
+    # The negative twin mirrors it; ordinary values are unaffected.
+    assert T._fmt_real_decorated(-e9) == "-0.000000001"
+    assert T._fmt_real_decorated(1.5) == "1.5"
+
+
 def _nan_from_hex(hx):
     """Decode a stored float32 (little-endian hex) to its widened double."""
     return struct.unpack("<f", bytes.fromhex(hx))[0]
@@ -239,7 +251,9 @@ _U_IMAGE = bytes([0x78, 0, 0, 0, 0x07, 0xFE, 0x01, 0,
 
 def test_l5k_layout_includes_hidden_skips_bit_alias():
     l5k = T.render_l5k_layout("U", None, _U_IMAGE, _U_LAYOUT, {})
-    assert l5k == "[120,[7,-2],1,9,[1,0,1,0,1,0,1,0,1,0]]"
+    # A nested BOOL[] array member renders each element as 2#0/2#1 (OEM form,
+    # matching render_l5k's top-level BOOL-array path); a scalar BOOL stays bare.
+    assert l5k == "[120,[7,-2],1,9,[2#1,2#0,2#1,2#0,2#1,2#0,2#1,2#0,2#1,2#0]]"
 
 
 def test_decorated_layout_skips_hidden_includes_bit_alias():
