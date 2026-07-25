@@ -21,7 +21,35 @@ from acd.zip.write_acd import build_acd_bytes
 from acd.zip.write_dat import patch_sbregion_dat
 
 from acd.database.acd_database import AcdDatabase
-from acd.l5x.elements import DumpCompsRecords, RSLogix5000Content
+from acd.l5x.elements import (
+    DumpCompsRecords,
+    RSLogix5000Content,
+    reset_sp_withheld,
+    sp_withheld_report,
+)
+from loguru import logger as log
+
+
+def _warn_sp_incomplete(acd_filename, report) -> None:
+    """Warn when the faithful export withheld source-protected content, so the
+    incomplete L5X is a KNOWN result rather than a silent one. ``report`` is the
+    {(kind, scheme): count} snapshot from :func:`sp_withheld_report`."""
+    if not report:
+        return
+    total = sum(report.values())
+    c9 = sum(n for (kind, scheme), n in report.items() if scheme == "config9")
+    routines = sum(n for (kind, scheme), n in report.items() if kind == "routine")
+    aois = sum(n for (kind, scheme), n in report.items() if kind == "aoi")
+    detail = (
+        f"{c9} use EncryptionConfig 9 (Studio V31+ source protection), which "
+        f"cannot be reproduced without embedded key material this converter does "
+        f"not have" if c9 else "no reproducible key material is available for them"
+    )
+    log.warning(
+        f"{acd_filename}: exported L5X is KNOWINGLY INCOMPLETE -- withheld {total} "
+        f"source-protected component(s) ({routines} routine(s), {aois} AOI(s)); "
+        f"{detail}. Their <EncodedData> blocks are OMITTED from the output."
+    )
 
 
 # Clean top-level API
@@ -289,7 +317,9 @@ class ConvertAcdToL5x(Extract):
     faithful: bool = False
 
     def extract(self):
+        reset_sp_withheld()
         project = ImportProjectFromFile(self.acd_filename, faithful=self.faithful).import_project()
+        _warn_sp_incomplete(self.acd_filename, sp_withheld_report())
         raw_xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + project.to_xml()
         if self.pretty_print:
             try:
