@@ -89,6 +89,7 @@ import html
 from typing import Optional, Tuple
 
 from acd.record._aes import AES
+from acd.record import config9
 from acd.record.comps import _SP_KEYS, _SP_MARKER
 
 _DECL = '<?xml version="1.0" encoding="UTF-16" standalone="yes"?>'
@@ -317,7 +318,8 @@ def security_descriptor(a1: Optional[bytes], keyhash_off: int,
 
 
 def source_protection_config(rec: bytes, a1: Optional[bytes],
-                             keyhash_off: int) -> Optional[int]:
+                             keyhash_off: int,
+                             major: Optional[int] = None) -> Optional[int]:
     """The project's export EncryptionConfig, or None when undetermined.
 
     None means we cannot tell which key the reference's blob is under, so the
@@ -331,6 +333,16 @@ def source_protection_config(rec: bytes, a1: Optional[bytes],
     either -- those resolve to None.
     """
     if rec[_SP_MARKER_OFF:_SP_MARKER_OFF + 4] == _SP_MARKER:
+        # The wrapped-key encrypted-tail scheme shares one at-rest framing across
+        # releases; only the release names the export EncryptionConfig: 8 at
+        # V28/29, 9 at V30+. Its interface recovers offline either way (the group
+        # key is wrapped in the ACD under the config-8 key -- see
+        # acd.record.config9), so we emit, tagging the version's config; a caller
+        # that cannot supply the major assumes the newer 9. Other encrypted-tail
+        # layouts keep no readable descriptor and no recoverable key here, so they
+        # still withhold (None).
+        if config9.is_config9(rec, _SP_MARKER_OFF):
+            return 8 if (major is not None and major <= 29) else 9
         return None       # encrypted-tail layout: the descriptor is not readable
     if a1 is None or len(a1) < keyhash_off or keyhash_off + _SD_LEN_OFF < 0:
         return None
@@ -494,14 +506,18 @@ def encryption_config_for_version(major: int) -> Optional[int]:
 
 
 def encoded_aoi(aoi, config: Optional[int], signature_id: Optional[str],
-                signature_timestamp: Optional[str]) -> Optional[str]:
+                signature_timestamp: Optional[str],
+                safety_signature: Optional[str] = None,
+                safety_signature_timestamp: Optional[str] = None
+                ) -> Optional[str]:
     """The <EncodedData EncodedType="AddOnInstructionDefinition"> for a source-
     protected AOI, or None to withhold.
 
     The wrapper projects the AOI's own attributes onto the encoded whitelist (Name,
     Class, Revision, RevisionExtension, Vendor, EditedDate, SoftwareRevision) -- the
     AOI-only Execute*/Created*/EditedBy attributes are dropped -- and adds
-    EncodedType, EncryptionConfig, and the seal SignatureID/SignatureTimestamp. The
+    EncodedType, EncryptionConfig, the seal SignatureID/SignatureTimestamp, and a
+    safety AOI's SafetySignature/SafetySignatureTimestamp. The
     children are the AOI's plaintext Description/RevisionNote/AdditionalHelpText/
     CustomProperties/Parameters in OEM order; its LocalTags and Routines (the
     protected logic) are dropped. The encrypted blob is withheld.
@@ -531,6 +547,14 @@ def encoded_aoi(aoi, config: Optional[int], signature_id: Optional[str],
     attrs.append(f'EditedDate="{esc(aoi.edited_date)}"')
     attrs.append(f'SoftwareRevision="{esc(aoi.software_revision)}"')
     attrs.append(f'EncryptionConfig="{config}"')
+    # A safety-signed AOI carries its GSS SafetySignature (8 hex words) and the
+    # safety-task sign timestamp after EncryptionConfig. Recovered from the AOI's
+    # own comps triple; absent (None) on a standard AOI.
+    if safety_signature is not None:
+        attrs.append(f'SafetySignature="{esc(safety_signature)}"')
+        if safety_signature_timestamp:
+            attrs.append(
+                f'SafetySignatureTimestamp="{esc(safety_signature_timestamp)}"')
 
     kids = aoi._custom_properties or ""
     if aoi._description:

@@ -46,6 +46,7 @@ import re
 from xml.sax.saxutils import escape
 
 from acd.l5x.sfc_order import Elem as _Elem, order_branches as _order_branches
+from acd.record.source_protection import sp_decrypt_nameless_element
 
 _MARK = b"\xff\xfe\xff"
 _AT = re.compile(r"@([0-9a-fA-F]+)@")
@@ -113,7 +114,11 @@ def decode_sfc(cur, routine_oid, _prove_sheet=None, textbox_text=None,
                         continue
                     seen.add(coid)
                     nx.append(coid)
-                    crec = bytes(crec)
+                    # A source-protected routine encrypts each graphical element
+                    # record; decrypt transparently (config-on-wire legacy always,
+                    # config-9 only in recovery mode) so the walk sees a normal
+                    # element. Plaintext records carry no marker and pass through.
+                    crec = sp_decrypt_nameless_element(bytes(crec))
                     subtree[coid] = crec
                     if len(crec) >= 16:
                         byhash[bytes(crec[12:16])] = coid

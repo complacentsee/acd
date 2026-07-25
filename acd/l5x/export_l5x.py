@@ -30,6 +30,7 @@ from acd.l5x.elements import (
     RSLogix5000Content,
     build_aoi_pin_rows,
 )
+from acd.record import config9
 from acd.record.comments import CommentsRecord
 from acd.record.comps import CompsRecord, record_uses_short_header
 from acd.record.nameless import NamelessRecord
@@ -38,6 +39,7 @@ from acd.record.source_protection import (
     _SP_MARKER,
     build_uid_name_map,
     is_v21_version,
+    set_element_recovery,
     sp_decrypt_framed,
 )
 
@@ -175,8 +177,13 @@ class ExportL5x:
         self.populate_region_map()
         self.populate_regn_link()
         self._load_rungs(comps_db, name_lookup)
-        self._load_comments()
+        # Nameless + the config-9 key-table load BEFORE comments so config-9
+        # (V31+) source-protected comment tails (AOI Description / RevisionNote /
+        # AdditionalHelpText / parameter descriptions) can be decrypted at parse
+        # time -- their group key lives in the key-table unwrapped here.
         self._load_nameless()
+        self._load_config9_keytable()
+        self._load_comments()
         self._load_taginfo()
         self._create_indexes()
 
@@ -821,24 +828,57 @@ class ExportL5x:
             # (V24+) only -- every project that carries these blocks is V24+.
             if (not self._comps_short_header and len(_buf) >= 34
                     and _buf[26] == 0x00 and _buf[27] == 0x19):
-                _sep = _buf.find(b'\x11\x00', 30)
-                _m12 = _buf.find(b'\x12\x00', _sep + 2) if _sep >= 0 else -1
-                _lt = _buf.find(b'<', _m12) if _m12 >= 0 else -1
-                if _sep >= 0 and _m12 >= 0 and _lt >= 0:
-                    _cp.append((
-                        struct.unpack_from("<I", _buf, 10)[0],
-                        struct.unpack_from("<I", _buf, 14)[0],
-                        struct.unpack_from("<I", _buf, 18)[0],
-                        _buf[30:_sep].decode("utf-16-le", "replace"),
-                        _buf[_sep + 2:_m12].decode("utf-16-le", "replace"),
-                        _buf[_lt:].rstrip(b"\x00").decode("latin-1", "replace"),
-                    ))
+                # The provider content begins at body+16 (raw[30]). On a config-9
+                # source-protected block the tail from the marker is encrypted, so
+                # decrypt each candidate group key and splice the plaintext prefix
+                # back on (recon = raw[30:marker] + plaintext); a plaintext block is
+                # the raw tail. The same "<ID>\x11<Ext>\x12<xml>" parse then applies,
+                # and its success (all three markers present) selects the right key.
+                _mi = _buf.find(_SP_MARKER)
+                if _mi >= 30 and config9.is_config9(_buf, _mi):
+                    _contents = (
+                        _buf[30:_mi] + _pt for _pt in config9.decrypt_candidates(
+                            _buf, _mi, config9.get_project_keytable()))
+                else:
+                    _contents = iter([_buf[30:]])
+                for _c in _contents:
+                    _sep = _c.find(b'\x11\x00')
+                    _m12 = _c.find(b'\x12\x00', _sep + 2) if _sep >= 0 else -1
+                    _lt = _c.find(b'<', _m12) if _m12 >= 0 else -1
+                    if _sep >= 0 and _m12 >= 0 and _lt >= 0:
+                        _cp.append((
+                            struct.unpack_from("<I", _buf, 10)[0],
+                            struct.unpack_from("<I", _buf, 14)[0],
+                            struct.unpack_from("<I", _buf, 18)[0],
+                            _c[:_sep].decode("utf-16-le", "replace"),
+                            _c[_sep + 2:_m12].decode("utf-16-le", "replace"),
+                            _c[_lt:].rstrip(b"\x00").decode("latin-1", "replace"),
+                        ))
+                        break
+            # A config-9 source-protected GSS record hides its needle in the
+            # encrypted tail. These reference records carry a fafa-comment kind
+            # byte at buf[27] (0x24 SignatureID / 0x23 Timestamp, buf[26]==0);
+            # decrypt each candidate group key and take the reconstruction that
+            # surfaces a needle (the key self-selects). The (otype, cid, disc)
+            # join keys live in the plaintext prefix, so they survive the splice.
+            _gbuf = _buf
+            if (len(_buf) >= 34 and _buf[26] == 0 and _buf[27] in (0x23, 0x24)
+                    and _buf.find(_sig_needle) < 0 and _buf.find(_ts_needle) < 0):
+                _gmi = _buf.find(_SP_MARKER)
+                if _gmi >= 0 and config9.is_config9(_buf, _gmi):
+                    for _pt in config9.decrypt_candidates(
+                            _buf, _gmi, config9.get_project_keytable()):
+                        _cand = _buf[:_gmi] + _pt
+                        if (_cand.find(_sig_needle) >= 0
+                                or _cand.find(_ts_needle) >= 0):
+                            _gbuf = _cand
+                            break
             _key = (_otype, _cid)
             _key3 = (_otype, _cid,
-                     struct.unpack_from("<I", _buf, 16)[0] if len(_buf) >= 20 else 0)
-            _si = _buf.find(_sig_needle)
+                     struct.unpack_from("<I", _gbuf, 16)[0] if len(_gbuf) >= 20 else 0)
+            _si = _gbuf.find(_sig_needle)
             if _si >= 0:
-                _h = _buf[_si + len(_sig_needle) + 14:_si + len(_sig_needle) + 46]
+                _h = _gbuf[_si + len(_sig_needle) + 14:_si + len(_sig_needle) + 46]
                 if len(_h) == 32:
                     if any(_h):
                         _sig = " - ".join(
@@ -850,9 +890,9 @@ class ExportL5x:
                         # timestamp the reference still emits. Its ts is filled
                         # by the timestamp block below.
                         _gss3z.setdefault(_key3, "")
-            _ti = _buf.find(_ts_needle)
+            _ti = _gbuf.find(_ts_needle)
             if _ti >= 0:
-                _txt = _buf[_ti + len(_ts_needle) + 12:].split(b"\x00")[0]
+                _txt = _gbuf[_ti + len(_ts_needle) + 12:].split(b"\x00")[0]
                 try:
                     _ts = _txt.decode("ascii")
                     _gss.setdefault(_key, [None, None])[1] = _ts
@@ -868,20 +908,20 @@ class ExportL5x:
             # keys); a NAMED record (a 0x13 name after the GSS marker, e.g.
             # 'TagMap') is captured at ANY cid, because the TagMap pair is keyed by
             # the SafetyTask comp's comment_id, which is not 0/1 in every project.
-            if len(_buf) >= 33:
-                _smi = _buf.find(_sig_mark)
+            if len(_gbuf) >= 33:
+                _smi = _gbuf.find(_sig_mark)
                 if _smi >= 0:
-                    _nm = _gss_name(_buf, _smi + len(_sig_mark))
+                    _nm = _gss_name(_gbuf, _smi + len(_sig_mark))
                     if _nm or _cid in (0, 1):
-                        _hh = _buf[len(_buf) - 33:len(_buf) - 1]
+                        _hh = _gbuf[len(_gbuf) - 33:len(_gbuf) - 1]
                         if any(_hh):
                             _named.setdefault((_otype, _nm), [None, None])[0] = " - ".join(
                                 "%08X" % struct.unpack_from(">I", _hh, _i * 4)[0] for _i in range(8))
-                _tmi = _buf.find(_ts_mark)
+                _tmi = _gbuf.find(_ts_mark)
                 if _tmi >= 0:
-                    _nm = _gss_name(_buf, _tmi + len(_ts_mark))
+                    _nm = _gss_name(_gbuf, _tmi + len(_ts_mark))
                     if _nm or _cid in (0, 1):
-                        _m = _ts_re.search(_buf)
+                        _m = _ts_re.search(_gbuf)
                         if _m:
                             _named.setdefault((_otype, _nm), [None, None])[1] = _m.group().decode("ascii")
         self._cur.executemany(
@@ -911,6 +951,34 @@ class ExportL5x:
         nameless_tuples = [t for record in nameless_db.records.record if (t := NamelessRecord.parse(record)) is not None]
         self._cur.executemany("INSERT INTO nameless VALUES (?,?,?)", nameless_tuples)
         self._db.commit()
+
+    def _load_config9_keytable(self):
+        """Unwrap the config-9 group-key table so config-9 (V31+) source
+        protection can be decrypted.
+
+        Config 9 keeps a per-source-protection-group content key -- wrapped under
+        the config-8 key -- in one shared Nameless.Dat key-table record. Unwrap it
+        once here (after Nameless is loaded, before the build phase decrypts any
+        ext-attrs) and stash the group keys where the comps decrypt path reads
+        them. A no-op on projects with no config-9 (the table is absent, so the
+        list is empty and every config-9 decrypt fail-closes as today).
+        """
+        # Recovery (faithful=False) reconstructs source-protected FBD/SFC sheets, so
+        # it decrypts config-9 graphical elements; faithful withholds them (see
+        # source_protection.set_element_recovery). Set once per export -- a module
+        # global, so it must reflect THIS export's mode even when reused in-process.
+        set_element_recovery(not self.faithful)
+        try:
+            rows = self._cur.execute(
+                "SELECT record FROM nameless WHERE LENGTH(record) > ?",
+                (config9._WRAP_SLOT * 2,)).fetchall()
+            keys = config9.find_keytable(r[0] for r in rows)
+            config9.set_project_keytable(keys)
+            if keys:
+                log.info("config-9 key-table: {} group keys unwrapped", len(keys))
+        except Exception as exc:  # noqa: BLE001 - never block export
+            log.warning("config-9 key-table load failed: {}", exc)
+            config9.set_project_keytable([])
 
     def _load_taginfo(self):
         # Step 6d: parse TagInfo.XML ONCE into a datatype -> member byte-layout

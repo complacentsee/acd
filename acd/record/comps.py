@@ -18,6 +18,7 @@ from acd.record.source_protection import (  # noqa: F401
     _SP_AES_CACHE, _SP_CT_OFFSET, _SP_KEY_BY_CONFIG, _SP_KEY_HINT, _SP_KEYS,
     _SP_MARKER, _sp_aes, _sp_cbc,
 )
+from acd.record import config9
 
 # Comps record identifiers (little-endian u16).
 _FAFA_IDENTIFIER = 64250  # 0xFAFA primary records
@@ -135,6 +136,50 @@ def _decrypt_value_attrs(ciphertext: bytes, full: bool = False) -> dict:
     return {}
 
 
+def _config9_extattr_head_ok(block0: bytes, declared: int) -> bool:
+    """A decrypted ext-attr table begins ``[u32 count][u32 attr_id=0x01]``.
+
+    This 1-block signature prunes the config-9 group-key trial to the correct key
+    without a full CBC decrypt per candidate over the ~1500-entry key-table -- the
+    difference between a fast export and a per-record scan on a protected project.
+    """
+    return block0[4:8] == b"\x01\x00\x00\x00"
+
+
+def _decrypt_value_attrs_config9(record: bytes, marker_index: int) -> dict:
+    """Decrypt an EncryptionConfig-9 ext-attr tail to {attribute_id: bytes}.
+
+    Config 9 is the wrapped-key scheme (:mod:`acd.record.config9`): a per-group
+    content key -- itself wrapped, under the config-8 key, in the project's shared
+    key-table -- and an inline 16-byte content IV at ``marker+24`` with the
+    ciphertext at ``marker+40`` (NOT the config-1..8 zero-IV / ``marker+18``
+    layout). No new secret: the key-encryption key is the existing config-8 entry.
+    Each candidate group key is head-prefiltered on the ``attr 0x01`` table start
+    and confirmed by :func:`_sp_walk`; the whole plaintext table is returned, so
+    there is no ``full`` distinction here. Returns {} when the project key-table
+    is unset (no config-9) or no group key fits -- callers then fall back to their
+    plaintext walk.
+    """
+    keytable = config9.get_project_keytable()
+    if not keytable:
+        return {}
+    for pt in config9.decrypt_candidates(record, marker_index, keytable,
+                                         head_ok=_config9_extattr_head_ok):
+        max_count = max(1, (len(pt) - 4) // 8)
+        attrs = _sp_walk(pt, max_count)
+        if attrs:
+            return attrs
+    return {}
+
+
+def _sp_nameless_head_ok(block0: bytes, declared: int) -> bool:
+    """A decrypted AOI-nameless metadata body begins ``[u16 ver=1][fffeff...]``.
+
+    This 1-block signature selects the correct config-9 group key from the
+    project's key-table (see :func:`acd.record.config9.decrypt_candidates`)."""
+    return block0[0:2] == b"\x01\x00" and block0[2:5] == b"\xff\xfe\xff"
+
+
 def decrypt_sp_nameless(record: bytes) -> Optional[bytes]:
     """Decrypt a source-protected AOI *nameless* metadata record in place.
 
@@ -156,6 +201,21 @@ def decrypt_sp_nameless(record: bytes) -> Optional[bytes]:
     try:
         midx = record.find(_SP_MARKER)
         if midx < 0:
+            return None
+        if config9.is_config9(record, midx):
+            # Config-9 wraps the metadata behind the same marker but with the
+            # per-record content-IV framing (IV@marker+24, ct@marker+40) and a
+            # per-group key, and it RETAINS the ffffffff sentinel at marker-4 (it
+            # does not overwrite it as the legacy framing below does) -- so the
+            # plaintext body slots straight in as record[:midx] + pt. The metadata
+            # head ``01 00 ff fe ff`` (u16 ver=1 then the first empty fffeff
+            # string) pins the unique group key among the project's key-table.
+            keytable = config9.get_project_keytable()
+            if not keytable:
+                return None
+            for pt in config9.decrypt_candidates(
+                    record, midx, keytable, head_ok=_sp_nameless_head_ok):
+                return record[:midx] + pt
             return None
         # Plaintext length is framed at marker+4 (u16); round up to the AES block
         # so trailing 0xFF slot-fill past the padded ciphertext is excluded.
@@ -408,6 +468,8 @@ class CompsRecord:
             midx = record.find(_SP_MARKER, 74)
             if midx < 0:
                 return {}
+            if config9.is_config9(record, midx):
+                return _decrypt_value_attrs_config9(record, midx)
             ct = record[midx + _SP_CT_OFFSET:]
             ct = ct[:(len(ct) // 16) * 16]
             return _decrypt_value_attrs(ct, full=full) or {}
@@ -446,9 +508,12 @@ class CompsRecord:
             # take the walk below, byte-for-byte unchanged.)
             midx = body.find(_SP_MARKER, 74)
             if midx >= 0:
-                ct = body[midx + _SP_CT_OFFSET:]
-                ct = ct[:(len(ct) // 16) * 16]
-                dec = _decrypt_value_attrs(ct, full=full)
+                if config9.is_config9(body, midx):
+                    dec = _decrypt_value_attrs_config9(body, midx)
+                else:
+                    ct = body[midx + _SP_CT_OFFSET:]
+                    ct = ct[:(len(ct) // 16) * 16]
+                    dec = _decrypt_value_attrs(ct, full=full)
                 if dec:
                     return dec
                 # Fall through to the plaintext walk on a failed decrypt so a

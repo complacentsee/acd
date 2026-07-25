@@ -219,6 +219,18 @@ def sp_decrypt_framed(buf: bytes, marker_index: int) -> Optional[bytes]:
 _ELEM_MARKER_MIN = 18             # the marker follows the plaintext kind word (u16 @ 16)
 _ELEM_SCAFFOLD = b"\x55\x69\x55"  # fixed 'Ui U' framing bytes at marker+9
 
+# Config-9 (V30+) graphical elements are recovered only on a faithful=False
+# export. Faithful mode withholds a source-protected routine as <EncodedData> and
+# discards its decoded FBD/SFC sheets, so trial-decrypting its (key-table-keyed)
+# config-9 element records there is pure waste; the flag keeps the faithful path
+# byte-identical while recovery mode reconstructs the sheets.
+_ELEMENT_RECOVERY = [False]
+
+
+def set_element_recovery(enabled: bool) -> None:
+    """Enable/disable config-9 graphical-element recovery (see _ELEMENT_RECOVERY)."""
+    _ELEMENT_RECOVERY[0] = bool(enabled)
+
 
 def sp_decrypt_nameless_element(record: bytes) -> bytes:
     """Decrypt a source-protected graphical element record, or return it unchanged.
@@ -241,11 +253,25 @@ def sp_decrypt_nameless_element(record: bytes) -> bytes:
     midx = record.find(_SP_MARKER, _ELEM_MARKER_MIN)
     if midx < 0 or len(record) <= midx + 17:
         return record
+    scaffold = record[midx + 9:midx + 12] == _ELEM_SCAFFOLD
+    # Config-9 (V30+) graphical element: same 'Ui U' scaffold, but the framing
+    # discriminator low byte is 1 and the tail is wrapped-key encrypted (no on-wire
+    # config, so sp_decrypt_framed cannot read it). The ffffffff sentinel is
+    # RETAINED at midx-4, so the reconstruction re-appends only the recovered
+    # plaintext (unlike the legacy path, which reinserts it). Recovery-only; the
+    # declared-length + PKCS7 filter pins the group key uniquely for these records,
+    # and a record whose key is absent stays encrypted (fail-closed).
+    if scaffold and _ELEMENT_RECOVERY[0] and record[midx + 16] != 0:
+        from acd.record import config9    # lazy: config9 imports this module
+        if config9.is_config9(record, midx):
+            pt = config9.decrypt(record, midx, config9.get_project_keytable())
+            if pt is not None:
+                return record[:midx] + pt
+        return record
     # The 'Ui U' scaffold and a zero discriminator low byte together identify the
     # legacy config-on-wire framing; genuine plaintext element bytes never carry
-    # them, and config-9 framing (low byte 1, no key material, different
-    # ciphertext offset) is left encrypted.
-    if record[midx + 9:midx + 12] != _ELEM_SCAFFOLD or record[midx + 16] != 0:
+    # them, and config-9 framing (low byte 1) is left encrypted in faithful mode.
+    if not scaffold or record[midx + 16] != 0:
         return record
     pt = sp_decrypt_framed(record, midx)
     if pt is None:

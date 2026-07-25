@@ -101,6 +101,7 @@ from acd.l5x.textbox_text import textbox_texts_v20_for as _textbox_texts_v20_for
 from acd.l5x.trends import build_trends
 from acd.record.blobs import ControllerProps
 from acd.record.comps import CompsRecord, _SP_MARKER, decrypt_sp_nameless
+from acd.record import config9
 from acd.record.source_protection import (
     _SP_KEYS, _SP_KEY_HINT, _SP_CT_OFFSET, _sp_aes, _sp_cbc)
 
@@ -1512,9 +1513,13 @@ class LocalTag(L5xElement):
 
     def to_xml(self) -> str:
         base = super().to_xml()
+        # ``_description``: None = no description row -> no element; "" = a row that
+        # was DELETED in a later edit (Studio exports an EMPTY <Description> for a
+        # deleted comment, see the revision-liveness gate); else the text. Emit the
+        # element whenever it is not None.
         desc_xml = (
             f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
-            if self._description else ""
+            if self._description is not None else ""
         )
         # Operand comments render between Description and DefaultData (OEM order).
         comments_xml = _aoi_comments_xml(self._operand_comments)
@@ -1587,9 +1592,13 @@ class Parameter(L5xElement):
 
     def to_xml(self) -> str:
         base = super().to_xml()
+        # ``_description``: None = no description row -> no element; "" = a row that
+        # was DELETED in a later edit (Studio exports an EMPTY <Description> for a
+        # deleted comment, see the revision-liveness gate); else the text. Emit the
+        # element whenever it is not None.
         desc_xml = (
             f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
-            if self._description else ""
+            if self._description is not None else ""
         )
         # Operand comments render between Description and DefaultData (OEM order).
         comments_xml = _aoi_comments_xml(self._operand_comments)
@@ -3169,9 +3178,13 @@ class ParameterBuilder(L5xElementBuilder):
         # resolve the AliasFor target from ext-attr 0x65 (a @hex@.@hex@ template
         # of comps oids). Fail-closed: an unresolved template keeps the param
         # TagType="Base" with no AliasFor, i.e. today's over-emission-only fix.
+        # This runs on config-9 (source-protected) parameters too: their ext-attr
+        # tail -- including the 0x20E flag and the 0x65 template -- decrypts to the
+        # ordinary layout (config9), so an alias resolves the same way. It stayed
+        # gated off only while that interface was undecryptable.
         tag_type = "Base"
         alias_for: Union[str, None] = None
-        if not sp and len(ext01) > 0x20E and (ext01[0x20E] & 0x02):
+        if len(ext01) > 0x20E and (ext01[0x20E] & 0x02):
             data_type = None
             _tgt = resolve_aoi_alias_target(self._cur, raw_rec, self._short_header)
             if _tgt:
@@ -3179,14 +3192,15 @@ class ParameterBuilder(L5xElementBuilder):
                 alias_for = _tgt
 
         # --- Description ---
-        # Source-protected projects also encrypt the comment text, so for an
-        # SP-recovered parameter the comments table holds undecryptable garbage
-        # (e.g. a lone 0x1d control byte, which would additionally produce invalid
-        # XML). Skip the lookup on the SP path rather than emit a bogus Description;
-        # the real text needs a separate comment-decryption that is not yet cracked.
         # Prefer the AOI datatype member-description map (long header): it keys by
         # the datatype comment_id, which is correct for both plain and
-        # source-protected AOIs, where the per-tag lookup below is not.
+        # source-protected AOIs. An InOut reference parameter is not a datatype
+        # storage member, so it is absent from that map and falls to the per-tag
+        # lookup below -- which now runs on config-9 parameters too, because their
+        # comment text decrypts (acd.record.comments) to the real Description
+        # instead of the framing garbage the lookup used to be guarded against.
+        # A comment that does not decrypt is dropped, so the lookup fail-closes to
+        # no Description rather than a bogus one.
         description: Union[str, None] = self._member_desc.get(name)
         if description is not None:
             pass
@@ -3212,20 +3226,24 @@ class ParameterBuilder(L5xElementBuilder):
                 desc_row = self._cur.fetchone()
                 if desc_row and desc_row[0]:
                     description = desc_row[0]
-        elif sp:
-            pass
         elif len(raw_rec) >= 18:
             # V24+ long header: bytes [14:18] are the member_ref into the comments
             # table, keyed by comment_id*0x10000 + cip.
             member_ref = struct.unpack_from("<I", raw_rec, 14)[0]
             if member_ref:
                 self._cur.execute(
-                    "SELECT record_string FROM comments WHERE parent=? AND member_ref=? LIMIT 1",
+                    "SELECT record_string, revision FROM comments WHERE parent=? "
+                    "AND member_ref=? ORDER BY revision DESC LIMIT 1",
                     ((r.comment_id * 0x10000) + r.cip_type, member_ref),
                 )
                 desc_row = self._cur.fetchone()
                 if desc_row and desc_row[0]:
-                    description = desc_row[0]
+                    _ep = _file_comment_epoch(self._cur)
+                    # A row below the file epoch is a DELETED comment -> OEM exports
+                    # an EMPTY <Description>; a live one (== epoch, or an untracked
+                    # revision 0) keeps its text.
+                    description = ("" if _ep and 0 < desc_row[1] < _ep
+                                   else desc_row[0])
 
         # Operand-keyed member/bit/array comments, both header forms. Short-header
         # AOI operand records decode through the 0x338 scope branch in
@@ -3326,20 +3344,24 @@ class LocalTagBuilder(L5xElementBuilder):
                 desc_row = self._cur.fetchone()
                 if desc_row and desc_row[0]:
                     description = desc_row[0]
-        elif sp:
-            pass
         elif len(raw_rec) >= 18:
             # V24+ long header: bytes [14:18] are the member_ref into the comments
             # table, keyed by comment_id*0x10000 + cip.
             member_ref = struct.unpack_from("<I", raw_rec, 14)[0]
             if member_ref:
                 self._cur.execute(
-                    "SELECT record_string FROM comments WHERE parent=? AND member_ref=? LIMIT 1",
+                    "SELECT record_string, revision FROM comments WHERE parent=? "
+                    "AND member_ref=? ORDER BY revision DESC LIMIT 1",
                     ((r.comment_id * 0x10000) + r.cip_type, member_ref),
                 )
                 desc_row = self._cur.fetchone()
                 if desc_row and desc_row[0]:
-                    description = desc_row[0]
+                    _ep = _file_comment_epoch(self._cur)
+                    # A row below the file epoch is a DELETED comment -> OEM exports
+                    # an EMPTY <Description>; a live one (== epoch, or an untracked
+                    # revision 0) keeps its text.
+                    description = ("" if _ep and 0 < desc_row[1] < _ep
+                                   else desc_row[0])
 
         # Operand-keyed member/bit/array comments (both header forms).
         operand_comments = _aoi_operand_comments(self._cur, r, raw_rec)
@@ -3930,6 +3952,16 @@ def _decode_oid_list(rec: bytes):
     return None
 
 
+def _config9_list_head_ok(block0: bytes, declared: int) -> bool:
+    """A decrypted AOI-nameless list body is ``[u16 count][count u32 oids]``, so
+    its declared length fixes the count exactly. This 1-block signature prunes the
+    config-9 group-key trial to (essentially) the one correct key; the caller's
+    superset-of-parameter-oids check remains the final arbiter."""
+    if declared < 2 or (declared - 2) % 4:
+        return False
+    return int.from_bytes(block0[0:2], "little") == (declared - 2) // 4
+
+
 def _sp_list_candidates(rec: bytes):
     """Yield plaintext forms of a nameless list record: the record itself when
     unprotected, else one reconstruction per project SP key. A source-protected
@@ -3939,6 +3971,18 @@ def _sp_list_candidates(rec: bytes):
     midx = rec.find(_SP_MARKER)
     if midx < 0:
         yield rec
+        return
+    if config9.is_config9(rec, midx):
+        # Config-9 keeps the per-group content key in the project key-table and
+        # frames the body with an inline content IV (IV@marker+24, ct@marker+40),
+        # RETAINING the ffffffff sentinel at marker-4 -- so the plaintext body
+        # slots in as rec[:midx] + pt (no re-added sentinel, unlike the legacy
+        # branch below). The caller's _decode_oid_list + superset check picks the
+        # right key among any that survive the head prefilter.
+        for pt in config9.decrypt_candidates(
+                rec, midx, config9.get_project_keytable(),
+                head_ok=_config9_list_head_ok):
+            yield rec[:midx] + pt
         return
     plen = int.from_bytes(rec[midx + 4:midx + 6], "little")
     ctlen = ((plen + 15) // 16) * 16
@@ -4109,6 +4153,7 @@ class AoiBuilder(L5xElementBuilder):
         aoi_member_desc: Dict[str, str] = {}
         if not self._short_header and aoi_comment_id and aoi_dt_oid is not None:
             try:
+                _mepoch = _file_comment_epoch(self._cur)
                 _parent = (aoi_comment_id * 0x10000) + 0x6C
                 _mc = self._cur.execute(
                     "SELECT object_id FROM comps WHERE parent_id=? AND "
@@ -4122,11 +4167,15 @@ class AoiBuilder(L5xElementBuilder):
                             continue
                         _mref = struct.unpack_from("<I", _mrec, 14)[0]
                         _drow = self._cur.execute(
-                            "SELECT record_string FROM comments WHERE parent=? AND "
-                            "member_ref=? AND record_string!='' LIMIT 1",
+                            "SELECT record_string, revision FROM comments WHERE "
+                            "parent=? AND member_ref=? AND record_string!='' "
+                            "ORDER BY revision DESC LIMIT 1",
                             (_parent, _mref)).fetchone()
                         if _drow and _drow[0]:
-                            aoi_member_desc[_mnm] = _drow[0]
+                            # Deleted (below-epoch) -> empty <Description>; else text.
+                            aoi_member_desc[_mnm] = (
+                                "" if _mepoch and 0 < _drow[1] < _mepoch
+                                else _drow[0])
             except Exception:
                 aoi_member_desc = {}
 
@@ -4297,21 +4346,31 @@ class AoiBuilder(L5xElementBuilder):
         # length here, so no candidate is found and the attribute is omitted (verified
         # 0 false-positives pool-wide; the structural candidate is unique and equals
         # the Vendor on every AOI that carries one).
-        vendor: Union[str, None] = None
-        for _p in range(6, len(e01) - 1):
-            if e01[_p - 6:_p - 2] != b"\x00\x00\x00\x00":
-                continue
-            _vl = struct.unpack_from("<H", e01, _p - 2)[0]
-            if not (0 < _vl <= 64) or _p + _vl > len(e01):
-                continue
+        # The Vendor (AOI author) can carry non-ASCII characters (e.g. an umlaut in
+        # a European name), so accept any printable UTF-8, not just ASCII. It sits at a
+        # STABLE slot -- a u16 length at e01[76] (4 zero bytes before it) then the
+        # string at e01[78] (verified vendor-exact corpus-wide) -- so read that slot
+        # first: a config-9 library AOI carries short spurious fields ("0", empty)
+        # BEFORE it that the leading-edge scan below would otherwise take as Vendor.
+        def _read_vendor(buf, p):
+            if p - 2 < 0 or p + 2 > len(buf):
+                return None
+            n = struct.unpack_from("<H", buf, p)[0]
+            if not (0 < n <= 64) or p + 2 + n > len(buf) or buf[p - 4:p] != b"\x00\x00\x00\x00":
+                return None
             try:
-                _vendor = e01[_p:_p + _vl].decode("utf-8")
+                s = buf[p + 2:p + 2 + n].decode("utf-8")
             except UnicodeDecodeError:
-                continue
-            if (_vendor.strip() and all(0x20 <= ord(c) < 0x7F for c in _vendor)
-                    and _xml_sane(_vendor) == _vendor):
-                vendor = _vendor
-                break
+                return None
+            return s if (s.strip() and s.isprintable() and _xml_sane(s) == s) else None
+
+        vendor: Union[str, None] = _read_vendor(e01, 76)
+        if vendor is None:
+            for _p in range(2, len(e01) - 1):
+                v = _read_vendor(e01, _p)
+                if v is not None:
+                    vendor = v
+                    break
         if vendor is None and not e01:
             # Legacy AOI schema with no ext-attr 0x01: the Vendor is stored inline
             # in the definition record. Run the identical structural scan over the
@@ -4539,6 +4598,13 @@ class AoiBuilder(L5xElementBuilder):
                 # not emitted by OEM as a Description; own_description's
                 # object_id == 1 filter excludes them.
                 aoi_description = own_description(self._cur, aoi_comment_parent)
+            # Studio re-stamps every LIVE comment with the file's current edit
+            # revision on save; a note left below that epoch was deleted in a later
+            # edit and Studio does NOT export it, so gate the UDI lookups to the
+            # live revision (or an untracked revision 0) and keep the newest. This
+            # is what source-protected library AOIs need: they carry a full stored
+            # revision history, and the plain LIMIT 1 would surface a stale note.
+            _epoch = _file_comment_epoch(self._cur)
             try:
                 # RevisionNote (UDI_HISTORY) keys on the bare comment_id in the
                 # short-header family and on the long comment key otherwise
@@ -4546,8 +4612,8 @@ class AoiBuilder(L5xElementBuilder):
                 self._cur.execute(
                     "SELECT record_string FROM comments "
                     "WHERE parent IN (?, ?) AND tag_reference='__REVISION_NOTE__' "
-                    "LIMIT 1",
-                    (_r_aoi.comment_id, aoi_comment_parent),
+                    "AND revision IN (?, 0) ORDER BY revision DESC LIMIT 1",
+                    (_r_aoi.comment_id, aoi_comment_parent, _epoch),
                 )
                 rn_row = self._cur.fetchone()
                 if rn_row:
@@ -4560,8 +4626,8 @@ class AoiBuilder(L5xElementBuilder):
                 self._cur.execute(
                     "SELECT record_string FROM comments "
                     "WHERE parent IN (?, ?) AND tag_reference='__EXT_HELP__' "
-                    "LIMIT 1",
-                    (_r_aoi.comment_id, aoi_comment_parent),
+                    "AND revision IN (?, 0) ORDER BY revision DESC LIMIT 1",
+                    (_r_aoi.comment_id, aoi_comment_parent, _epoch),
                 )
                 ah_row = self._cur.fetchone()
                 if ah_row:
@@ -4662,6 +4728,37 @@ _SP_PROTECTED_FLAG = bytes.fromhex("000001001000")  # marker+14..+20 -> protecte
 _AOI_KEYHASH_OFF = 272   # protection-key hash offset within ext-attr 0x1 (AOI)
 _RT_KEYHASH_OFF = 202    # ... and for a routine definition record
 _SP_ZERO_HASH = b"\x00" * 16
+
+# ---------------------------------------------------------------------------
+# Faithful-mode diagnostics: source-protected <EncodedData> components WITHHELD
+# because no key material exists to reproduce them (chiefly EncryptionConfig 9 /
+# Studio V31+). Aggregated module-side -- a single ACD->L5X build is
+# single-threaded -- so the top-level converter can warn ONCE that the exported
+# L5X is knowingly incomplete, instead of silently dropping content.
+# ---------------------------------------------------------------------------
+_SP_WITHHELD: Dict[tuple, int] = {}
+
+
+def reset_sp_withheld() -> None:
+    """Clear the withheld-component tally (call before a conversion)."""
+    _SP_WITHHELD.clear()
+
+
+def sp_withheld_report() -> Dict[tuple, int]:
+    """Snapshot of withheld source-protected components as {(kind, scheme): n}."""
+    return dict(_SP_WITHHELD)
+
+
+def note_sp_withheld(rec: bytes, kind: str) -> None:
+    """Record one withheld source-protected component (kind='routine'/'aoi').
+
+    ``scheme`` is 'config9' when the record carries the V31+ config-9 protection
+    flag (for which no key material exists), else 'other'."""
+    i = rec.find(_SP_MARKER)
+    scheme = ("config9" if i >= 0 and rec[i + 14:i + 20] == _SP_PROTECTED_FLAG
+              else "other")
+    key = (kind, scheme)
+    _SP_WITHHELD[key] = _SP_WITHHELD.get(key, 0) + 1
 
 
 def _ext_attr01(rec: bytes):
@@ -5029,8 +5126,10 @@ class ProgramBuilder(L5xElementBuilder):
                 a1 = _ext_attr01(rec)
                 _rt._encoded = encoded_routine(
                     _rt, a1, _RT_KEYHASH_OFF,
-                    source_protection_config(rec, a1, _RT_KEYHASH_OFF))
+                    source_protection_config(rec, a1, _RT_KEYHASH_OFF,
+                                             self._acd_major))
                 if _rt._encoded is None:
+                    note_sp_withheld(rec, "routine")
                     continue
             routines.append(_rt)
 
@@ -6468,17 +6567,33 @@ class ControllerBuilder(L5xElementBuilder):
                     _aoi._encoded = encoded_aoi(
                         _aoi, encryption_config_for_version(self._acd_major),
                         sid, _aoi.edited_date)
+                    if _aoi._encoded is None:
+                        # A seal OEM force-encodes but whose interface we could not
+                        # rebuild (e.g. a PackMLv3 library seal whose wrapped key is
+                        # Rockwell material we do not hold -> empty parameters). Emit
+                        # nothing rather than a plaintext def OEM never wrote.
+                        note_sp_withheld(rec, "aoi")
+                        continue
                 elif _aoi_is_source_protected(rec):
                     # At-rest source-protected with a readable descriptor (the
                     # padded/filled-slot form, whose interface stays plaintext): the
                     # config is the descriptor's scheme. The encrypted-tail form has
                     # no readable descriptor (config None) and decodes with an empty
                     # interface (no parameters) -- encoded_aoi withholds both.
+                    # A safety-signed AOI's GSS SafetySignature rides its own
+                    # comps (otype, cid, disc) triple in connection_signatures
+                    # (populated from the -- config-9-encrypted -- GSS records);
+                    # None on a standard AOI, so the wrapper omits it.
+                    _asr = connection_signature_row(self._cur, rec, 0)
+                    _assig = _asr[0] if _asr else None
+                    _aots = _asr[1] if _asr else None
                     _aoi._encoded = encoded_aoi(
                         _aoi,
-                        source_protection_config(rec, a1, _AOI_KEYHASH_OFF),
-                        None, None)
+                        source_protection_config(rec, a1, _AOI_KEYHASH_OFF,
+                                                 self._acd_major),
+                        None, None, _assig, _aots)
                     if _aoi._encoded is None:
+                        note_sp_withheld(rec, "aoi")
                         continue
             aois.append(_aoi)
         return aois

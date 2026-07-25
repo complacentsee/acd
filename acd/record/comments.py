@@ -8,6 +8,7 @@ from acd.generated.comments.fafa_coments import FafaComents
 from acd.record.comps import (
     _SP_KEYS, _SP_KEY_BY_CONFIG, _SP_KEY_HINT, _SP_MARKER, _sp_aes, _sp_cbc,
 )
+from acd.record import config9
 
 
 # A Min/Max operand row declares its limit's type with the CIP elementary type
@@ -64,6 +65,35 @@ def _sp_comment_framing(raw_full: bytes) -> Optional[tuple]:
     return mi + 18, declared, config
 
 
+def _config9_comment_pts(raw_full: bytes, mi: Optional[int] = None):
+    """Yield each config-9 group key's decrypted comment plaintext, unpadded.
+
+    A config-9 (V31+) source-protected comment frames its text tail with the
+    shared wrapped-key layout (:mod:`acd.record.config9`): content IV at
+    ``marker+24``, ciphertext at ``marker+40``, a per-group key from the project
+    key-table -- NOT the config-1..8 on-wire config byte, so ``_sp_comment_framing``
+    (which reads that byte) never sees it. The decrypted body is identical to the
+    config-1..8 form, so each caller applies its existing reconstruction and
+    validation to select the right key among the yielded candidates. ``mi`` is the
+    marker index when the caller already located it (the operand parser scans from
+    body offset 14); otherwise the first marker is used. Empty when the record is
+    not config-9 or the project key-table is unset (fail-closed).
+    """
+    if mi is None:
+        mi = raw_full.find(_SP_MARKER)
+    if mi < 0 or not config9.is_config9(raw_full, mi):
+        return
+    keytable = config9.get_project_keytable()
+    if keytable:
+        yield from config9.decrypt_candidates(raw_full, mi, keytable)
+
+
+def _is_config9_comment(raw_full: bytes) -> bool:
+    """True when the record carries a config-9 source-protected text tail."""
+    mi = raw_full.find(_SP_MARKER)
+    return mi >= 0 and config9.is_config9(raw_full, mi)
+
+
 def _decrypt_sp_comment_text(raw_full: bytes) -> Optional[str]:
     """Recover the plaintext text of a source-protected comment record, or None.
 
@@ -83,6 +113,20 @@ def _decrypt_sp_comment_text(raw_full: bytes) -> Optional[str]:
     frames as protected but does not decode yields None and the caller emits
     nothing rather than the framing bytes the kaitai mistook for text.
     """
+    # Config-9: the body is [member_ref u32][rung_content u32][object_id u32][UTF-8
+    # text][NUL] just like the config-1..8 form, so apply the same offset-12 text
+    # gate to each candidate and take the first that yields printable UTF-8.
+    for pt in _config9_comment_pts(raw_full):
+        if len(pt) < 12:
+            continue
+        seg = pt[12:].split(b"\x00", 1)[0]
+        try:
+            text = seg.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if text and sum(
+                c.isprintable() or c in "\r\n\t" for c in text) >= len(text) * 0.8:
+            return text
     framing = _sp_comment_framing(raw_full)
     if framing is None:
         return None
@@ -496,6 +540,13 @@ class CommentsRecord:
         mi = raw.find(_SP_MARKER)
         if mi < 30:
             return None
+        # Config-9: same reconstruction (prefix + decrypted tail), but the tail is
+        # decrypted with the wrapped-key scheme; try each candidate and keep the
+        # one that reconstructs a known UDI marker.
+        for pt in _config9_comment_pts(raw):
+            row = CommentsRecord._udi_row_from_recon(raw, raw[30:mi] + pt)
+            if row is not None:
+                return row
         framing = _sp_comment_framing(raw)
         if framing is None:
             return None
@@ -509,7 +560,14 @@ class CommentsRecord:
         pad = ct_len - declared
         if len(pt) != ct_len or pt[-pad:] != bytes([pad]) * pad:
             return None
-        recon = raw[30:mi] + pt[:declared]
+        return CommentsRecord._udi_row_from_recon(raw, raw[30:mi] + pt[:declared])
+
+    @staticmethod
+    def _udi_row_from_recon(raw: bytes, recon: bytes) -> Optional[tuple]:
+        """Build a UDI text row (RevisionNote / AdditionalHelpText) from a
+        reconstructed plaintext (plaintext prefix + decrypted tail), or None when
+        it does not begin with a known UDI marker or the text is not UTF-8. Shared
+        by the config-1..8 and config-9 decrypt paths."""
         if recon.startswith(CommentsRecord._UDI_EXT_HELP_MARKER):
             marker, tag_ref, object_id = (
                 CommentsRecord._UDI_EXT_HELP_MARKER, "__EXT_HELP__", 0)
@@ -637,6 +695,15 @@ class CommentsRecord:
             # trigger binding 0x21); drop before attempting the decrypt.
             return None
         prefix = raw[30:mi]
+        fields = (seq_number, sub_record_length, object_id, record_type,
+                  parent, owner_ref, kind)
+        # Config-9: same blob layout (plaintext prefix + decrypted tail); the
+        # wrapped-key scheme supplies the tail. Validate each candidate through the
+        # shared operand row builder and keep the first that passes.
+        for pt in _config9_comment_pts(raw, mi):
+            row = CommentsRecord._operand_row_from_blob(prefix + pt, fields)
+            if row is not None:
+                return row
         ct = raw[mi + 18:]
         nblocks = len(ct) // 16
         if nblocks < 1:
@@ -652,53 +719,54 @@ class CommentsRecord:
             pad = pt[-1]
             if not (1 <= pad <= 16) or pt[-pad:] != bytes([pad]) * pad:
                 continue
-            blob = prefix + pt[:-pad]
-            pos = 0
-            cus = []
-            while pos + 1 < len(blob):
-                cu = struct.unpack_from("<H", blob, pos)[0]
-                pos += 2
-                if cu == 0:
-                    break
-                cus.append(cu)
-            if not cus:
-                continue
-            operand = "".join(chr(c) for c in cus)
-            if operand[0] not in ".[":
-                continue
-            if any((ord(c) < 0x20 and c != "\t") for c in operand):
-                continue
-            if kind in (0x02, 0x03):
-                if len(blob) < pos + 4:
-                    continue
-                from acd.l5x.tag_value import _fmt_real_decorated
-                text = _fmt_real_decorated(
-                    struct.unpack("<f", blob[-4:])[0])
-            else:
-                tpos = pos + 12
-                end = blob.find(b"\x00", tpos)
-                if end < 0:
-                    end = len(blob)
-                try:
-                    text = blob[tpos:end].decode("utf-8")
-                except UnicodeDecodeError:
-                    continue
-                if not text:
-                    continue
-            _SP_KEY_HINT[0] = config
-            return (
-                seq_number,
-                sub_record_length,
-                object_id,
-                text,
-                record_type,
-                parent,
-                operand,
-                0,
-                kind,
-                owner_ref,
-            )
+            row = CommentsRecord._operand_row_from_blob(prefix + pt[:-pad], fields)
+            if row is not None:
+                _SP_KEY_HINT[0] = config
+                return row
         return None
+
+    @staticmethod
+    def _operand_row_from_blob(blob: bytes, fields: tuple) -> Optional[tuple]:
+        """Build an operand-comment row from a reconstructed plaintext ``blob``
+        (plaintext prefix + decrypted tail), or None when the operand or text gate
+        fails. Shared by the config-1..8 and config-9 operand decrypt paths.
+        ``fields`` = (seq_number, sub_record_length, object_id, record_type,
+        parent, owner_ref, kind)."""
+        (seq_number, sub_record_length, object_id, record_type,
+         parent, owner_ref, kind) = fields
+        pos = 0
+        cus = []
+        while pos + 1 < len(blob):
+            cu = struct.unpack_from("<H", blob, pos)[0]
+            pos += 2
+            if cu == 0:
+                break
+            cus.append(cu)
+        if not cus:
+            return None
+        operand = "".join(chr(c) for c in cus)
+        if operand[0] not in ".[":
+            return None
+        if any((ord(c) < 0x20 and c != "\t") for c in operand):
+            return None
+        if kind in (0x02, 0x03):
+            if len(blob) < pos + 4:
+                return None
+            from acd.l5x.tag_value import _fmt_real_decorated
+            text = _fmt_real_decorated(struct.unpack("<f", blob[-4:])[0])
+        else:
+            tpos = pos + 12
+            end = blob.find(b"\x00", tpos)
+            if end < 0:
+                end = len(blob)
+            try:
+                text = blob[tpos:end].decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+            if not text:
+                return None
+        return (seq_number, sub_record_length, object_id, text, record_type,
+                parent, operand, 0, kind, owner_ref)
 
     @staticmethod
     def parse(dat_record: DatRecord, short_header: bool = False) -> Optional[tuple]:
@@ -724,7 +792,8 @@ class CommentsRecord:
         try:
             raw_full = bytes(dat_record.record.record_buffer)
             if (not sp_recovered and not result[6]
-                    and _sp_comment_framing(raw_full) is not None):
+                    and (_sp_comment_framing(raw_full) is not None
+                         or _is_config9_comment(raw_full))):
                 text = _decrypt_sp_comment_text(raw_full)
                 if text is None:
                     # FAIL CLOSED. The tail's framing says this record IS
