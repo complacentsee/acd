@@ -50,7 +50,13 @@ from acd.record.source_protection import sp_decrypt_nameless_element
 
 _MARK = b"\xff\xfe\xff"
 _AT = re.compile(r"@([0-9a-fA-F]+)@")
-_QUALIFIER = {1: "NonStored", 5: "TimeDelayed", 7: "PulseRisingEdge", 8: "PulseFallingEdge"}
+# Action-qualifier code -> the L5X qualifier name. A fixed wire enum (the SFC
+# action qualifier vocabulary is schema-defined, not stored in the project), so an
+# unmapped code fails the routine closed rather than guess a name. 22 = "Pulse",
+# read off a decrypted reference export: its 180 action records carry codes
+# {1: 172, 22: 8} and the reference's own qualifiers are 172 NonStored + 8 Pulse.
+_QUALIFIER = {1: "NonStored", 5: "TimeDelayed", 7: "PulseRisingEdge",
+              8: "PulseFallingEdge", 22: "Pulse"}
 _STEP_MASK = 0x33
 _SHEET = ('Letter - 8.5 x 11 in', 'Landscape')
 

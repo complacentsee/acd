@@ -85,6 +85,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import html
 from typing import Optional, Tuple
 
@@ -289,6 +290,42 @@ def _encrypt_b64(plaintext: bytes, config: int) -> Optional[str]:
     return base64.b64encode(bytes(out)).decode("ascii").rstrip("=")
 
 
+# Config-8 export framing: a 2-byte config magic, then a 16-byte INLINE CBC IV,
+# then the ciphertext -- unlike config 3, which is a bare IV=0 ciphertext.
+#   [00 08][IV 16][AES-256-CBC(PKCS7(UTF-8 document))]
+# Read off the reference: every config-8 routine blob in the corpus decrypts under
+# the config-8 key with its own leading IV to a complete <Routine> document, and
+# the plaintext is UTF-8 (config 3 is UTF-16LE -- the declared encoding lies in
+# both). Studio draws the IV at RANDOM per export: three routines whose plaintexts
+# are BYTE-IDENTICAL carry three different IVs, so an OEM blob's exact bytes are
+# not reproducible (the same per-export wall as config 9, and the reason the
+# fidelity comparator does not compare either one's ciphertext). We derive the IV
+# from the plaintext instead, so a re-run of the converter is byte-identical and
+# no two routines share an IV. That is a reproducibility choice, not a security
+# one: the config-8 key is a public embedded constant, so the blob protects
+# nothing either way -- it is a container Studio can read back.
+_CFG8_CONFIG = 8
+_CFG8_MAGIC = b"\x00\x08"
+
+
+def _encrypt_cfg8(document: str) -> Optional[str]:
+    """The config-8 ``<EncodedData>`` body for ``document``, or None."""
+    aes = _aes(_CFG8_CONFIG)
+    if aes is None:
+        return None
+    pt = document.encode("utf-8")
+    iv = hashlib.sha256(pt).digest()[:16]
+    pad = 16 - (len(pt) % 16)
+    buf = pt + bytes([pad]) * pad
+    out = bytearray()
+    prev = iv
+    for i in range(0, len(buf), 16):
+        prev = aes.encrypt_block(bytes(x ^ y for x, y in zip(buf[i:i + 16], prev)))
+        out += prev
+    return base64.b64encode(
+        _CFG8_MAGIC + iv + bytes(out)).decode("ascii").rstrip("=")
+
+
 def security_descriptor(a1: Optional[bytes], keyhash_off: int,
                         config: Optional[int] = None) -> Optional[Tuple[str, str]]:
     """(EncodedSourceKey, SourceProtectionType) from ext-attr 0x1, or None.
@@ -393,8 +430,21 @@ def _inner_document(routine, esk: str, spt: str) -> Optional[str]:
         for i, line in enumerate(routine._st_lines):
             body.append(f'<Line Number="{i}">\n<![CDATA[{line}]]>\n</Line>\n')
         body.append("</STContent>\n")
+    elif routine.type in ("FBD", "SFC"):
+        # A graphical routine's content is already serialized as one pre-rendered
+        # block by the plaintext-<Routine> path (acd.l5x.fbd_content /
+        # acd.l5x.sfc_content), which those decoders build fail-closed: None means
+        # the sheet or an element did not resolve. Reuse it verbatim rather than
+        # re-serialize -- the blob must carry the SAME content the recovered
+        # plaintext routine would, and a second serializer would be a second thing
+        # to keep in step. None here withholds the whole blob.
+        content = (routine._fbd_content if routine.type == "FBD"
+                   else routine._sfc_content)
+        if content is None:
+            return None
+        body.append(content + "\n")
     else:
-        # FBD/SFC and the relic TypeLess routines have no serializer here.
+        # The relic TypeLess routines have no content to serialize.
         return None
     return (
         f"{_DECL}\n"
@@ -415,9 +465,11 @@ _CFG9_WRAPKEY_LEN = 64
 
 
 def _config9_routine_descriptor(rec: bytes) -> Optional[Tuple[str, str]]:
-    """(EncodedSourceKey, SourceProtectionType) for a config-9 protected routine.
+    """(EncodedSourceKey, SourceProtectionType) from a config-9-framed AT-REST record.
 
-    Config-9 routines carry no ext-attr 0x1 (``security_descriptor`` returns None);
+    This is the at-rest framing shared by the export configs 8 and 9 (see
+    ``source_protection_config``), so it serves both. Such routines carry no
+    ext-attr 0x1 (``security_descriptor`` returns None);
     their source-protection descriptor lives inside the config-9-encrypted record.
     Decrypt it and lift the wrapped source-key block -- the 64 bytes after the
     ``42 00 00 08`` slot preamble -- which is the real at-rest source-key material.
@@ -425,6 +477,15 @@ def _config9_routine_descriptor(rec: bytes) -> Optional[Tuple[str, str]]:
     binding on import (a differing esk still imports), and the whole config-9
     <EncodedData> body is a per-export, non-reproducible, comparator-masked
     ciphertext, so reproducing Studio's exact per-export re-wrap buys nothing.
+
+    SourceProtectionType is READ from the record, not assumed: the flags word
+    follows the whole key slot here exactly as it follows the 66-byte slot in the
+    plaintext descriptor form (see ``security_descriptor``), and its bit 0 is the
+    same Viewable flag. Confirmed against the reference's own decrypted blobs --
+    it splits 99 Viewable from 553 Full Protection with no overlap, and a project
+    whose routines Studio marks Viewable is a whole file this would otherwise
+    mislabel.
+
     Fail-closed: None (withhold) on any framing/decrypt miss."""
     midx = rec.find(_SP_MARKER)
     if midx < 0 or not config9.is_config9(rec, midx):
@@ -439,7 +500,12 @@ def _config9_routine_descriptor(rec: bytes) -> Optional[Tuple[str, str]]:
     block = pt[start:start + _CFG9_WRAPKEY_LEN]
     if len(block) != _CFG9_WRAPKEY_LEN or block == bytes(_CFG9_WRAPKEY_LEN):
         return None
-    return base64.b64encode(block).decode("ascii").rstrip("="), _SPT_FULL
+    fstart = start + _CFG9_WRAPKEY_LEN
+    if len(pt) < fstart + _SD_FLAGS_LEN:
+        return None
+    flags = int.from_bytes(pt[fstart:fstart + _SD_FLAGS_LEN], "little")
+    spt = _SPT_VIEWABLE if flags & _SPT_VIEWABLE_BIT else _SPT_FULL
+    return base64.b64encode(block).decode("ascii").rstrip("="), spt
 
 
 def encoded_routine(routine, a1: Optional[bytes], keyhash_off: int,
@@ -453,9 +519,10 @@ def encoded_routine(routine, a1: Optional[bytes], keyhash_off: int,
     if config is None:
         return None
     desc = security_descriptor(a1, keyhash_off, config)
-    if desc is None and config == 9 and rec is not None:
-        # Config-9 routines keep no ext-attr 0x1 descriptor; recover it from the
-        # encrypted record instead.
+    if desc is None and config in (8, 9) and rec is not None:
+        # A routine on the encrypted-tail scheme (export config 8 or 9 -- one
+        # at-rest framing, the release picks the config) keeps no readable
+        # ext-attr 0x1; recover the descriptor from the encrypted record instead.
         desc = _config9_routine_descriptor(rec)
     if desc is None:
         return None
@@ -467,6 +534,10 @@ def encoded_routine(routine, a1: Optional[bytes], keyhash_off: int,
         # Config 9 is AES-256-GCM under a runtime-loaded export key (PBKDF2), not
         # the AES-CBC of the other configs; withheld when no key is loaded.
         body = config9_export.encrypt_routine(document)
+    elif config == _CFG8_CONFIG:
+        # Config 8 is CBC like config 3 but with an inline IV and a UTF-8
+        # document -- see _encrypt_cfg8.
+        body = _encrypt_cfg8(document)
     else:
         body = _encrypt_b64(document.encode("utf-16-le"), config)
     if body is None:

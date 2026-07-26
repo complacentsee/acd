@@ -42,8 +42,9 @@ falls back to fail-closed. (A V21 routine DOES have a plaintext-named
 the chain returns None there and defers to the V21 table.)
 """
 import struct
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterable, Iterator, Optional, Tuple
 
+from acd.record import config9
 from acd.record.comps import (CompsRecord, _SP_KEY_BY_CONFIG, _sp_aes,
                               _sp_cbc)
 
@@ -97,15 +98,99 @@ def _parse_named(dat: bytes, name: str) -> Dict[Tuple[int, int], int]:
     return out
 
 
-def build_sheet_layout_rows(comments_dat: bytes):
+# A record's UTF-16 attribute name starts at this fixed offset -- ahead of the
+# config-9 marker, so a protected record's name BEGINS in the clear (see
+# _parse_named_config9).
+_NAME_OFF = 0x24
+_SHEET_NAMES = ("SHEETSIZE", "SHEETLAYOUT")
+
+
+def _walk_records(dat: bytes) -> Iterator[bytes]:
+    """Yield each ``fafa``-framed record, bounded by its own u32 length at +2.
+
+    Splitting the stream on every ``fafa`` occurrence (what the name scan above
+    does, which is safe because it anchors on a plaintext needle) mis-bounds a
+    record whose encrypted payload happens to contain those two bytes. Walking by
+    the declared length is exact; a length that does not land on the next record
+    resyncs to the following ``fafa`` so one bad record cannot lose the rest.
+    """
+    pos = dat.find(_FAFA)
+    while 0 <= pos and pos + 6 <= len(dat):
+        ln = struct.unpack_from("<I", dat, pos + 2)[0]
+        if ln < 0x1A or pos + ln > len(dat):
+            pos = dat.find(_FAFA, pos + 2)
+            continue
+        yield dat[pos:pos + ln]
+        nxt = pos + ln
+        pos = nxt if dat[nxt:nxt + 2] == _FAFA else dat.find(_FAFA, nxt)
+
+
+def _parse_named_config9(dat: bytes, keytable: Iterable[bytes]):
+    """``{name: {(prog, rkey): value}}`` from CONFIG-9-ENCRYPTED sheet records.
+
+    A source-protected graphical routine's SHEETSIZE/SHEETLAYOUT records are
+    themselves config-9 encrypted at rest, so the attribute name and its value sit
+    in the ciphertext and the plaintext name scan never sees them (witnessed: a
+    V31 file with 25 FBD routines keeps only 6 sheet records in the clear, and a
+    V36 file with protected SFC routines keeps none). Only the record HEAD stays
+    readable -- which is where the ``(program, routine)`` key pair lives, and where
+    the name STARTS.
+
+    That head is the whole prefilter: a record is tried only when the plaintext
+    part of its name is a prefix of a sheet attribute name, which costs no key
+    trial at all and is exact in the corpus (825 config-9 records -> 38 tried ->
+    38 sheet records). The name itself then selects the key: a wrong group key
+    cannot reconstruct the 18/22-byte UTF-16 attribute name, on top of the PKCS7 +
+    declared-length filter ``decrypt_candidates`` already applies. Fail-closed --
+    a record that does not decrypt, or whose reconstruction does not carry the
+    name, contributes nothing.
+    """
+    keytable = list(keytable)
+    out: Dict[str, Dict[Tuple[int, int], int]] = {n: {} for n in _SHEET_NAMES}
+    if not keytable:
+        return out
+    needles = {n: n.encode("utf-16-le") for n in _SHEET_NAMES}
+    for rec in _walk_records(dat):
+        mi = rec.find(_SP_MARK)
+        if mi <= _NAME_OFF or not config9.is_config9(rec, mi):
+            continue
+        head = rec[_NAME_OFF:mi]
+        if not any(nb.startswith(head) for nb in needles.values()):
+            continue
+        for pt in config9.decrypt_candidates(rec, mi, keytable):
+            recon = rec[:mi] + pt
+            if len(recon) < 0x1A:
+                break
+            for name, nb in needles.items():
+                if nb in recon:
+                    key = (struct.unpack_from("<I", recon, 0x12)[0] & 0xFFFF,
+                           struct.unpack_from("<H", recon, 0x16)[0])
+                    out[name][key] = struct.unpack_from(
+                        "<I", recon, len(recon) - 4)[0]
+            break
+    return out
+
+
+def build_sheet_layout_rows(comments_dat: bytes,
+                            keytable: Optional[Iterable[bytes]] = None):
     """Rows ``(prog, rkey, size_index, orient)`` for the ``sheet_layout`` table.
 
     One row per routine that owns a SHEETSIZE record; the ``0xFFFFFFFF`` unset
     sentinel is normalised to 0 (the Studio default) here so the table always
-    holds a concrete index/orientation.
+    holds a concrete index/orientation. ``keytable`` is the project's config-9
+    group-key table: with it, the sheet records of SOURCE-PROTECTED graphical
+    routines are recovered too (they are encrypted at rest -- see
+    ``_parse_named_config9``). Plaintext records win over decrypted ones for the
+    same key, so passing a key-table can only ADD rows.
     """
     sizes = _parse_named(comments_dat, "SHEETSIZE")
     orients = _parse_named(comments_dat, "SHEETLAYOUT")
+    if keytable:
+        enc = _parse_named_config9(comments_dat, keytable)
+        for key, val in enc["SHEETSIZE"].items():
+            sizes.setdefault(key, val)
+        for key, val in enc["SHEETLAYOUT"].items():
+            orients.setdefault(key, val)
     rows = []
     for (prog, rkey), si in sizes.items():
         oi = orients.get((prog, rkey), 0)

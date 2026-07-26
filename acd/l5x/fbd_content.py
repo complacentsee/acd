@@ -22,6 +22,15 @@ from xml.sax.saxutils import quoteattr
 from acd.record.source_protection import sp_decrypt_nameless_element
 
 IREF, OREF, TEXTBOX, WIRE, ATTACH = 0x0e, 0x0d, 0x81, 0x11, 0x88
+# A feedback wire is a SIBLING CLASS of the wire, in the same wire group. Its
+# record is byte-identical to a wire's -- same 40-byte length, same class-version
+# u16 (7) at offset 18, same From/FromParam/To/ToParam u32 quadruple -- so the
+# class id at offset 16 is the only thing that tells them apart, which makes
+# reading it a per-instance derivation rather than a table. Mapped EXPLICITLY, so
+# a future third accepted class cannot silently render as a feedback wire.
+FEEDBACK = 0x12
+WIRE_TAG = {WIRE: 'Wire', FEEDBACK: 'FeedbackWire'}
+WIRE_ORDER = {WIRE: 0, FEEDBACK: 1}
 # On-sheet AOI call, wire connectors and the connector-name record they point at
 AOICALL, ICON, OCON, CONNNAME = 0x8a, 0x0f, 0x10, 0x71
 # The AOI call's optional empty property child
@@ -34,7 +43,10 @@ KIND2TYPE = {
     0x2e: 'SSUM', 0x39: 'RLIM', 0x3a: 'DERV', 0x3b: 'MINC', 0x3d: 'OSRI',
     0x44: 'RAD', 0x48: 'ABS', 0x4d: 'COS', 0x4f: 'DIV', 0x52: 'MUL',
     0x55: 'SUB', 0x5b: 'TONR', 0x5c: 'EQU', 0x5d: 'GEQ', 0x5e: 'GRT',
-    0x5f: 'LEQ', 0x63: 'NEQ',
+    # LES sits in the consecutive comparison-block run (EQU/GEQ/GRT/LEQ/../NEQ);
+    # its records carry the same SourceA/SourceB/Dest pin mask as its siblings and
+    # its per-file record count matches the reference's LES block count exactly.
+    0x5f: 'LEQ', 0x60: 'LES', 0x63: 'NEQ',
     # pin-space types: wide datatype-derived mask, not the VISIBLE_PIN_BITS u32
     0x0b: 'TOT', 0x1b: 'PIDE', 0x29: 'PI', 0x58: 'CTUD',
     0x18: 'FGEN', 0x1a: 'MAVE',
@@ -64,6 +76,10 @@ PIN_MASK_BYTES = {'CTUD': 8, 'PI': 8, 'TOT': 8, 'PIDE': 24, 'FGEN': 8, 'MAVE': 8
 # output collectors reserve nothing). This is a read over member NAMES -- a
 # derivation, not a per-type value. PIN_ULINPUT.match(name).group(1) -> n.
 PIN_ULINPUT = re.compile(r"^ulBoolInput(\d+)$")
+# The hidden OUTPUT bit-collector and the member it trades pin slots with -- both
+# firmware member names, the same vocabulary as PIN_ULINPUT (see _datatype_pinmap).
+_PIN_OUT_COLLECTOR = "ulBoolOutput1"
+_PIN_ENABLE_OUT = "EnableOut"
 # PIDE's mask offset from base depends on the record generation, read off the
 # structure itself: the fixed prelude length = offset of the operand string
 # marker. V16-era records (prelude 48) start the mask at +12; the V20+/V31+
@@ -75,6 +91,11 @@ _PIDE_MASK_DELTA_BY_PRELUDE = {48: 12, 76: 9, 80: 9}
 # attested for them, so the V16 shape fails closed until evidenced.
 _ARRAY_MASK_DELTA_BY_PRELUDE = {76: 9, 80: 9}
 
+# bit -> pin name, per block type. This is an ANCHOR, not the whole vocabulary:
+# a set bit missing from it is resolved at RUNTIME from the block instance's own
+# datatype member list in the ACD (_derived_pin_bits), and the entries here are
+# what puts that derivation in phase. So a block type needs only as many pins
+# tabled as the corpus has attested -- the rest come out of the project.
 VISIBLE_PIN_BITS = {
     'ABS': {10: 'Source', 12: 'Dest'},
     'ADD': {10: 'SourceA', 11: 'SourceB', 13: 'Dest'},
@@ -92,6 +113,8 @@ VISIBLE_PIN_BITS = {
     'GRT': {10: 'SourceA', 11: 'SourceB', 13: 'Dest'},
     'HLL': {11: 'In', 12: 'HighLimit', 13: 'LowLimit', 17: 'Out'},
     'LEQ': {9: 'EnableIn', 10: 'SourceA', 11: 'SourceB', 13: 'Dest'},
+    # LES shares FBD_COMPARE (and its pin layout) with its GRT/NEQ siblings.
+    'LES': {10: 'SourceA', 11: 'SourceB', 13: 'Dest'},
     'LPF': {11: 'In', 21: 'Out'},
     'MINC': {11: 'In', 12: 'Reset', 16: 'Out'},
     'MUL': {10: 'SourceA', 11: 'SourceB', 13: 'Dest'},
@@ -108,6 +131,9 @@ VISIBLE_PIN_BITS = {
 }
 MASK_DELTA = {'SSUM': 9}
 FAM_OK = {'SSUM': {'S'}}
+# A u32-mask bit is the datatype pin SLOT plus this -- the same relation _wparam
+# uses to turn a wire index into a bit. SSUM's mask is already slot-based (shift 0).
+_PIN_BIT_SHIFT = 8
 
 WIRE_PARAM = {
     'ADD:L': {2: 'SourceA', 3: 'SourceB', 5: 'Dest'},
@@ -199,13 +225,23 @@ def _datatype_pinmap(cur, datatype, array_slots=()):
     and order come entirely from the datatype member list, so no per-type pin
     table is needed.
 
+    The hidden output bit-collector ``ulBoolOutput1`` does NOT occupy the slot its
+    ordinal implies: in firmware pin space it sits one slot LATER, i.e. the member
+    listed immediately after it comes first. That is a property of the datatype's
+    own member list, so it is applied whenever the list has that shape -- the
+    collector immediately followed by ``EnableOut`` -- and NOT gated on the
+    instance having array parameters (which is merely where the rule was first
+    seen: a MAVE block reads EnableOut=11, collector=12, Out=13). Leaving it gated
+    made every set mask bit that landed on the collector reject its whole routine.
+    Attested directly on 2 datatypes (TOTALIZER via its mask, MOVING_AVERAGE via
+    the array path) and generalised to the 42 others of that shape. A datatype
+    that lists the collector far from ``EnableOut`` (FBD_TIMER puts it at ordinal
+    1) is deliberately left alone.
+
     ``array_slots``: the pin slots the block instance's array parameters
     occupy (each 0x75 array record states its slot: MAVE StorageArray=9 /
     WeightArray=10, FGEN X1=7 Y1=8 X2=9 Y2=10). Members then fill the FREE
-    slots in ordinal order -- except that the first hidden ``ulBoolOutput1``
-    fills AFTER the member that follows it (a MAVE block: EnableOut=11,
-    collector=12, Out=13; with no arrays the collector keeps its ordinal
-    slot, CTUD-attested).
+    slots in ordinal order.
     """
     rows = cur.execute(
         "SELECT name, hidden FROM datatype_members WHERE datatype=? "
@@ -213,12 +249,11 @@ def _datatype_pinmap(cur, datatype, array_slots=()):
     if not rows:
         return None
     order = [(name, bool(hidden)) for name, hidden in rows]
-    if array_slots:
-        for i, (name, hidden) in enumerate(order):
-            if hidden and name == 'ulBoolOutput1':
-                if i + 1 < len(order):
-                    order[i], order[i + 1] = order[i + 1], order[i]
-                break
+    for i, (name, hidden) in enumerate(order):
+        if (hidden and name == _PIN_OUT_COLLECTOR and i + 1 < len(order)
+                and order[i + 1][0] == _PIN_ENABLE_OUT):
+            order[i], order[i + 1] = order[i + 1], order[i]
+            break
     taken = set(array_slots)
     out = {}
     slot = 0
@@ -231,6 +266,41 @@ def _datatype_pinmap(cur, datatype, array_slots=()):
         if hidden and mm and int(mm.group(1)) >= 2:
             slot += 1
     return out
+
+
+def _derived_pin_bits(cur, operand_oid, operand_name, tab, shift):
+    """A u32-mask block's pin map DERIVED from the project, or None.
+
+    A u32-mask block is tag-backed just like a pin-space one: its operand names a
+    tag whose datatype is the block's backing structure (an HLL instance is an
+    ``HL_LIMIT``, an RLIM a ``RATE_LIMITER``, every comparison block an
+    ``FBD_COMPARE``), and that datatype's member list -- ordered, in the ACD --
+    IS the pin vocabulary. So the pin names need not be tabled: read them from the
+    project. The mask bit of a member is its ``_datatype_pinmap`` slot + 8, the
+    same relation ``_wparam`` already uses to turn a wire index into a bit.
+
+    ``tab`` is the block type's tabled anchor and the PHASE CHECK: the slot->bit
+    relation holds only for the datatypes whose leading hidden members
+    ``_datatype_pinmap`` models exactly, and a datatype one slot out of step would
+    silently rename every pin. So the derivation is accepted only when it
+    reproduces EVERY tabled bit for this block type -- then it is in phase and its
+    remaining bits are trustworthy; otherwise None and the caller keeps the table
+    alone (fail-closed on an unknown bit, exactly as before).
+
+    Returned in the SLOT domain (bit - ``shift``) with ``_datatype_pinmap``'s
+    ``(name, hidden)`` values, so it doubles as the wire-parameter map.
+    """
+    dt = _block_datatype(cur, operand_oid, operand_name)
+    if dt is None:
+        return None
+    pinmap = _datatype_pinmap(cur, dt)
+    if pinmap is None:
+        return None
+    for bit, name in tab.items():
+        entry = pinmap.get(bit - shift)
+        if entry is None or entry[1] or entry[0] != name:
+            return None
+    return pinmap
 
 
 def _pins_from_mask(er, base, bt, pinmap):
@@ -673,13 +743,35 @@ def _decode(cur, oid, sh, size, orient, tbtext, tbtext_v20):
                         tab = VISIBLE_PIN_BITS.get(bt)
                         if tab is None:
                             return None
+                        # A bit the table does not name is resolved from the
+                        # project's own pin vocabulary instead (and that map then
+                        # also serves as this element's wire-parameter map). Read
+                        # LAZILY -- only a block that actually needs an unnamed bit
+                        # pays for it, so every block the table already covers
+                        # follows exactly the path it did before.
+                        derived = None
+                        tried = False
+                        shift = 0 if bt == 'SSUM' else _PIN_BIT_SHIFT
                         pins = []
                         for b in range(32):
-                            if mask & (1 << b):
-                                if b not in tab:
-                                    return None
-                                pins.append(tab[b])
+                            if not mask & (1 << b):
+                                continue
+                            name = tab.get(b)
+                            if name is None:
+                                if not tried:
+                                    tried = True
+                                    derived = _derived_pin_bits(
+                                        cur, _operand_oid(er), op, tab, shift)
+                                if derived is not None:
+                                    entry = derived.get(b - shift)
+                                    name = (None if entry is None or entry[1]
+                                            else entry[0])
+                            if name is None:
+                                return None
+                            pins.append(name)
                         pins_str = " ".join(pins)
+                        if derived is not None:
+                            pinmap = derived
                     elems.append([eo, 'Block', x, y, op, pins_str, bt, autotune,
                                   pinmap, arrays])
                 else:
@@ -782,7 +874,8 @@ def _decode(cur, oid, sh, size, orient, tbtext, tbtext_v20):
         wires = []
         for go in wgs:
             for wo, wr in _rows(cur, go):
-                if _kind(wr) != WIRE or len(wr) < base + 16:
+                wk = _kind(wr)
+                if wk not in WIRE_TAG or len(wr) < base + 16:
                     return None
                 fo = struct.unpack_from("<I", wr, base)[0]
                 fp = struct.unpack_from("<I", wr, base + 4)[0]
@@ -790,10 +883,10 @@ def _decode(cur, oid, sh, size, orient, tbtext, tbtext_v20):
                 tp = struct.unpack_from("<I", wr, base + 12)[0]
                 if fo not in idmap or to not in idmap:
                     return None
-                wires.append((fo, fp, to, tp))
+                wires.append((wk, fo, fp, to, tp))
 
         resolved = []
-        for fo, fp, to, tp in wires:
+        for wk, fo, fp, to, tp in wires:
             fattr = tattr = ""
             fname = tname = ""
             ft, fbt = etype[fo]
@@ -808,13 +901,20 @@ def _decode(cur, oid, sh, size, orient, tbtext, tbtext_v20):
                 if tname is None:
                     return None
                 tattr = ' ToParam="%s"' % tname
-            resolved.append((idmap[fo], idmap[to], fattr, tattr, fname, tname))
+            resolved.append((wk, idmap[fo], idmap[to], fattr, tattr, fname, tname))
         # Same-endpoint wire pairs (several wires between one element pair) are
         # ordered ALPHABETICALLY by param name -- corpus: OEM lists DevDeadband,
         # ProgAutoReq, ProgProgReq (names ordered; their pin indices 61, 67, 64
         # are not), and DevHLimit before DevLLimit.
-        wire_xml = ['<Wire FromID="%d"%s ToID="%d"%s/>' % (w[0], w[2], w[1], w[3])
-                    for w in sorted(resolved, key=lambda w: (w[0], w[1], w[4], w[5]))]
+        # Feedback wires form a TRAILING RUN: every <Wire> of the sheet first, then
+        # every <FeedbackWire>, each run in that same key order (reference-attested
+        # on a 4-feedback sheet). UNEVIDENCED and chosen: the param tiebreak WITHIN
+        # a feedback run, and the run's position relative to <Attachment> -- no
+        # reference FBD sheet carries both a feedback wire and an attachment.
+        wire_xml = ['<%s FromID="%d"%s ToID="%d"%s/>'
+                    % (WIRE_TAG[w[0]], w[1], w[3], w[2], w[4])
+                    for w in sorted(resolved, key=lambda w: (
+                        WIRE_ORDER[w[0]], w[1], w[2], w[5], w[6]))]
 
         att = []
         for go in ags:

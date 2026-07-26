@@ -665,6 +665,14 @@ _CONFIG_MARK = b"\x44\x02\x00\x00"
 # reference renders only as <ConfigScript>, never <ConfigData>.
 _CONFIGSCRIPT_ONLY_PT = 123
 _CONFIG_IMG_VALUE = 0x66          # ext-attr holding the config/script image
+# Module ext-attr 0x12c is a coarse DEVICE-PROFILE code. Communications adapters
+# (product_type 12) split on it: the profiles at or above this value are the ones
+# observed to carry a raw config image the reference renders as <ConfigData>, the
+# ones below it are not (they include the DeviceNet scanners whose 0x13e image the
+# reference leaves unrendered). A THRESHOLD FITTED TO OBSERVATION -- 8 distinct
+# codes seen, no documentation behind it -- so it is used only to widen a route
+# that is otherwise blanket-closed, never to suppress one that already works.
+_MOD_PROFILE_HAS_CONFIG = 10
 
 
 def _build_config_holders(cur, short_header: bool = False):

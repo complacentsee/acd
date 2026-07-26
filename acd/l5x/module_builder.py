@@ -27,6 +27,7 @@ from acd.l5x.connections import (
     _CONFIG_IMG_MAX,
     _CONFIG_MARK,
     _CONFIGSCRIPT_ONLY_PT,
+    _MOD_PROFILE_HAS_CONFIG,
     _CONN_DIRECT_PRODUCT_TYPES,
     _CONN_FMT_OUTPUT,
     _CONN_GENERIC_VENDOR,
@@ -2027,18 +2028,37 @@ class ModuleBuilder(L5xElementBuilder):
                 except Exception:
                     _ma = {}
                 # The 0x13e fallback is a speculative recovery, used only when the
-                # reliable primary pointer found nothing. A communications-adapter
-                # module (product_type 12: EN/DeviceNet bridges, scanners) that has
-                # real config reaches it through the primary pointer; a missing
-                # primary there means "no config", so do not speculate -- the 0x13e
-                # ext-attr on these resolves to a generic image the reference does
-                # not render as <ConfigData>.
-                if (config_inner is None and configdata is None
-                        and product_type not in (12, _CONFIGSCRIPT_ONLY_PT)):
+                # reliable primary pointer found nothing. For a communications
+                # adapter (product_type 12: EN/DeviceNet bridges, scanners) that is
+                # usually right -- its 0x13e resolves to a generic image the
+                # reference does not render. But on a SHORT-HEADER (<=V21) project
+                # the primary pointer is structurally dead: the module record is
+                # truncated before the identity marker the trailer route needs, so
+                # 0x13e is the ONLY pointer there and blanket-excluding
+                # product_type 12 deletes the ConfigData of every managed switch in
+                # every such project. Discriminate per MODULE INSTANCE instead, on
+                # the device-profile code in ext-attr 0x12c: the profiles observed
+                # to carry a raw config image are the high ones, and the low ones
+                # (which include the DeviceNet scanners whose 0x13e image the
+                # reference does not render) are still excluded. This is read from
+                # the record, not keyed by catalog -- the same catalog appears under
+                # different profile codes.
+                _prof = _ma.get(0x12C)
+                _prof = (int.from_bytes(_prof[:4], "little")
+                         if _prof and len(_prof) >= 4 else None)
+                _pt_ok = (product_type != _CONFIGSCRIPT_ONLY_PT
+                          and (product_type != 12
+                               or (_prof is not None
+                                   and _prof >= _MOD_PROFILE_HAS_CONFIG)))
+                if config_inner is None and configdata is None and _pt_ok:
                     _ref = _ma.get(0x13E)
                     if _ref and len(_ref) == 4:
-                        img = _config_holder_image(
-                            self._cur, struct.unpack("<I", _ref)[0], self._short_header)
+                        _oid = struct.unpack("<I", _ref)[0]
+                        # Fail closed unless the target really is an indexed config
+                        # holder, not just any object id that happens to sit there.
+                        img = (_config_holder_image(
+                            self._cur, _oid, self._short_header)
+                            if _oid in self._cfg_pool else None)
                         if img is not None and len(img) >= 4:
                             u = struct.unpack_from("<I", img, 0)[0] - 4
                             csize = u if 0 <= u <= _CONFIG_IMG_MAX else len(img)

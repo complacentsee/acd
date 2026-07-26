@@ -671,7 +671,11 @@ class ExportL5x:
         )
         try:
             with open(os.path.join(self._temp_dir, "Comments.Dat"), "rb") as _cf:
-                _sl_rows = build_sheet_layout_rows(_cf.read())
+                # A source-protected graphical routine's sheet records are
+                # config-9 encrypted at rest; pass the group-key table (loaded
+                # just above) so those are recovered too.
+                _sl_rows = build_sheet_layout_rows(
+                    _cf.read(), config9.get_project_keytable())
             self._cur.executemany(
                 "INSERT INTO sheet_layout VALUES (?,?,?,?)", _sl_rows)
             self._cur.execute(
