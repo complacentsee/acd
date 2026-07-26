@@ -103,7 +103,8 @@ from acd.record.blobs import ControllerProps
 from acd.record.comps import CompsRecord, _SP_MARKER, decrypt_sp_nameless
 from acd.record import config9
 from acd.record.source_protection import (
-    _SP_KEYS, _SP_KEY_HINT, _SP_CT_OFFSET, _sp_aes, _sp_cbc)
+    _SP_KEYS, _SP_KEY_HINT, _SP_CT_OFFSET, _sp_aes, _sp_cbc,
+    get_element_recovery)
 
 
 # Maps primitive DataType names to their L5K zero-default value string.
@@ -3416,6 +3417,38 @@ _ST_AT_TOKEN_RE = re.compile(r"@([0-9a-fA-F]+)@")
 _ST_LINE_MARKER = b"\xff\xfe\xff"
 
 
+def _st_recon_candidates(rec: bytes, group_kids: "Union[int, None]" = None):
+    """Yield plaintext forms of an ST nameless record.
+
+    Unprotected records yield themselves. Config-9 (V31+) source-protected ST
+    routines encrypt the WHOLE subtree at rest -- the group record's trailing
+    line-order array and every line record's ``FF FE FF`` text -- behind the
+    ``aa96aa0a`` marker (same at-rest scheme as the AOI interface, keyed by the
+    project key-table). Such records yield each group-key decryption that passes
+    a strong ST head prefilter: a LINE body begins with the ``FF FE FF`` marker;
+    a GROUP body begins with a u16 child-count == len(kids) and declares
+    ``2 + 4*count`` bytes. The prefilter pins the one correct per-group key over
+    the ~1500-key table and rejects the short-record false positives a bare
+    PKCS7-length filter admits. Fail-closed: no candidate -> nothing yielded."""
+    midx = rec.find(_SP_MARKER)
+    # Only decrypt config-9 ST content in recovery mode; faithful exports withhold
+    # (emit <EncodedData>) and must not pay the decryption cost.
+    if midx < 0 or not config9.is_config9(rec, midx) or not get_element_recovery():
+        yield rec
+        return
+    if group_kids is not None:
+        k = group_kids
+
+        def _head(b0, decl):
+            return decl == 2 + 4 * k and int.from_bytes(b0[0:2], "little") == k
+    else:
+        def _head(b0, decl):
+            return b0[0:3] == _ST_LINE_MARKER
+    for pt in config9.decrypt_candidates(
+            rec, midx, config9.get_project_keytable(), head_ok=_head):
+        yield rec[:midx] + pt
+
+
 def _st_content_lines(cur, routine_oid: int) -> "Union[List[str], None]":
     """Decode an ST routine's source lines from its nameless subtree, or None.
 
@@ -3452,12 +3485,19 @@ def _st_content_lines(cur, routine_oid: int) -> "Union[List[str], None]":
                         "SELECT object_id FROM nameless WHERE parent_id=?",
                         (coid,)).fetchall()]
                     k = len(kids)
-                    if k == 0 or len(crec) < 4 * k:
+                    if k == 0:
                         continue
-                    arr = [struct.unpack_from("<I", crec, len(crec) - 4 * k
-                                              + 4 * i)[0] for i in range(k)]
-                    if set(arr) == set(kids) and len(set(arr)) == k:
-                        candidates.append((coid, arr))
+                    # crec may be config-9-encrypted (V31+ SP ST routines encrypt
+                    # the whole subtree); the trailing line-order array lives in
+                    # the decrypted body, so test each plaintext candidate.
+                    for rc in _st_recon_candidates(crec, group_kids=k):
+                        if len(rc) < 4 * k:
+                            continue
+                        arr = [struct.unpack_from("<I", rc, len(rc) - 4 * k
+                                                  + 4 * i)[0] for i in range(k)]
+                        if set(arr) == set(kids) and len(set(arr)) == k:
+                            candidates.append((coid, arr))
+                            break
             frontier = nxt
         def _deref(oid: int, depth: int = 0) -> "Union[str, None]":
             # Resolve a comps oid to its export name, following the
@@ -3490,23 +3530,30 @@ def _st_content_lines(cur, routine_oid: int) -> "Union[List[str], None]":
                     (oid,)).fetchone()
                 if not row:
                     return None
-                rec = bytes(row[0])
-                m = rec.find(_ST_LINE_MARKER)
-                if m < 0 or len(rec) < m + 4:
+                # A line record may be config-9-encrypted; try each plaintext
+                # candidate and keep the first that decodes as an FF FE FF line.
+                decoded = None
+                for rec in _st_recon_candidates(bytes(row[0])):
+                    m = rec.find(_ST_LINE_MARKER)
+                    if m < 0 or len(rec) < m + 4:
+                        continue
+                    # Code-unit count: u8, with 0xFF as the long-form sentinel
+                    # followed by a u16 LE count (observed on 267-unit lines).
+                    n = rec[m + 3]
+                    tpos = m + 4
+                    if n == 0xFF:
+                        if len(rec) < m + 6:
+                            continue
+                        n = struct.unpack_from("<H", rec, m + 4)[0]
+                        tpos = m + 6
+                    if len(rec) < tpos + 2 * n:
+                        continue
+                    text = rec[tpos:tpos + 2 * n].decode("utf-16-le")
+                    decoded = _ST_AT_TOKEN_RE.sub(_resolve, text)
+                    break
+                if decoded is None:
                     return None
-                # Code-unit count: u8, with 0xFF as the long-form sentinel
-                # followed by a u16 LE count (observed on 267-unit lines).
-                n = rec[m + 3]
-                tpos = m + 4
-                if n == 0xFF:
-                    if len(rec) < m + 6:
-                        return None
-                    n = struct.unpack_from("<H", rec, m + 4)[0]
-                    tpos = m + 6
-                if len(rec) < tpos + 2 * n:
-                    return None
-                text = rec[tpos:tpos + 2 * n].decode("utf-16-le")
-                lines.append(_ST_AT_TOKEN_RE.sub(_resolve, text))
+                lines.append(decoded)
             return lines
 
         # A structural candidate whose children do not ALL decode as line
@@ -4820,6 +4867,25 @@ def _ext_attr01(rec: bytes):
     return None
 
 
+def _sp_descriptor_a1(rec: bytes):
+    """ext-attr 0x1 (the source-protection descriptor) of a protected routine.
+
+    Config 3/8 keep it plaintext in the record body (``_ext_attr01`` reads it
+    directly). Config 9 encrypts the WHOLE record at rest behind the ``aa96aa0a``
+    marker, so the descriptor only appears after decrypting the record under its
+    project group key -- return it from the decrypted payload. None when absent
+    or the record does not decrypt."""
+    a1 = _ext_attr01(rec)
+    if a1 is not None:
+        return a1
+    midx = rec.find(_SP_MARKER)
+    if midx >= 0 and config9.is_config9(rec, midx):
+        pt = config9.decrypt(rec, midx, config9.get_project_keytable())
+        if pt is not None:
+            return _ext_attr01(pt)
+    return None
+
+
 def _definition_is_source_protected(rec: bytes, keyhash_off: int) -> bool:
     """Structural source-protection test shared by AOI and routine definitions
     (see the layout note above). ``keyhash_off`` is the family's protection-key
@@ -5165,11 +5231,12 @@ class ProgramBuilder(L5xElementBuilder):
             if _rt.type in ("TypeLess", "Typeless"):
                 continue
             if protected:
-                a1 = _ext_attr01(rec)
+                a1 = _sp_descriptor_a1(rec)
                 _rt._encoded = encoded_routine(
                     _rt, a1, _RT_KEYHASH_OFF,
                     source_protection_config(rec, a1, _RT_KEYHASH_OFF,
-                                             self._acd_major))
+                                             self._acd_major),
+                    rec=rec)
                 if _rt._encoded is None:
                     note_sp_withheld(rec, "routine")
                     continue

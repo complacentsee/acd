@@ -967,7 +967,10 @@ class ExportL5x:
         # it decrypts config-9 graphical elements; faithful withholds them (see
         # source_protection.set_element_recovery). Set once per export -- a module
         # global, so it must reflect THIS export's mode even when reused in-process.
-        set_element_recovery(not self.faithful)
+        # A faithful export WITH a config-9 export key also needs the content
+        # decrypted, so it can be re-encrypted into an importable <EncodedData>.
+        from acd.record import config9_export
+        set_element_recovery(not self.faithful or config9_export.is_loaded())
         try:
             rows = self._cur.execute(
                 "SELECT record FROM nameless WHERE LENGTH(record) > ?",
@@ -1463,8 +1466,21 @@ if __name__ == "__main__":
         nargs="+",
         help="Filename of the exported file",
     )
+    parser.add_argument(
+        "--sp-export-key",
+        metavar="PATH",
+        type=str,
+        default=None,
+        help="Path to a config-9 export key bundle. Enables emitting "
+        "Studio-importable source-protected <EncodedData> in faithful mode "
+        "(without it, protected routines are withheld as before).",
+    )
 
     args = parser.parse_args()
+    if args.sp_export_key:
+        from acd.record import config9_export
+
+        config9_export.set_key_file(args.sp_export_key)
     # Import here to avoid a module-level cycle (acd.api imports this module).
     from acd.api import ConvertAcdToL5x
 

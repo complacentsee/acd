@@ -90,6 +90,7 @@ from typing import Optional, Tuple
 
 from acd.record._aes import AES
 from acd.record import config9
+from acd.record import config9_export
 from acd.record.comps import _SP_KEYS, _SP_MARKER
 
 _DECL = '<?xml version="1.0" encoding="UTF-16" standalone="yes"?>'
@@ -245,6 +246,15 @@ def _source_key_name_esk(a1: Optional[bytes], keyhash_off: int,
         return None
     inner = _aes(body[1])          # body[0:2] = LE version word -> the wrap config
     out = _aes(export_config)
+    if out is None and export_config == 9:
+        # Config-9 export holds no CBC key: its whole <EncodedData> body (this
+        # EncodedSourceKey included) is AES-256-GCM under a per-export key, so it
+        # is never byte-reproducible and never compared, and Studio re-derives the
+        # source-key binding on import (a corrupted esk still imports cleanly).
+        # Recover the real source-key name and re-wrap it under the config it was
+        # stored under, so the emitted esk is a valid real identifier -- not a
+        # withheld blob and not a fabricated one.
+        out = inner
     if inner is None or out is None:
         return None
     name_field = _cbc_decrypt(body[2:], inner)
@@ -397,8 +407,44 @@ def _inner_document(routine, esk: str, spt: str) -> Optional[str]:
     )
 
 
+# The at-rest config-9 routine descriptor holds the wrapped source key in the 64
+# bytes that follow this preamble (a 66-byte slot header) -- see
+# _config9_routine_descriptor.
+_CFG9_WRAPKEY_PREAMBLE = b"\x42\x00\x00\x08"
+_CFG9_WRAPKEY_LEN = 64
+
+
+def _config9_routine_descriptor(rec: bytes) -> Optional[Tuple[str, str]]:
+    """(EncodedSourceKey, SourceProtectionType) for a config-9 protected routine.
+
+    Config-9 routines carry no ext-attr 0x1 (``security_descriptor`` returns None);
+    their source-protection descriptor lives inside the config-9-encrypted record.
+    Decrypt it and lift the wrapped source-key block -- the 64 bytes after the
+    ``42 00 00 08`` slot preamble -- which is the real at-rest source-key material.
+    It is emitted verbatim as the EncodedSourceKey: Studio re-derives the source-key
+    binding on import (a differing esk still imports), and the whole config-9
+    <EncodedData> body is a per-export, non-reproducible, comparator-masked
+    ciphertext, so reproducing Studio's exact per-export re-wrap buys nothing.
+    Fail-closed: None (withhold) on any framing/decrypt miss."""
+    midx = rec.find(_SP_MARKER)
+    if midx < 0 or not config9.is_config9(rec, midx):
+        return None
+    pt = config9.decrypt(rec, midx, config9.get_project_keytable())
+    if pt is None:
+        return None
+    off = pt.find(_CFG9_WRAPKEY_PREAMBLE)
+    if off < 0:
+        return None
+    start = off + len(_CFG9_WRAPKEY_PREAMBLE)
+    block = pt[start:start + _CFG9_WRAPKEY_LEN]
+    if len(block) != _CFG9_WRAPKEY_LEN or block == bytes(_CFG9_WRAPKEY_LEN):
+        return None
+    return base64.b64encode(block).decode("ascii").rstrip("="), _SPT_FULL
+
+
 def encoded_routine(routine, a1: Optional[bytes], keyhash_off: int,
-                    config: Optional[int]) -> Optional[str]:
+                    config: Optional[int],
+                    rec: Optional[bytes] = None) -> Optional[str]:
     """The <EncodedData> element for a source-protected routine, or None.
 
     None means some input did not resolve and the caller must emit nothing --
@@ -407,21 +453,35 @@ def encoded_routine(routine, a1: Optional[bytes], keyhash_off: int,
     if config is None:
         return None
     desc = security_descriptor(a1, keyhash_off, config)
+    if desc is None and config == 9 and rec is not None:
+        # Config-9 routines keep no ext-attr 0x1 descriptor; recover it from the
+        # encrypted record instead.
+        desc = _config9_routine_descriptor(rec)
     if desc is None:
         return None
     esk, spt = desc
     document = _inner_document(routine, esk, spt)
     if document is None:
         return None
-    body = _encrypt_b64(document.encode("utf-16-le"), config)
+    if config == 9:
+        # Config 9 is AES-256-GCM under a runtime-loaded export key (PBKDF2), not
+        # the AES-CBC of the other configs; withheld when no key is loaded.
+        body = config9_export.encrypt_routine(document)
+    else:
+        body = _encrypt_b64(document.encode("utf-16-le"), config)
     if body is None:
         return None
+    # Studio repeats the routine's plaintext <CustomProperties> and <Description>
+    # on the <EncodedData> wrapper (only the logic is hidden), in that order --
+    # mirror the plaintext <Routine> serialisation so both are byte-faithful.
+    cp = routine._custom_properties
+    cp_block = f"{cp}\n" if cp else ""
     return (
         f'<EncodedData EncodedType="Routine"'
         f' Name="{html.escape(routine.name, quote=True)}"'
         f' Type="{routine.type}"'
         f' EncryptionConfig="{config}">\n'
-        f"{_description_block(routine)}{body}</EncodedData>"
+        f"{cp_block}{_description_block(routine)}{body}</EncodedData>"
     )
 
 

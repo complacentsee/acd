@@ -232,6 +232,13 @@ def set_element_recovery(enabled: bool) -> None:
     _ELEMENT_RECOVERY[0] = bool(enabled)
 
 
+def get_element_recovery() -> bool:
+    """Whether config-9 source recovery is enabled (faithful=False). Gates the
+    at-rest config-9 decryption of graphical/ST content so faithful exports stay
+    byte-identical and avoid needless decryption work."""
+    return _ELEMENT_RECOVERY[0]
+
+
 def sp_decrypt_nameless_element(record: bytes) -> bytes:
     """Decrypt a source-protected graphical element record, or return it unchanged.
 
