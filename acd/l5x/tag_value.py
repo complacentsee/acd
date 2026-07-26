@@ -75,8 +75,9 @@ def _sign_neg(v: float) -> bool:
     The MSVC CRT prints QNaN with a leading ``-`` when the stored sign bit is set,
     so a stored ``0xFFC00001``/``0xFFFFFFFF`` NaN renders ``-1.#QNAN`` while a
     sign-clear ``0x7FC00000`` renders ``1.#QNAN``. ``v < 0`` is always False for a
-    NaN, so the sign must come from the bits themselves -- the same test already
-    used for signed zero at the ``_emit9``/``_round_sig_haway`` call sites.
+    NaN, so the sign must come from the bits themselves. NOTE this applies to the
+    NON-FINITE sentinels only: a signed ZERO is printed UNSIGNED in every Logix
+    text form (see :func:`_fmt_real`).
     """
     return bool(struct.pack("<d", v)[7] & 0x80)
 
@@ -134,6 +135,9 @@ def _fmt_real(v: float) -> str:
     reproduces the OEM converter byte-for-byte over the full pool corpus (every
     distinct REAL literal and every weighted occurrence). NaN/+-Inf use the Logix
     sentinels, which are NOT %e output.
+
+    A ZERO is written UNSIGNED whatever the stored sign bit -- the suppression is
+    zero-specific, a signed NaN/-Inf still keeps its sign (see the zero branch).
     """
     if v != v:
         return _qnan_l5k(v)
@@ -153,7 +157,14 @@ def _fmt_real(v: float) -> str:
     with localcontext() as ctx:
         ctx.prec = 80                                  # ample; default 28 also works
         if f == 0.0:
-            return _emit9("0" * 9, 0, bool(struct.pack("<d", f)[7] & 0x80))
+            # Signed zero is NOT signed in the L5K scientific form: the reference
+            # exports carry 3512915 zero literals and every one is the unsigned
+            # "0.00000000e+000" -- not one signed zero in any spelling, in any
+            # block (nor as a Decorated @Value, an element text, or a space-
+            # delimited AxisParameters token). The suppression is ZERO-specific:
+            # the same corpus does keep "-1.#QNAN000e+000" and "-1.#INF0000e+000",
+            # which is why the sign bit is still honoured for the non-finites above.
+            return _emit9("0" * 9, 0, False)
 
         def _cand(p: int):
             dig, exp, neg = _round_sig_haway(f, p)
@@ -175,11 +186,29 @@ def _fmt_real(v: float) -> str:
         if dig8[-1] == "0" and rt8 and mag8 <= av:
             return _emit9(dig8, exp8, neg8)
 
-        # ULTRA-CLEAN collapse: the 1-sig form round-trips and sits at-or-below v
-        # by less than ~half a float32 ULP (8th-digit noise <= 2) -> emit it clean.
+        # ULTRA-CLEAN collapse: the 1-sig form round-trips, sits at-or-below v,
+        # and the noise tail is one the reference writer drops. Writing the 9-sig
+        # mantissa as d1.dddddd(d8)(d9), the tail test is DIGIT-WISE --
+        #     d8 == 0             (no 8th-digit noise at all), or
+        #     d8 <= 2 and d9 <= 4 (small 8th-digit noise that rounds DOWN)
+        # -- not numeric on the digit pair. Reading the pair as a NUMBER (the old
+        # int(dig8[-1]) <= 2, i.e. "tail <= 24") also collapses tail 19, where the
+        # reference keeps all nine digits: float32(0.004) -> 4.00000019e-003.
+        # This branch and the PRIMARY one above emit the same thing, the correctly
+        # rounded SEVEN significant digits zero-padded; the reference writer only
+        # ever emits 7 or 9 significant digits, never 8.
+        # NOTE: the (d8, d9) bound is CORPUS-FITTED, not derived. It is pinned by
+        # the 22 literals this branch decides (17 collapsed / 5 not) and no rule
+        # monotone in any metric of the value can separate them: two of them share
+        # a significand, hence identical relative and ULP-relative noise, yet
+        # differ, and a trio sharing binade AND decade has the noise ordering
+        # interleaved. It is a strict TIGHTENING of the old bound -- over the
+        # complete finite domain of this branch it collapses a subset of what the
+        # old test collapsed, so it can never add a collapse that was not there.
         if av >= _F32_SMALLEST_NORMAL:
             dig1, exp1, neg1, mag1, rt1 = _cand(1)
-            if rt1 and mag1 <= av and int(dig8[-1]) <= 2:
+            d8, d9 = int(dig9[7]), int(dig9[8])
+            if rt1 and mag1 <= av and (d8 == 0 or (d8 <= 2 and d9 <= 4)):
                 return _emit9(dig1, exp1, neg1)
 
         return _emit9(dig9, exp9, neg9)
@@ -192,7 +221,7 @@ def _fmt_lreal(v: float) -> str:
     :func:`_fmt_real`, applied to the raw double WITHOUT the float32 re-quant/
     collapse (that is a single-precision dtoa artifact and ``pack('<f', ...)``
     would overflow for large doubles). The pool contains no LREAL L5K literals, so
-    this is the by-analogy shared base rule; sentinels and signed zero are identical.
+    this is the by-analogy shared base rule; sentinel and zero handling are identical.
     """
     if v != v:
         return _qnan_l5k(v)
@@ -203,7 +232,7 @@ def _fmt_lreal(v: float) -> str:
     with localcontext() as ctx:
         ctx.prec = 80
         if v == 0.0:
-            return _emit9("0" * 9, 0, bool(struct.pack("<d", v)[7] & 0x80))
+            return _emit9("0" * 9, 0, False)       # unsigned zero; see _fmt_real
         dig9, exp9, neg9 = _round_sig_haway(v, 9)
         return _emit9(dig9, exp9, neg9)
 
@@ -463,16 +492,34 @@ def _wrap_l5k(flat: str, depth: int, budget: int = 81) -> str:
     broken (it accumulates into the surrounding column). ``depth`` is the writer's
     per-format-version indent (2 tabs for SoftwareRevision >= 32, else 5).
 
-    Reproduces the reference wrap byte-exact (4216/4216 corpus blocks). Scalars
-    and any non-bracket body pass through unchanged.
+    Inside a string literal ``$`` is the L5K escape, so ``$'`` is a literal
+    apostrophe and must NOT be read as the closing quote — mistaking it for one
+    inverts the in-string state for the whole rest of the payload, and since a
+    wrap can only be inserted outside a string, the writer then stops wrapping
+    altogether and emits the remainder as one enormous line.
+
+    Reproduces the reference wrap byte-exact over every ``Format="L5K"`` CDATA
+    block in the reference corpus (47032/47032 blocks re-wrapped from their own
+    flattened text; the escape-blind form got 47028). Scalars and any
+    non-bracket body pass through unchanged.
     """
     if not flat or flat[0] != "[":
         return flat
     out: List[str] = []
     col = 0
     in_str = False
-    for ch in flat:
+    i = 0
+    n = len(flat)
+    while i < n:
+        ch = flat[i]
+        i += 1
         if in_str:
+            if ch == "$" and i < n:
+                out.append(ch)            # escape + the character it protects
+                out.append(flat[i])
+                col += 2
+                i += 1
+                continue
             out.append(ch)
             col += 1
             if ch == "'":
@@ -654,9 +701,20 @@ def _l5k_string(layout, image: bytes) -> Optional[str]:
 #              included, e.g. AB:1734_4SLOT:O:0's SlotStatusBits DINTs or the
 #              connection-header CfgSize/CfgIDNum/Reserved words); Decorated
 #              serialises the VIEW (hidden skipped).
-#   bit_alias  a scalar BOOL whose base byte falls inside a wider member
-#              (e.g. Pt0FaultMode overlaying the FaultMode SINT) is NOT a
-#              distinct storage slot: L5K skips it, Decorated shows it.
+#   overlay    a member whose bit range is STRICTLY inside another member's is
+#              not a distinct storage slot, it is a view onto the wider one
+#              (a scalar BOOL over its host integer, e.g. Pt0FaultMode over the
+#              FaultMode SINT; equally an AOI parameter that lies inside the
+#              AOI's backing local struct, e.g. a Cfg_*Severity INT inside a
+#              nested alarm instance). L5K emits storage slots only; Decorated
+#              shows every member.
+#              SCOPE OF THE EVIDENCE: the corpus attests exactly one containment
+#              shape -- a declared parameter laid over a NESTED SUB-INSTRUCTION's
+#              storage. The byte test is deliberately general, so it also covers
+#              an atomic scalar declared over one ELEMENT of an atomic array
+#              member; that class has NO reference instance, so it is decided by
+#              the rule, not proven by it. Check it first if a future corpus
+#              regresses here.
 # Decode failures become ("err",) nodes evaluated per-emitter, so a failing
 # member only fails the serialisation(s) that actually include it.
 #
@@ -674,7 +732,7 @@ def _l5k_string(layout, image: bytes) -> Optional[str]:
 #                                           (Decorated requires it, L5K
 #                                           renders from stride alone)
 #   ("struct", dt_name, members)            members = [(name, mdt, hidden,
-#                                           bit_alias, node), ...]
+#                                           overlay, node), ...]
 #   ("string", dt_name, layout, image)      STRING-shaped struct; the two
 #                                           leaf formatters (_l5k_string /
 #                                           _render_string_inner) keep their
@@ -773,6 +831,43 @@ def _force_sub(f: Optional[bytes], lo: int, hi: int) -> Optional[bytes]:
     return f[lo:hi]
 
 
+def _contained_flags(ranges: List[Optional[Tuple[int, int]]]) -> List[bool]:
+    """Mark every ``[lo, hi)`` bit range that lies STRICTLY inside another one.
+
+    Sweeping by ascending start (ties by descending end) means every range
+    already visited starts no later than the current one, so a running maximum
+    end decides containment in O(n log n): ``wide`` is that maximum over ranges
+    that started STRICTLY earlier, ``seen`` over all visited ranges.
+
+    Edge cases, decided here once:
+      * two ranges that are exactly EQUAL are neither one's overlay, so both
+        stay storage slots (this is why ``wide`` exists);
+      * partial overlap is not containment, so both stay slots;
+      * a chain a < b < c marks both a and b, keeping only c -- "inside ANY
+        other range" and "inside a range that is itself a slot" agree, because
+        strict containment is a strict partial order;
+      * ``-inf`` seeds the running maxima because a malformed layout may carry
+        a negative member offset (the walker must stay total on those);
+      * a ``None`` entry is a member whose span could not be resolved. It takes
+        no part in the sweep at all -- never contained, never a container --
+        because a guessed span must not be allowed to hide a member (that would
+        break the fail-closed contract) nor to swallow its neighbours.
+    """
+    order = sorted((i for i in range(len(ranges)) if ranges[i] is not None),
+                   key=lambda i: (ranges[i][0], -ranges[i][1]))
+    out = [False] * len(ranges)
+    wide = seen = float("-inf")
+    start = None
+    for i in order:
+        lo, hi = ranges[i]
+        if lo != start:
+            wide, start = seen, lo
+        out[i] = wide >= hi or seen > hi
+        if hi > seen:
+            seen = hi
+    return out
+
+
 def _walk_struct(dt_name: str, image: bytes, layout_map: Dict,
                  data_types_map: Dict, depth: int,
                  fmask: Optional[bytes] = None,
@@ -783,7 +878,7 @@ def _walk_struct(dt_name: str, image: bytes, layout_map: Dict,
     undecodable member (out-of-bounds or negative offset, unresolvable or
     cyclic type, depth cap) becomes an ("err",) node for the emitters to
     judge. The walker decodes policy-skipped members too (hidden /
-    bit-alias); their flags are applied at emit time.
+    overlay); their flags are applied at emit time.
 
     ``fmask``/``fval`` are the optional installed-force mask/value images,
     aligned byte-for-byte with ``image``; they are sliced wherever ``image``
@@ -797,28 +892,53 @@ def _walk_struct(dt_name: str, image: bytes, layout_map: Dict,
         return ("err",)
     if _is_string_layout(layout):
         return ("string", dt_name, layout, image)
-    # Byte offsets owned by non-BOOL atomic / struct members: a scalar BOOL
-    # whose base byte falls inside one is a bit-alias of that member.
+    # Bit range every member owns, plus (unchanged) the byte set owned by the
+    # non-scalar-BOOL members. The byte test is kept verbatim so a member the
+    # walker skips today can never start being emitted; the containment sweep
+    # is a pure addition on top of it.
     covered = set()
+    ranges: List[Optional[Tuple[int, int]]] = []
     for (name, mdt, off, bit, hidden, dims, def_radix) in layout:
-        if mdt in ("BOOL", "BIT") and not dims:
-            continue
-        if mdt in _ATOMIC:
-            w = _ATOMIC[mdt][0]
-        else:
-            w = _struct_stride(mdt, layout_map, data_types_map) or 1
         n = 1
         if dims:
             for d in dims:
                 n *= d
+        if mdt in ("BOOL", "BIT") and not dims:
+            # A packed BOOL owns exactly its one declared bit.
+            b0 = bit if bit is not None else 0
+            ranges.append((off * 8 + b0, off * 8 + b0 + 1))
+            continue
+        if mdt in _ATOMIC:
+            w = _ATOMIC[mdt][0]
+        else:
+            w = _struct_stride(mdt, layout_map, data_types_map)
+            if w is None:
+                # Unresolvable type: this member's span is a GUESS, so it may
+                # neither be an overlay nor swallow one -- a None range keeps it
+                # out of the containment sweep entirely. Without that, the 1-byte
+                # fallback below is the width most likely to land strictly inside
+                # a neighbour, the member would be skipped as an overlay, and its
+                # ("err",) node would never reach _emit_l5k to refuse the block --
+                # i.e. a WRONG block instead of no block. The byte contribution
+                # to ``covered`` stays exactly as it was.
+                ranges.append(None)
+                for b in range(off, off + n):
+                    covered.add(b)
+                continue
+        # A BOOL array is bit-packed, so it owns n BITS from its base byte;
+        # everything else owns w * n whole bytes.
+        ranges.append((off * 8, off * 8 + n) if mdt in ("BOOL", "BIT")
+                      else (off * 8, (off + w * n) * 8))
         for b in range(off, off + w * n):
             covered.add(b)
+    inside = _contained_flags(ranges)
     members = []
-    for (name, mdt, off, bit, hidden, dims, def_radix) in layout:
-        bit_alias = mdt in ("BOOL", "BIT") and not dims and off in covered
+    for i, (name, mdt, off, bit, hidden, dims, def_radix) in enumerate(layout):
+        overlay = inside[i] or (mdt in ("BOOL", "BIT") and not dims
+                                and off in covered)
         node = _walk_member(mdt, off, bit, dims, def_radix, image,
                             layout_map, data_types_map, depth, fmask, fval)
-        members.append((name, mdt, hidden, bit_alias, node))
+        members.append((name, mdt, hidden, overlay, node))
     return ("struct", dt_name, members)
 
 
@@ -904,9 +1024,10 @@ def _walk_member(mdt: str, off: int, bit, dims, def_radix, image: bytes,
 def _emit_l5k(node) -> Optional[str]:
     """Serialise a value-tree node in the L5K bracket form ``[m0,m1,...]``.
 
-    Storage policy: hidden members included, bit-alias scalar BOOLs skipped
-    (only their containing integer member is emitted). Values are plain signed
-    decimals regardless of display radix.
+    Storage policy: hidden members included, OVERLAY members skipped (only the
+    wider member whose bit range contains them is emitted), compiler scratch
+    members skipped. Values are plain signed decimals regardless of display
+    radix.
     """
     kind = node[0]
     if kind == "err":
@@ -915,9 +1036,16 @@ def _emit_l5k(node) -> Optional[str]:
         return _l5k_string(node[2], node[3])
     if kind == "struct":
         parts: List[str] = []
-        for (_name, _mdt, _hidden, bit_alias, sub) in node[2]:
-            if bit_alias:
-                # bit-alias of a wider integer member -> not a storage slot
+        for (_name, _mdt, _hidden, overlay, sub) in node[2]:
+            if overlay:
+                # strictly inside a wider member -> not a storage slot
+                continue
+            if _hidden and _name.startswith("__l"):
+                # Compiler scratch (``__l<hex>``): allocated in the instance
+                # image but absent from the definition's exported member list,
+                # so the reference's list has no slot for it. Same predicate the
+                # Tag / LocalTag / Parameter exporters already use to drop these
+                # names; Decorated is unaffected (it drops hidden wholesale).
                 continue
             frag = _emit_l5k(sub)
             if frag is None:
@@ -1337,7 +1465,7 @@ def _ascii_string_cdata(b: bytes) -> str:
 def _emit_decorated_inner(node) -> Optional[str]:
     """Serialise a struct/string node's INNER members (no <Structure> wrap).
 
-    View policy: hidden members skipped, bit-alias scalar BOOLs shown.
+    View policy: hidden members skipped, overlay members shown.
     """
     kind = node[0]
     if kind == "literal":
@@ -1347,7 +1475,7 @@ def _emit_decorated_inner(node) -> Optional[str]:
     if kind != "struct":
         return None
     parts: List[str] = []
-    for (name, mdt, hidden, _bit_alias, sub) in node[2]:
+    for (name, mdt, hidden, _overlay, sub) in node[2]:
         if hidden:
             continue
         frag = _emit_decorated_member(name, mdt, sub)

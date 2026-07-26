@@ -102,6 +102,20 @@ def test_fmt_real_l5k_uses_exponential_form():
     assert T._atomic_text("REAL", struct.pack("<f", 0.1)) == "1.00000000e-001"
 
 
+def test_fmt_real_l5k_zero_is_unsigned():
+    # A stored negative zero prints UNSIGNED in the L5K scientific form; the
+    # reference exports never carry a signed zero in any spelling.
+    assert T._fmt_real(0.0) == "0.00000000e+000"
+    assert T._fmt_real(-0.0) == "0.00000000e+000"
+    assert T._atomic_text("REAL", b"\x00\x00\x00\x80") == "0.00000000e+000"
+    assert T._fmt_lreal(-0.0) == "0.00000000e+000"
+    assert T._atomic_text("LREAL", b"\x00" * 7 + b"\x80") == "0.00000000e+000"
+    # ... but the suppression is ZERO-specific: a signed non-finite keeps its sign.
+    assert T._fmt_real(struct.unpack("<f", b"\x00\x00\x80\xff")[0]) == "-1.#INF0000e+000"
+    assert T._fmt_real(struct.unpack("<f", b"\x01\x00\xc0\xff")[0]) == "-1.#QNAN000e+000"
+    assert T._fmt_real(-1.0) == "-1.00000000e+000"
+
+
 def test_fmt_lreal_decorated_edges():
     assert T._fmt_lreal_decorated(0.0) == "0.0"
     assert T._fmt_lreal_decorated(0.1) == "0.1"
@@ -487,6 +501,50 @@ def test_cyclic_layout_degrades_instead_of_recursing():
         '</Structure>'
     )
     assert T.render_l5k_layout("PARENT", None, img, lm, {}) is None
+
+
+def test_unresolvable_member_span_never_becomes_an_overlay():
+    # Same shape as above, but the neighbour is now WIDE enough to contain the
+    # undecodable member's fallback 1-byte span. A member whose stride cannot be
+    # resolved has a GUESSED span, so it must take no part in the containment
+    # sweep: if it were skipped as an overlay its ("err",) node would never reach
+    # the emitter and L5K would silently produce a wrong block instead of none.
+    lm = {
+        "PARENT": [("Vis", "DINT", 0, None, False, [2]),
+                   ("Hid", "CYC", 4, None, True, None)],
+        "CYC": [("Self", "CYC", 0, None, False, None)],
+    }
+    img = b"\x01\x00\x00\x00\x02\x00\x00\x00"
+    assert T.render_l5k_layout("PARENT", None, img, lm, {}) is None
+
+
+def test_l5k_overlay_member_is_not_a_storage_slot():
+    # A member strictly inside another member's byte range is a view onto it,
+    # not a storage slot: L5K emits the container only, Decorated shows both.
+    lm = {
+        "OUTER": [("Host", "DINT", 0, None, True, None),
+                  ("Flag", "BOOL", 0, 1, False, None),
+                  ("Aliased", "REAL", 8, None, False, None),
+                  ("Inner", "SUB", 4, None, True, None)],
+        "SUB": [("A", "DINT", 0, None, False, None),
+                ("B", "REAL", 4, None, False, None)],
+        "@size@OUTER": 12,
+        "@size@SUB": 8,
+    }
+    img = struct.pack("<i", 2) + struct.pack("<i", 7) + struct.pack("<f", 1.5)
+    # Host + Inner are the storage slots; Flag (bit of Host) and Aliased
+    # (inside Inner) are overlays.
+    assert T.render_l5k_layout("OUTER", None, img, lm, {}) == (
+        "[2,[7,1.50000000e+000]]")
+    # ... and the Decorated VIEW is unchanged by the overlay flag: it skips the
+    # hidden members and shows the overlays.
+    assert T.render_decorated_layout("OUTER", None, img, lm, {}) == (
+        '<Structure DataType="OUTER">'
+        '<DataValueMember Name="Flag" DataType="BOOL" Value="1"/>'
+        '<DataValueMember Name="Aliased" DataType="REAL" Radix="Float"'
+        ' Value="1.5"/>'
+        '</Structure>'
+    )
 
 
 def test_negative_offsets_never_raise():
