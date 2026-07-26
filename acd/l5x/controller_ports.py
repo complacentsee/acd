@@ -45,9 +45,11 @@ _SERIAL_CHANNEL = "0"
 
 # The EthernetPort config block sits at offset 106 of the record's 0x1
 # ext-attr value (verified at that one location across all 127 readable
-# records pool-wide, including the source-protected ones after decrypt):
-#   +0 u32 gate (1 = config block present)  +4 u8 flags (bit1 = autonegotiate)
-#   +6 u8 port-enabled                       +7 u8 label length, ASCII @ +8.
+# records pool-wide, including the source-protected ones after decrypt). It
+# opens with the CIP Ethernet Link object's "Interface Control" attribute:
+#   +0 u16 ControlBits (bit0 = auto-negotiate enable, bit1 = forced duplex)
+#   +2 u16 ForcedInterfaceSpeed (Mbit/s; 0 while auto-negotiating)
+#   +4 u8 flags   +6 u8 port-enabled   +7 u8 label length, ASCII label @ +8.
 _EP_BLOCK = 106
 
 
@@ -188,7 +190,13 @@ def build_ethernet_ports(cur: Cursor, controller_oid: int, short_header: bool,
             enabled = label = auto_neg = None
             if blk is not None:
                 enabled = _BOOL.get(blk[6])
-                auto_neg = "true" if blk[4] & 0x02 else "false"
+                # Auto-negotiate is ControlBits bit 0, not blk[4] bit 1. The two
+                # agree on every port whose ControlBits word is exactly 1, which
+                # is why blk[4] read correctly until a port turned up carrying
+                # the forced-duplex bit as well (ControlBits 0x0003 with a
+                # ForcedInterfaceSpeed of 100): there blk[4] is 0 and the port
+                # still auto-negotiates.
+                auto_neg = "true" if blk[0] & 0x01 else "false"
                 if struct.unpack_from("<I", blk, 0)[0] == 1 and blk[4] == 0x02:
                     ln = blk[7]
                     if ln and len(blk) >= 8 + ln:

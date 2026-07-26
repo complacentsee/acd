@@ -371,13 +371,17 @@ def _render_message_data(cur, short_header, dti, oid2name, nr, route_count):
                 if cf == 1:
                     P.append(("CacheConnections", cc_val))
         elif mt in ("SERCOS IDN Read", "SERCOS IDN Write"):
-            # A SERCOS IDN message targets a motion axis (the ConnectionPath) via
-            # the CIP setup struct (ServiceCode/ObjectType/AttributeNumber, same
-            # fields as CIP Generic), carries the real CommTypeCode, a RemoteIndex
-            # (u32 @345) and a LocalElement, and emits zeroed DH+ routing fields.
-            # Require the axis path, the local element, and structurally-zero DH+
-            # routing so a mis-decoded blob can never fabricate a route.
-            if le is None or not has_cp:
+            # A SERCOS IDN message usually targets a motion axis (the
+            # ConnectionPath) via the CIP setup struct (ServiceCode/ObjectType/
+            # AttributeNumber, same fields as CIP Generic), carries the real
+            # CommTypeCode, a RemoteIndex (u32 @345) and a LocalElement, and
+            # emits zeroed DH+ routing fields. An unconfigured-path variant
+            # (empty EPATH, CommTypeCode 0) carries no ConnectionPath at all and
+            # the reference omits the attribute; add_cp() is already a no-op in
+            # that state, so no route can be fabricated and the path must not be
+            # required. Still require the local element and structurally-zero
+            # DH+ routing.
+            if le is None:
                 return None
             if (a1[324] | (a1[325] << 8) | a1[326] | (a1[327] << 8)
                     | a1[328] | (a1[329] << 8)):

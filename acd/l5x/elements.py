@@ -446,16 +446,24 @@ def _axis_attr(blob: bytes, off: int, kind: str, enum: str = "") -> str:
     raise ValueError(kind)
 
 
-def _render_axis_virtual(blob: bytes, group_name: str) -> "Union[str, None]":
+def _render_axis_virtual(blob: bytes,
+                         group_name: "Optional[str]") -> "Union[str, None]":
     """The full <Data Format="Axis"><AxisParameters .../></Data> for an
     AXIS_VIRTUAL tag, or None when the blob length is an unrecognised firmware
-    generation (keep today's no-<Data>, never a wrong render)."""
+    generation (keep today's no-<Data>, never a wrong render).
+
+    ``group_name`` is None for an axis that belongs to no motion group at all;
+    the reference omits the MotionGroup attribute entirely for those, so it is
+    left out rather than guessed (the every-11th-attribute line break then falls
+    where the reference puts it, since it counts the emitted attributes)."""
     tail = _AXIS_VIRTUAL_TAIL.get(len(blob))
     if tail is None:
         return None
     ipc_off, aus_off = tail
     try:
-        parts = [f'MotionGroup="{html.escape(group_name, quote=True)}"']
+        parts = []
+        if group_name is not None:
+            parts.append(f'MotionGroup="{html.escape(group_name, quote=True)}"')
         for entry in _AXIS_VIRTUAL_HEADER:
             val = _axis_attr(blob, entry[1], entry[2],
                              entry[3] if len(entry) > 3 else "")
@@ -7194,7 +7202,12 @@ class ControllerBuilder(L5xElementBuilder):
                 _gcid = struct.unpack_from("<H", _blob, 8)[0]
                 _gname = _grp_by_cid.get(_gcid)
                 if _adt == "AXIS_VIRTUAL":
-                    if _gname is None:
+                    # A group reference of 0 means the axis is in NO motion
+                    # group; the reference then omits the MotionGroup attribute,
+                    # so render without it. A non-zero cid that no MOTION_GROUP
+                    # tag carries is UNRESOLVED (not ungrouped) and still fails
+                    # closed, keeping today's no-<Data>.
+                    if _gname is None and _gcid != 0:
                         continue
                     _at._axis_data_xml = _render_axis_virtual(_blob, _gname)
                 else:

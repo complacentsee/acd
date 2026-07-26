@@ -658,12 +658,20 @@ def encryption_config_for_version(major: int) -> Optional[int]:
     the epochs whose at-rest descriptor is unreadable it can only be read from the
     ACD's Studio version. The readable-descriptor epochs (cfg2 = V19, cfg3 = V20) are
     derived structurally by ``source_protection_config`` instead; this covers the
-    force-encoded / encrypted-tail epochs. V30 is deliberately withheld -- it is the
-    sole ambiguous revision (cfg7 PackML library seals vs cfg9) with no structural
-    tell here -- and the V21..V27 epochs are absent from the reference corpus.
+    force-encoded / encrypted-tail epochs, and the V21..V27 ones are absent from the
+    reference corpus (withheld).
+
+    V30 exports a FORCE-ENCODED (sealed, plaintext-at-rest) definition under config 7,
+    not 9. The apparent cfg7/cfg9 ambiguity at V30 is not one: only the sealed
+    population reaches this function. A V30 definition that is source-protected AT
+    REST keeps its interface behind the wrapped-key encrypted tail, takes the separate
+    at-rest branch, and gets its 9 structurally from ``source_protection_config``.
+    Reference-wide the two populations are disjoint at V30 and neither one is mixed.
     """
     if major in (28, 29):
         return 8
+    if major == 30:
+        return 7
     if major >= 31:
         return 9
     return None
