@@ -655,14 +655,18 @@ class Module(L5xElement):
 
         # <ExtendedProperties> section. Public-only keeps its exact prior byte
         # form (the comparator normalizes inter-tag whitespace); a DNET/DNB
-        # <private> block follows the public block verbatim, with OEM's newline
-        # after the opening tag.
+        # <private> block is emitted verbatim BEFORE the public one, with OEM's
+        # newline after the opening tag. Order attested 7/7 with 0 counter-
+        # examples across the reference corpus (both the self-closing <private/>
+        # and the <private><Filename>..</Filename></private> form), and
+        # independently required by the published L5X schema's sequence. The
+        # fidelity comparator is order-insensitive, so it cannot see this.
         ext_xml = ""
         if self._extended_private:
             pub = (f'<public>{self._extended_properties}</public>'
                    if self._extended_properties else '')
-            ext_xml = (f'<ExtendedProperties>\n{pub}'
-                       f'{self._extended_private}</ExtendedProperties>')
+            ext_xml = (f'<ExtendedProperties>\n{self._extended_private}'
+                       f'{pub}</ExtendedProperties>')
         elif self._extended_properties:
             ext_xml = f'<ExtendedProperties><public>{self._extended_properties}</public></ExtendedProperties>'
 
