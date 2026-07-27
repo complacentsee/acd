@@ -419,9 +419,15 @@ _AXIS_VIRTUAL_HEADER = [
 # axis_cip_data.json declares for the identical blob lengths of the sibling
 # AXIS_CIP_DRIVE/AXIS_SERVO_DRIVE profile); None means the attribute does not
 # exist at that generation. It was previously hardcoded to enum index 0 ("Base").
+# The 3526 entry is DERIVED, not fitted: its reference emits IPC 16#0000_0002 on
+# every witness, and offset 3426 is the ONLY offset in the whole 3526-byte blob
+# whose u32 reads 2 on all of them -- so no other IPC offset is possible. It
+# coincides with the 3654/3666 pair, i.e. this generation grew only past the
+# tail. Probe: scratchpad/av/{dump_blobs,an1,render_text}.py.
 _AXIS_VIRTUAL_TAIL = {
     3424: (None, None),
     3430: (3426, None),
+    3526: (3426, 3440),
     3654: (3426, 3440),
     3666: (3426, 3440),
     5476: (3474, 3488),
