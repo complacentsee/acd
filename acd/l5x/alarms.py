@@ -26,11 +26,14 @@ _ALARM_FLAGB_RENDERED = 0x01 | 0x02 | 0x04
 _ALARM_FLAGC_RENDERED = 0x02
 
 
-# Boolean <AlarmCondition> attributes the reference always emits "false" (none of
-# the ~1500 pool conditions has any of these set). Severity-bit fields cover only
-# Used/AlarmSet*/AckRequired (see _build_alarm_conditions).
-# AlarmDigitalParameters boolean attributes in OEM order; bit i of the backing
-# AlarmControlFlags word (V20/21 short-header form, 20 bits).
+# Boolean <AlarmDigitalParameters> attributes in OEM order for the V20/21
+# short-header ALARM_DIGITAL (20-bit AlarmControlFlags). FALLBACK ONLY: the live
+# path derives the bit names from the project's own TagInfo layout (see
+# _adp_layout); this constant is used only for a short-header project whose
+# TagInfo carries no ALARM_DIGITAL type, so the pre-TagInfo behaviour is
+# preserved exactly (a hard 0-worse guard, never the primary source). The V31+
+# long-header form (23 bits, extra Shelve members) is NOT tabled here -- it is
+# always derived, so it is reached only when TagInfo is present.
 _ADP_BITS = (
     "EnableIn", "In", "InFault", "Condition", "AckRequired", "Latched",
     "ProgAck", "OperAck", "ProgReset", "OperReset", "ProgSuppress", "OperSuppress",
@@ -39,28 +42,74 @@ _ADP_BITS = (
 )
 
 
-def _render_alarm_digital_data(cur, short_header, dti):
+def _adp_layout(adp_members):
+    """(bit_names, scalar_names, long_form) for the ALARM_DIGITAL parameter block,
+    derived from the datatype's own TagInfo member list, or None if it cannot be
+    resolved. ``bit_names`` are the bit members of the AlarmControlFlags word in
+    bit order; ``scalar_names`` are the scalar members strictly between
+    AlarmControlFlags and AlarmStatusFlags in offset order (Severity,
+    MinDurationPRE[, ShelveDuration, MaxShelveDuration]), which is exactly the
+    OEM emission order with ProgTime appended last. ``long_form`` (the V31+
+    23-bit variant carrying ShelveDuration) selects the '000_000Z' ProgTime
+    spelling and the empty <AlarmConfig/> for a message-less alarm."""
+    acf_off = asf_off = None
+    for m in adp_members:
+        if m[0] == "AlarmControlFlags":
+            acf_off = m[2]
+        elif m[0] == "AlarmStatusFlags":
+            asf_off = m[2]
+    if acf_off is None or asf_off is None:
+        return None
+    bits = sorted((m[3], m[0]) for m in adp_members
+                  if m[2] == acf_off and m[3] is not None)
+    scalars = sorted((m[2], m[0]) for m in adp_members
+                     if acf_off < m[2] < asf_off and m[3] is None
+                     and not m[4] and m[0] != "ProgTime")
+    bit_names = [n for _b, n in bits]
+    scalar_names = [n for _o, n in scalars]
+    if not bit_names or not scalar_names:
+        return None
+    return bit_names, scalar_names, ("ShelveDuration" in scalar_names)
+
+
+def _render_alarm_digital_data(cur, short_header, dti, adp_members=()):
     """Render an ALARM_DIGITAL tag's <Data Format="Alarm"> block, or None.
 
     The configuration lives in the tag's cip-0x6a data-table backing (object id ==
-    data_table_instance): ext-attr 0x01 carries a 20-bit AlarmControlFlags word at
-    offset 141, Severity (DINT @145), MinDurationPRE (DINT @149), and a u16 message
-    join key (@0) that joins into the alarm_messages side table. V20/21 short-header
-    form only. Returns None on any failure so the tag keeps its prior no-<Data>.
+    data_table_instance): ext-attr 0x01 carries the AlarmControlFlags word at
+    offset 141, then the parameter scalars as consecutive DINTs from offset 145
+    (Severity, MinDurationPRE[, ShelveDuration, MaxShelveDuration]), and a u16
+    message join key (@0) into the alarm_messages side table. The attribute
+    inventory/order and the bit->name map are DERIVED from ``adp_members`` (the
+    project's TagInfo ALARM_DIGITAL layout), so the same code renders both the
+    V20/21 short-header (20-bit) and V31+ long-header (23-bit + Shelve) forms.
+    Falls back to the short-header ``_ADP_BITS`` table only when TagInfo carries
+    no ALARM_DIGITAL type. Returns None on any failure so the tag keeps its prior
+    no-<Data>.
     """
     try:
         if not dti:
             return None
+        layout = _adp_layout(adp_members)
+        if layout is None:
+            if not short_header:
+                return None  # long-header needs TagInfo; never guess offsets
+            bit_names, scalar_names, long_form = list(_ADP_BITS), \
+                ["Severity", "MinDurationPRE"], False
+        else:
+            bit_names, scalar_names, long_form = layout
+        need = 145 + 4 * len(scalar_names)
         e1 = CompsRecord.record_attrs(cur, dti, short_header).get(0x01, b"")
-        if len(e1) < 153:
+        if len(e1) < need:
             return None
         flags = struct.unpack_from("<I", e1, 141)[0]
-        severity = struct.unpack_from("<i", e1, 145)[0]
-        min_dur = struct.unpack_from("<i", e1, 149)[0]
         joinkey = struct.unpack_from("<H", e1, 0)[0]
-        attrs = [f'Severity="{severity}"', f'MinDurationPRE="{min_dur}"',
-                 'ProgTime="DT#1970-01-01-00:00:00.000000Z"']
-        for i, name in enumerate(_ADP_BITS):
+        attrs = [f'{nm}="{struct.unpack_from("<i", e1, 145 + 4 * i)[0]}"'
+                 for i, nm in enumerate(scalar_names)]
+        progtime = ("DT#1970-01-01-00:00:00.000_000Z" if long_form
+                    else "DT#1970-01-01-00:00:00.000000Z")
+        attrs.append(f'ProgTime="{progtime}"')
+        for i, name in enumerate(bit_names):
             attrs.append(f'{name}="{"true" if (flags >> i) & 1 else "false"}"')
         adp = "<AlarmDigitalParameters " + " ".join(attrs) + " />"
         mrow = cur.execute(
@@ -70,9 +119,13 @@ def _render_alarm_digital_data(cur, short_header, dti):
             msg = (f'<Messages>\n<Message Type="{html.escape(mrow[0], quote=True)}">\n'
                    f'<Text Lang="en-US">\n{html.escape(mrow[1])}\n</Text>\n'
                    f'</Message>\n</Messages>')
+            cfg = f"<AlarmConfig>\n{msg}\n</AlarmConfig>"
+        elif long_form:
+            # OEM emits an empty element for a message-less long-header alarm.
+            cfg = "<AlarmConfig/>"
         else:
-            msg = "<Messages />"
-        return f'<Data Format="Alarm">\n{adp}\n<AlarmConfig>\n{msg}\n</AlarmConfig>\n</Data>'
+            cfg = "<AlarmConfig>\n<Messages />\n</AlarmConfig>"
+        return f'<Data Format="Alarm">\n{adp}\n{cfg}\n</Data>'
     except Exception:
         return None
 

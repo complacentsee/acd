@@ -7149,19 +7149,23 @@ class ControllerBuilder(L5xElementBuilder):
             pass
 
         # ALARM_DIGITAL tags carry a dedicated <Data Format="Alarm"> block decoded
-        # from their data-table backing. Short-header (V20/21) form only; the V31+
-        # variant (extra Shelve attrs/bools) is not emitted here.
-        if self._short_header:
-            try:
-                _al_tags = list(tags)
-                for _prog in programs:
-                    _al_tags.extend(_prog.tags)
-                for _at in _al_tags:
-                    if (_at.data_type or "").upper() == "ALARM_DIGITAL" and _at.tag_type != "Alias":
-                        _at._alarm_data_xml = _render_alarm_digital_data(
-                            self._cur, self._short_header, _at._data_table_instance)
-            except Exception:
-                pass
+        # from their data-table backing. The renderer derives the parameter
+        # inventory from the ALARM_DIGITAL TagInfo layout, so it covers both the
+        # V20/21 short-header (20-bit) and the V31+ long-header (23-bit + Shelve)
+        # forms; it falls back to the short-header table only when TagInfo lacks
+        # the type. Fail-closed: any tag that does not resolve keeps no-<Data>.
+        try:
+            _adp_members = (self._taginfo_layout or {}).get("ALARM_DIGITAL", ())
+            _al_tags = list(tags)
+            for _prog in programs:
+                _al_tags.extend(_prog.tags)
+            for _at in _al_tags:
+                if (_at.data_type or "").upper() == "ALARM_DIGITAL" and _at.tag_type != "Alias":
+                    _at._alarm_data_xml = _render_alarm_digital_data(
+                        self._cur, self._short_header, _at._data_table_instance,
+                        _adp_members)
+        except Exception:
+            pass
 
         # Axis tags carry a <Data Format="Axis"> block whose value image is
         # attr 0x01 of the cip-0x6a backing (not 0x66); MotionGroup resolves
